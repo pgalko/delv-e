@@ -170,4 +170,4 @@ Generated code runs locally via `exec()`. A module blacklist blocks dangerous op
 
 ## Origin
 
-Standalone extraction of the auto-explore module from [BambooAI](https://github.com/pgalko/BambooAI). Core exploration logic preserved; web UI, database, billing, and multi-tenant routing replaced with minimal local equivalents.
+Standalone extraction of the auto-explore module from [BambooAI](https://bambooai.io). Core exploration logic preserved; web UI, database, billing, and multi-tenant routing replaced with minimal local equivalents.
