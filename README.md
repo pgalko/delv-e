@@ -2,8 +2,6 @@
 
 Autonomous data investigation powered by LLMs. Give it a dataset and a question - it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers.
 
-![delv-e screenshot](assets/screenshot.png)
-
 ## Quick Start
 
 ```bash
@@ -19,6 +17,8 @@ python run.py data.csv "What factors drive churn?" --iterations 10
 ```
 
 ## How It Works
+
+![delv-e screenshot](assets/screenshot.png)
 
 Each iteration:
 
