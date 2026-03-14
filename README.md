@@ -74,17 +74,20 @@ python run.py data.csv "Analyze trends" --iterations 15
 # OSS models via OpenRouter
 python run.py data.csv "What predicts price?" \
     --agent-model openrouter:moonshotai/kimi-k2.5 \
-    --code-model openrouter:moonshotai/kimi-k2.5
+    --code-model openrouter:moonshotai/kimi-k2.5 \
+    --iterations 15
 
 # Mix providers — OSS agents, Anthropic code
 python run.py data.csv "Deep analysis" \
     --agent-model openrouter:z-ai/glm-5 \
-    --code-model anthropic:claude-haiku-4-5-20251001
+    --code-model anthropic:claude-haiku-4-5-20251001 \
+    --iterations 15
 
-# Local Ollama
+# Ollama - Local agents, Cloud code
 python run.py data.csv "Quick look" \
     --agent-model ollama:qwen3:30b \
-    --code-model ollama:qwen3:30b
+    --code-model ollama:kimi-k2.5:cloud \
+    --iterations 15
 ```
 
 ## Resuming Runs
