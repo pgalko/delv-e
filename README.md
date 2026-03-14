@@ -1,6 +1,6 @@
 # delv-e
 
-Autonomous data investigation powered by LLMs. Give it a dataset and a question - it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers.
+Autonomous, long-running data investigation powered by LLMs. Give it a dataset and a seed question — it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers. Capable of running autonomously for hours over hundreds of iterations. Every step produces a detailed analysis report coupled with charts and visualisations, with a final synthesis report at the end of the run tying everything together.
 
 ## Quick Start
 
