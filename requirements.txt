@@ -1,0 +1,15 @@
+# Core
+python-dotenv
+pandas
+numpy
+matplotlib
+seaborn
+scipy
+scikit-learn
+statsmodels
+openpyxl
+pyarrow
+
+# LLM providers
+anthropic
+openai
