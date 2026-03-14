@@ -19,7 +19,6 @@ python run.py data.csv "What factors drive churn?" --iterations 10
 ## How It Works
 
 ![delv-e screenshot](assets/screenshot.png)
-*CLI: python run.py datasets/shoe_analysis_2.csv --agent-model ollama:glm-5:cloud --code-model ollama:kimi-k2.5:cloud --iterations 25*
 
 
 Each iteration:
