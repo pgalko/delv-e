@@ -136,7 +136,7 @@ def _load_dataset(path):
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in ('.tsv',):
-            return pd.read_csv(path, sep='\t')
+            return pd.read_csv(path, sep='\t', low_memory=False)
         elif ext in ('.xlsx', '.xls'):
             return pd.read_excel(path)
         elif ext in ('.parquet', '.pq'):
@@ -146,7 +146,7 @@ def _load_dataset(path):
         elif ext in ('.jsonl',):
             return pd.read_json(path, lines=True)
         else:
-            return pd.read_csv(path)
+            return pd.read_csv(path, low_memory=False)
     except Exception as e:
         print(f"Error loading {ext or 'file'}: {e}", file=sys.stderr)
         sys.exit(1)

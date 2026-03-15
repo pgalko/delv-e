@@ -1,5 +1,5 @@
 """
-ExplorationEngine: minimal runtime that satisfies the self.bamboo.* interface
+ExplorationEngine: minimal runtime that satisfies the self.engine.* interface
 expected by auto_explore.py. Replaces BambooAI for standalone operation.
 """
 
@@ -128,7 +128,7 @@ class SimpleLogManager:
 
 class ExplorationEngine:
     """
-    Minimal runtime for AutoExplorer. Provides the self.bamboo.* interface.
+    Minimal runtime for AutoExplorer. Provides the self.engine.* interface.
     
     Usage:
         engine = ExplorationEngine(df, output_dir="output")
@@ -201,7 +201,14 @@ class ExplorationEngine:
             os.makedirs(output_dir)
             os.makedirs(os.path.join(output_dir, "exploration"))
             # Save DataFrame for potential --continue later
-            self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
+            try:
+                self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
+            except Exception:
+                # Mixed-type columns (e.g. mutation cols with int 0 and str '0') —
+                # coerce object columns to string and retry
+                for col in self.df.select_dtypes(include=['object']).columns:
+                    self.df[col] = self.df[col].astype(str).replace('nan', None)
+                self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
 
     # ──────────────────────────────────────────────
     # LLM interface (called by auto_explore agents)
@@ -210,12 +217,12 @@ class ExplorationEngine:
     def llm_stream(self, prompts, log_and_call_manager, output_manager,
                    messages, agent=None, chain_id=None, tools=None,
                    reasoning_models=None, reasoning_effort="medium",
-                   stop_event=None):
+                   stop_event=None, model_override=None):
         """
         LLM call matching the signature auto_explore expects.
         Streams through the output_manager (which handles silent mode).
         """
-        model, _ = self.models.get_model_name(agent)
+        model = model_override or self.models.get_model_name(agent)[0]
         max_tokens = 24000 if agent == "Synthesis Generator" else 10000
 
         response = self.llm_client.stream(

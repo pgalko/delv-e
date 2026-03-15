@@ -297,8 +297,16 @@ def final_box(iterations, analyses, avg, dormant, phase_hist, cost_str, output_d
     lines.append(f"  {CYAN}│{RESET}  {bold(str(iterations))} iterations, {bold(str(analyses))} analyses {dim(f'(avg score: {avg:.1f})')}, {dormant} unexplored branches")
 
     if phase_hist:
-        transitions = " → ".join(phase_transition(o, n) for _, o, n in phase_hist)
-        lines.append(f"  {CYAN}│{RESET}  {dim('Phases:')} {transitions}")
+        from collections import Counter
+        # Count iterations per phase
+        phase_counts = Counter()
+        prev_iter, prev_phase = 0, 'MAPPING'
+        for it, old, new in phase_hist:
+            phase_counts[prev_phase] += (it - prev_iter)
+            prev_iter, prev_phase = it, new
+        phase_counts[prev_phase] += (iterations - prev_iter)
+        phase_summary = ", ".join(f"{c} {p}" for p, c in phase_counts.most_common() if c > 0)
+        lines.append(f"  {CYAN}│{RESET}  {dim('Phases:')} {phase_summary} {dim(f'({len(phase_hist)} transitions)')}")
 
     lines.append(f"  {CYAN}│{RESET}  {dim('Cost:')} {cost_str}")
     lines.append(f"  {CYAN}│{RESET}")
@@ -313,48 +321,126 @@ def final_box(iterations, analyses, avg, dormant, phase_hist, cost_str, output_d
 
 # ── Exploration tree ────────────────────────────────────────
 
-def exploration_tree(insight_tree, root_node_id):
-    """Render the insight tree as an ASCII diagram with colored scores."""
+def exploration_tree(insight_tree, root_node_id, phase_history=None, total_iterations=None):
+    """Render the exploration as a thread summary showing investigation arcs."""
     if not insight_tree or not root_node_id:
         return ""
 
-    STATUS_ORDER = {'active': 0, 'runner_up': 1, 'dormant': 2, 'abandoned': 3}
+    phase_history = phase_history or []
+    total = len(insight_tree)
 
-    def fmt_node(nid):
-        n = insight_tree[nid]
-        q = clean_question(n['question'])
-        if len(q) > 62:
-            q = q[:59] + "..."
-        sc = n['quality_score']
-        status = n['status']
+    # Winning nodes in chronological order
+    winning_nodes = sorted(
+        [(nid, n) for nid, n in insight_tree.items() if n['status'] in ('active', 'dormant')],
+        key=lambda x: x[1]['chain_id']
+    )
+    if not winning_nodes:
+        return ""
 
-        if status == 'abandoned' or sc == 0:
-            return f"{DIM}{q} [✗]{RESET}"
-        elif status == 'dormant':
-            return f"{DIM}{q}{RESET} {score(sc)} {DIM}(dormant){RESET}"
-        elif status == 'runner_up':
-            return f"{DIM}{q}{RESET} {score(sc)}"
-        else:
-            return f"{q} {score(sc)}"
+    n_iters = total_iterations or len(winning_nodes)
 
-    def walk(nid, prefix, is_last):
-        connector = "└── " if is_last else "├── "
-        result.append(f"{prefix}{connector}{fmt_node(nid)}")
-        children = [c for c in insight_tree[nid].get('children_ids', [])
-                     if c in insight_tree]
-        children.sort(key=lambda c: STATUS_ORDER.get(insight_tree[c]['status'], 3))
-        child_prefix = prefix + ("    " if is_last else "│   ")
-        for i, child in enumerate(children):
-            walk(child, child_prefix, i == len(children) - 1)
+    # Identify thread boundaries from phase history
+    # PURSUING threads: MAPPING→PURSUING to PURSUING→MAPPING (or end)
+    # MAPPING segments: gaps between PURSUING threads
+    def phase_at(iteration):
+        phase = 'MAPPING'
+        for it, _old, new in phase_history:
+            if it <= iteration:
+                phase = new
+        return phase
+
+    pursuing_threads = []
+    current_start = None
+    for it, old, new in phase_history:
+        if new == 'PURSUING' and old == 'MAPPING':
+            current_start = it
+        elif new == 'MAPPING' and old in ('PURSUING', 'CONVERGING'):
+            if current_start is not None:
+                pursuing_threads.append(('PURSUING', current_start, it - 1))
+            current_start = None
+    if current_start is not None:
+        pursuing_threads.append(('PURSUING', current_start, n_iters - 1))
+
+    # Build MAPPING segments from gaps
+    mapping_segments = []
+    prev_end = -1
+    for _, start, end in pursuing_threads:
+        if start > prev_end + 1:
+            mapping_segments.append(('MAPPING', prev_end + 1, start - 1))
+        prev_end = end
+    if prev_end < n_iters - 1:
+        mapping_segments.append(('MAPPING', prev_end + 1, n_iters - 1))
+
+    # Merge and sort chronologically
+    all_segments = mapping_segments + pursuing_threads
+    all_segments.sort(key=lambda x: x[1])
+
+    # If no phase history at all, show everything as one segment
+    if not all_segments:
+        all_segments = [('MAPPING', 0, n_iters - 1)]
 
     result = []
-    result.append(f"\n  {bold('Exploration Tree')}\n")
-    result.append(f"  {fmt_node(root_node_id)}")
+    result.append(f"\n  {bold('Exploration Threads')} {DIM}({n_iters} iterations, {total} analyses){RESET}\n")
 
-    children = [c for c in insight_tree[root_node_id].get('children_ids', [])
-                 if c in insight_tree]
-    children.sort(key=lambda c: STATUS_ORDER.get(insight_tree[c]['status'], 3))
-    for i, child in enumerate(children):
-        walk(child, "  ", i == len(children) - 1)
+    thread_num = 0
+    for phase, start, end in all_segments:
+        segment_nodes = [(nid, n) for i, (nid, n) in enumerate(winning_nodes) if start <= i <= end]
+        if not segment_nodes:
+            continue
+
+        thread_num += 1
+        scores = [n['quality_score'] for _, n in segment_nodes]
+        avg_sc = sum(scores) / len(scores)
+        depth = len(segment_nodes)
+
+        # Phase icon and color
+        if phase == 'MAPPING':
+            phase_icon = f"{CYAN}▸{RESET}"
+            phase_label = f"{CYAN}MAPPING{RESET}"
+        else:
+            phase_icon = f"{BRIGHT_YELLOW}▸{RESET}"
+            phase_label = f"{BRIGHT_YELLOW}PURSUING{RESET}"
+
+        def _trunc(text, maxlen=200):
+            return text[:maxlen-1] + "…" if len(text) > maxlen else text
+
+        # First node = what started this thread
+        first_n = segment_nodes[0][1]
+        first_q = _trunc(clean_question(first_n['question']))
+
+        # Best finding in the thread
+        best_nid, best_node = max(segment_nodes, key=lambda x: x[1]['quality_score'])
+        best_finding = best_node.get('finding_summary', '')
+        if not best_finding or len(best_finding) < 10:
+            best_finding = clean_question(best_node['question'])
+        best_finding = _trunc(best_finding)
+
+        # Final finding (if different from best and thread has depth)
+        last_n = segment_nodes[-1][1]
+        last_finding = last_n.get('finding_summary', '')
+        if not last_finding or len(last_finding) < 10:
+            last_finding = clean_question(last_n['question'])
+        last_finding = _trunc(last_finding)
+
+        result.append(
+            f"  {phase_icon} Thread {thread_num}: {phase_label} "
+            f"{DIM}(iter {start+1}–{end+1}, {depth} analyses){RESET}  "
+            f"{score(round(avg_sc))}"
+        )
+        result.append(f"     {DIM}Started:{RESET}  {DIM}{first_q}{RESET}")
+        result.append(f"     {GREEN}Key find:{RESET} {BOLD}{best_finding}{RESET}")
+        if depth > 2 and last_finding != best_finding:
+            result.append(f"     {DIM}Reached:{RESET}  {last_finding}")
+        result.append("")
+
+    # Dormant branches
+    dormant = [(nid, n) for nid, n in insight_tree.items() if n['status'] == 'dormant']
+    if dormant:
+        result.append(f"  {DIM}Dormant branches ({len(dormant)}):{RESET}")
+        for nid, n in dormant:
+            fs = n.get('finding_summary', clean_question(n['question']))
+            fs = fs[:199] + "…" if len(fs) > 200 else fs
+            result.append(f"     {DIM}○ {fs}{RESET}  {score(n['quality_score'])}")
+        result.append("")
 
     return "\n".join(result)

@@ -28,7 +28,7 @@ class AutoExplorer:
     """
     Autonomous exploration engine that recursively explores analytical space.
     Operates on an ExplorationEngine instance (or any object providing the
-    self.bamboo.* interface).
+    self.engine.* interface).
     """
 
     PHASE_INSTRUCTIONS = {
@@ -69,8 +69,8 @@ class AutoExplorer:
         ),
     }
 
-    def __init__(self, bamboo_instance):
-        self.bamboo = bamboo_instance
+    def __init__(self, engine_instance):
+        self.engine = engine_instance
 
         # Tree-based exploration state
         self.insight_tree = {}
@@ -90,36 +90,37 @@ class AutoExplorer:
         self.stagnation_count = 0            # consecutive iterations evaluator flagged stagnation
 
         # Reset branch endpoints
-        self.bamboo.branch_endpoints = []
+        self.engine.branch_endpoints = []
 
     @property
     def kill_signal(self):
-        return self.bamboo.kill_signal
+        return self.engine.kill_signal
 
     @property
     def chain_id(self):
-        return self.bamboo.chain_id
+        return self.engine.chain_id
 
     @chain_id.setter
     def chain_id(self, value):
-        self.bamboo.chain_id = value
+        self.engine.chain_id = value
 
-    def _llm_stream_silent(self, messages, agent):
+    def _llm_stream_silent(self, messages, agent, model_override=None):
         """Run llm_stream in silent mode and return captured output."""
-        output_manager = self.bamboo.output_manager
+        output_manager = self.engine.output_manager
         output_manager.set_silent(True)
 
         try:
-            response = self.bamboo.llm_stream(
-                self.bamboo.prompts,
-                self.bamboo.log_and_call_manager,
+            response = self.engine.llm_stream(
+                self.engine.prompts,
+                self.engine.log_and_call_manager,
                 output_manager,
                 messages,
                 agent=agent,
                 chain_id=self.chain_id,
-                reasoning_models=self.bamboo.reasoning_models,
+                reasoning_models=self.engine.reasoning_models,
                 reasoning_effort="low",
-                stop_event=self.bamboo._stop_event,
+                stop_event=self.engine._stop_event,
+                model_override=model_override,
             )
             if not response or (isinstance(response, str) and response.strip() == ''):
                 response = output_manager.get_captured_output()
@@ -180,7 +181,7 @@ Result:{error_note}
 
         solutions_block = "\n---\n".join(solutions_parts)
 
-        eval_prompt = self.bamboo.prompts.result_evaluator.format(
+        eval_prompt = self.engine.prompts.result_evaluator.format(
             seed_question=self.seed_question,
             exploration_state=exploration_state,
             solutions_block=solutions_block,
@@ -189,6 +190,16 @@ Result:{error_note}
 
         eval_messages = [{"role": "user", "content": eval_prompt}]
         response = self._llm_stream_silent(eval_messages, 'Result Evaluator')
+
+        # Cross-model fallback if response is empty
+        if not response or not response.strip():
+            fallback_model = self._get_fallback_model('Result Evaluator')
+            if fallback_model:
+                logger.info(f"Evaluator returned empty, falling back to {fallback_model}")
+                response = self._llm_stream_silent(eval_messages, 'Result Evaluator',
+                                                    model_override=fallback_model)
+            if not response or not response.strip():
+                response = ""
 
         # Parse response
         scores = [5] * len(solutions_data)
@@ -248,7 +259,7 @@ Result:{error_note}
 
         return selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries
 
-    def _generate_branching_questions(self, use_chain_id=None, follow_up_hint=None):
+    def _generate_branching_questions(self, use_chain_id=None, follow_up_hint=None, model_override=None):
         """
         Generate 5 branching questions. Phase-driven: all 5 are the same type.
         """
@@ -289,7 +300,7 @@ Result:{error_note}
 
         model_context = self.research_model if self.research_model else "(No model yet — first iteration)"
 
-        phase_prompt = self.bamboo.prompts.ideas_explorer_auto.format(
+        phase_prompt = self.engine.prompts.ideas_explorer_auto.format(
             phase_mode=phase_mode,
             current_phase=self.current_phase,
             phase_instruction=phase_instruction,
@@ -297,7 +308,7 @@ Result:{error_note}
         )
 
         # Complete question log (prevents circular exploration)
-        all_questions_log = self.bamboo.message_manager.format_all_questions()
+        all_questions_log = self.engine.message_manager.format_all_questions()
 
         gen_prompt = f"""Based on our exploration so far:
 
@@ -313,7 +324,7 @@ Result:{error_note}
         gen_messages = [{"role": "user", "content": gen_prompt}]
 
         agent = 'Question Generator'
-        questions_response = self._llm_stream_silent(gen_messages, agent)
+        questions_response = self._llm_stream_silent(gen_messages, agent, model_override=model_override)
 
         questions, categories = self._parse_questions_with_categories(questions_response)
 
@@ -349,7 +360,7 @@ Pool questions are valuable when current direction feels exhausted."""
 
         exploration_context = self._get_exploration_history()
         # Append complete question log so selector can avoid duplicates
-        all_questions_log = self.bamboo.message_manager.format_all_questions()
+        all_questions_log = self.engine.message_manager.format_all_questions()
         exploration_history = exploration_context + "\n\n" + all_questions_log if all_questions_log else exploration_context
 
         context_section = ""
@@ -358,7 +369,7 @@ Pool questions are valuable when current direction feels exhausted."""
 
         research_model_context = self.research_model if self.research_model else "(No model yet)"
 
-        selection_prompt = self.bamboo.prompts.question_selector.format(
+        selection_prompt = self.engine.prompts.question_selector.format(
             exploration_history=exploration_history,
             questions=chr(10).join(formatted_questions) + pool_section,
             context_hint=context_section,
@@ -487,7 +498,7 @@ Pool questions are valuable when current direction feels exhausted."""
                 )
             parallel_context = '\n'.join(parts)
 
-        interpret_prompt = self.bamboo.prompts.research_model_updater.format(
+        interpret_prompt = self.engine.prompts.research_model_updater.format(
             current_model=current_model,
             question=winning_solution['question'],
             score=quality_score,
@@ -497,6 +508,16 @@ Pool questions are valuable when current direction feels exhausted."""
 
         interpret_messages = [{"role": "user", "content": interpret_prompt}]
         response = self._llm_stream_silent(interpret_messages, 'Research Interpreter')
+
+        # Cross-model fallback if response is empty
+        if not response or not response.strip():
+            fallback_model = self._get_fallback_model('Research Interpreter')
+            if fallback_model:
+                logger.info(f"RI returned empty, falling back to {fallback_model}")
+                response = self._llm_stream_silent(interpret_messages, 'Research Interpreter',
+                                                    model_override=fallback_model)
+            if not response or not response.strip():
+                response = ""
 
         # Parse MODEL_IMPACT
         model_impact = "MEDIUM"
@@ -634,14 +655,14 @@ Pool questions are valuable when current direction feels exhausted."""
         num_parallel_solutions = max(2, min(5, num_parallel_solutions))
 
         # Store original settings
-        original_user_feedback = self.bamboo.user_feedback
-        original_analyst_system_content = self.bamboo.message_manager.select_analyst_messages[0]["content"]
-        original_max_errors = self.bamboo.MAX_ERROR_CORRECTIONS
+        original_user_feedback = self.engine.user_feedback
+        original_analyst_system_content = self.engine.message_manager.select_analyst_messages[0]["content"]
+        original_max_errors = self.engine.MAX_ERROR_CORRECTIONS
 
         # Switch to auto-explore mode
-        self.bamboo.user_feedback = False
-        self.bamboo.message_manager.select_analyst_messages[0]["content"] = self.bamboo.prompts.analyst_selector_system_auto
-        self.bamboo.MAX_ERROR_CORRECTIONS = 3
+        self.engine.user_feedback = False
+        self.engine.message_manager.select_analyst_messages[0]["content"] = self.engine.prompts.analyst_selector_system_auto
+        self.engine.MAX_ERROR_CORRECTIONS = 3
 
         try:
             current_image = initial_image
@@ -688,18 +709,18 @@ Pool questions are valuable when current direction feels exhausted."""
             self._current_iteration = start_iteration
 
             # --- Header ---
-            df_shape = f"{self.bamboo.df.shape[0]:,} rows × {self.bamboo.df.shape[1]} cols"
-            agent_model = self.bamboo.models.agent_model
-            code_model = self.bamboo.models.code_model
+            df_shape = f"{self.engine.df.shape[0]:,} rows × {self.engine.df.shape[1]} cols"
+            agent_model = self.engine.models.agent_model
+            code_model = self.engine.models.code_model
             if interactive and not resumed_state:
                 print(style.config_lines(df_shape, max_iterations, num_parallel_solutions,
-                                         self.bamboo.output_dir, agent_model, code_model))
+                                         self.engine.output_dir, agent_model, code_model))
             else:
                 extra = ""
                 if resumed_state:
                     extra = f" (resuming from iteration {start_iteration})"
                 print(style.splash_header(df_shape, max_iterations, num_parallel_solutions,
-                                          self.bamboo.output_dir, agent_model, code_model))
+                                          self.engine.output_dir, agent_model, code_model))
                 if extra:
                     print(f"    {style.DIM}{extra}{style.RESET}")
             print()
@@ -713,9 +734,9 @@ Pool questions are valuable when current direction feels exhausted."""
                     break
 
                 # --- ADDED: set iteration context on engine ---
-                self.bamboo._iteration = iteration + 1
-                self.bamboo._max_iterations = max_iterations
-                self.bamboo._phase = self.current_phase
+                self.engine._iteration = iteration + 1
+                self.engine._max_iterations = max_iterations
+                self.engine._phase = self.current_phase
 
                 # Determine questions to process
                 if iteration == 0:
@@ -740,8 +761,8 @@ Pool questions are valuable when current direction feels exhausted."""
 
                     # Restore to common starting point for parallel branches
                     if len(questions_to_process) > 1 and last_solution_chain is not None:
-                        self.bamboo.message_manager.restore_interaction(
-                            self.bamboo.thread_id,
+                        self.engine.message_manager.restore_interaction(
+                            self.engine.thread_id,
                             last_solution_chain,
                         )
 
@@ -755,23 +776,23 @@ Pool questions are valuable when current direction feels exhausted."""
                     # Process question
                     error_occurred = False
                     try:
-                        self.bamboo._process_question(question, current_image if q_idx == 0 else None, None, None)
+                        self.engine._process_question(question, current_image if q_idx == 0 else None, None, None)
                     except Exception as e:
                         error_occurred = True
                         logger.warning(f"Execution error: {e}")
-                        self.bamboo.output_manager.display_error(f"Execution error: {e}", chain_id=self.chain_id)
+                        self.engine.output_manager.display_error(f"Execution error: {e}", chain_id=self.chain_id)
 
                     solutions_data.append({
                         'question': question,
-                        'results': self.bamboo.message_manager.code_exec_results,
-                        'code': self.bamboo.message_manager.last_code,
-                        'text_answer': self.bamboo.message_manager.last_plan,
+                        'results': self.engine.message_manager.code_exec_results,
+                        'code': self.engine.message_manager.last_code,
+                        'text_answer': self.engine.message_manager.last_plan,
                         'chain_id': solution_chain_id,
                         'error_occurred': error_occurred,
                         'category': categories_to_process[q_idx] if q_idx < len(categories_to_process) else 'exploit',
                     })
 
-                    self.bamboo.message_manager.reset_non_cumul_messages()
+                    self.engine.message_manager.reset_non_cumul_messages()
                     time.sleep(1)
 
                 # Supporting chain
@@ -905,7 +926,7 @@ Pool questions are valuable when current direction feels exhausted."""
                         self.insight_tree[node_id]['status'] = 'runner_up'
 
                 # --- ADDED: write iteration summary ---
-                self.bamboo.write_iteration_summary(
+                self.engine.write_iteration_summary(
                     iteration=iteration + 1,
                     phase=old_phase,
                     solutions_data=solutions_data,
@@ -951,7 +972,7 @@ Pool questions are valuable when current direction feels exhausted."""
                 )
 
                 if new_phase == "REFRAMING" or (new_phase == "MAPPING" and (thread_completed or forced_mapping)):
-                    self.bamboo.branch_endpoints.append(last_solution_chain)
+                    self.engine.branch_endpoints.append(last_solution_chain)
 
                     if new_phase == "REFRAMING":
                         reason_msg = "Contradiction detected — reframing"
@@ -964,8 +985,8 @@ Pool questions are valuable when current direction feels exhausted."""
                     if self.dormant_branches:
                         new_branch_id = self._pop_best_dormant_branch()
                         new_branch = self.insight_tree[new_branch_id]
-                        self.bamboo.message_manager.restore_interaction(
-                            self.bamboo.thread_id,
+                        self.engine.message_manager.restore_interaction(
+                            self.engine.thread_id,
                             new_branch['chain_id'],
                         )
                         self.active_branch_id = new_branch_id
@@ -983,11 +1004,23 @@ Pool questions are valuable when current direction feels exhausted."""
 
                 # Retry once if parsing failed
                 if not new_questions:
-                    logger.warning(f"Question generation returned empty. Raw response: {raw_response[:200] if raw_response else '(empty)'}")
+                    logger.info(f"Question generation returned empty. Raw response: {raw_response[:200] if raw_response else '(empty)'}")
                     print(style.error_msg("Question generation failed, retrying..."))
                     new_questions, new_categories, raw_response = self._generate_branching_questions(
                         use_chain_id=supporting_chain_id,
                     )
+
+                # Cross-model fallback: if still empty, try the alternate model
+                if not new_questions:
+                    fallback_model = self._get_fallback_model('Question Generator')
+                    if fallback_model:
+                        logger.info(f"QG retry failed, falling back to {fallback_model}")
+                        print(style.error_msg(f"Retrying with fallback model..."))
+                        new_questions, new_categories, raw_response = self._generate_branching_questions(
+                            use_chain_id=supporting_chain_id,
+                            follow_up_hint=last_follow_up_angle,
+                            model_override=fallback_model,
+                        )
 
                 if not new_questions:
                     print(style.error_msg("Could not generate new questions after retry. Exploration complete."))
@@ -1026,10 +1059,10 @@ Pool questions are valuable when current direction feels exhausted."""
 
             # === CAPTURE FINAL BRANCH ENDPOINT ===
             if last_solution_chain:
-                self.bamboo.branch_endpoints.append(last_solution_chain)
+                self.engine.branch_endpoints.append(last_solution_chain)
 
             # === BUILD TRAJECTORY ===
-            self.bamboo.exploration_trajectory = self._build_exploration_trajectory()
+            self.engine.exploration_trajectory = self._build_exploration_trajectory()
 
             # === SYNTHESIS ===
             with style.spinner("Generating synthesis report"):
@@ -1040,7 +1073,9 @@ Pool questions are valuable when current direction feels exhausted."""
                 synthesis_text = ""
 
             # === EXPLORATION TREE ===
-            print(style.exploration_tree(self.insight_tree, self.root_node_id))
+            print(style.exploration_tree(self.insight_tree, self.root_node_id,
+                                         phase_history=self.phase_history,
+                                         total_iterations=iteration))
 
             # === FINAL SUMMARY ===
             dormant_count = len(self.dormant_branches)
@@ -1052,12 +1087,12 @@ Pool questions are valuable when current direction feels exhausted."""
                 avg=avg_score,
                 dormant=dormant_count,
                 phase_hist=self.phase_history,
-                cost_str=self.bamboo.cost_tracker.report(),
-                output_dir=self.bamboo.output_dir,
+                cost_str=self.engine.cost_tracker.report(),
+                output_dir=self.engine.output_dir,
             ))
 
             # Write final files
-            self.bamboo.write_final_outputs(
+            self.engine.write_final_outputs(
                 research_model=self.research_model,
                 phase_history=self.phase_history,
                 synthesis_text=synthesis_text,
@@ -1066,25 +1101,25 @@ Pool questions are valuable when current direction feels exhausted."""
 
         finally:
             # Restore original settings
-            self.bamboo.user_feedback = original_user_feedback
-            self.bamboo.message_manager.select_analyst_messages[0]["content"] = original_analyst_system_content
-            self.bamboo.MAX_ERROR_CORRECTIONS = original_max_errors
+            self.engine.user_feedback = original_user_feedback
+            self.engine.message_manager.select_analyst_messages[0]["content"] = original_analyst_system_content
+            self.engine.MAX_ERROR_CORRECTIONS = original_max_errors
 
     def _generate_synthesis(self, seed_question, max_retries=3):
         """Generate final synthesis report using exploration trajectory."""
-        trajectory = self.bamboo.exploration_trajectory
+        trajectory = self.engine.exploration_trajectory
         if not trajectory:
             return None
 
         # Use full untruncated results for synthesis (not the 500-char tree summaries)
-        full_store = self.bamboo.message_manager.full_results_store
+        full_store = self.engine.message_manager.full_results_store
         synthesis_context = format_trajectory_for_synthesis(
             trajectory, full_results_store=full_store
         )
 
         import datetime
         today = datetime.date.today().strftime("%Y-%m-%d")
-        prompt = self.bamboo.prompts.exploration_synthesis.format(
+        prompt = self.engine.prompts.exploration_synthesis.format(
             today,
             synthesis_context,
             f"Synthesize all findings from the exploration seeded by: {seed_question}",
@@ -1262,7 +1297,7 @@ Pool questions are valuable when current direction feels exhausted."""
     def _get_dataset_schema(self):
         """Get full dataset schema for Code Generator context."""
         try:
-            return f"**Available Data:**\n{self.bamboo._get_df_schema()}"
+            return f"**Available Data:**\n{self.engine._get_df_schema()}"
         except Exception as e:
             logger.warning(f"Could not get dataset schema: {e}")
             return ""
@@ -1270,7 +1305,7 @@ Pool questions are valuable when current direction feels exhausted."""
     def _get_dataset_schema_slim(self):
         """FIX 5: Lightweight schema for non-code agents (QG, Selector, Evaluator)."""
         try:
-            return f"**Available Data:**\n{self.bamboo._get_df_schema_slim()}"
+            return f"**Available Data:**\n{self.engine._get_df_schema_slim()}"
         except Exception as e:
             logger.warning(f"Could not get slim dataset schema: {e}")
             # Fall back to full schema if slim not available
@@ -1311,6 +1346,19 @@ Pool questions are valuable when current direction feels exhausted."""
         self.insight_tree[best_id]['status'] = 'active'
         return best_id
 
+    def _get_fallback_model(self, agent):
+        """Get the alternate model for cross-model fallback.
+
+        If the agent normally uses the agent_model, returns the code_model,
+        and vice versa. Returns None if both models are the same.
+        """
+        agent_model = self.engine.models.agent_model
+        code_model = self.engine.models.code_model
+        if agent_model == code_model:
+            return None
+        normal_model = self.engine.models.get_model_name(agent)[0]
+        return code_model if normal_model == agent_model else agent_model
+
     def _trim_question_pool(self):
         if len(self.question_pool) > 10:
             self.question_pool = self.question_pool[-10:]
@@ -1346,16 +1394,16 @@ Pool questions are valuable when current direction feels exhausted."""
                 "node_counter": AutoExplorer._node_counter,
             },
             "message_manager": {
-                "qa_pairs": self.bamboo.message_manager.qa_pairs,
-                "all_questions": self.bamboo.message_manager.all_questions,
-                "full_results_store": self.bamboo.message_manager.full_results_store,
+                "qa_pairs": self.engine.message_manager.qa_pairs,
+                "all_questions": self.engine.message_manager.all_questions,
+                "full_results_store": self.engine.message_manager.full_results_store,
             },
-            "branch_endpoints": list(self.bamboo.branch_endpoints),
+            "branch_endpoints": list(self.engine.branch_endpoints),
             "last_solution_chain": last_solution_chain,
             "last_follow_up_angle": last_follow_up_angle,
         }
 
-        path = os.path.join(self.bamboo.output_dir, "state.json")
+        path = os.path.join(self.engine.output_dir, "state.json")
         tmp_path = path + ".tmp"
         with open(tmp_path, 'w') as f:
             json.dump(state, f, indent=2, default=str)
@@ -1381,11 +1429,11 @@ Pool questions are valuable when current direction feels exhausted."""
         AutoExplorer._node_counter = ex.get('node_counter', 0)
 
         mm = state['message_manager']
-        self.bamboo.message_manager.qa_pairs = mm['qa_pairs']
-        self.bamboo.message_manager.all_questions = mm['all_questions']
-        self.bamboo.message_manager.full_results_store = mm['full_results_store']
+        self.engine.message_manager.qa_pairs = mm['qa_pairs']
+        self.engine.message_manager.all_questions = mm['all_questions']
+        self.engine.message_manager.full_results_store = mm['full_results_store']
 
-        self.bamboo.branch_endpoints = state.get('branch_endpoints', [])
+        self.engine.branch_endpoints = state.get('branch_endpoints', [])
 
     def _build_exploration_trajectory(self):
         """Build trajectory for synthesis. Includes result_summary for each node."""
@@ -1411,7 +1459,7 @@ Pool questions are valuable when current direction feels exhausted."""
         )
 
         branches = []
-        for endpoint_chain in self.bamboo.branch_endpoints:
+        for endpoint_chain in self.engine.branch_endpoints:
             endpoint_node = None
             for nid, node in self.insight_tree.items():
                 if node['chain_id'] == endpoint_chain:
@@ -1436,7 +1484,7 @@ Pool questions are valuable when current direction feels exhausted."""
         return {
             'nodes': explored_nodes,
             'branches': branches,
-            'branch_endpoints': list(self.bamboo.branch_endpoints),
+            'branch_endpoints': list(self.engine.branch_endpoints),
             'research_model': self.research_model,
             'phase_history': self.phase_history,
         }

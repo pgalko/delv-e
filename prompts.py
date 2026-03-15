@@ -158,9 +158,12 @@ Rate each solution 1-10 based on:
 - 1-2: Failed, null result, or no new information
 
 **Stagnation Detection:**
-Answer YES if EITHER:
-- Results only confirm or add minor detail to what the research model already captures, OR
+Answer YES if ANY of these apply:
+- Results only confirm or add minor detail to what the research model already captures
 - Current branch depth is 3+ iterations AND dormant branches with scores 7+ exist
+- The last 3+ analyses use the same analytical method (e.g., all regression, all correlation,
+  all segmentation) and refine the same relationship — this is methodological stagnation even
+  if the specific numbers differ between analyses
 
 **Respond in exactly this format:**
 SCORES: [comma-separated scores 1-10 for each solution, in order]
@@ -412,7 +415,9 @@ Structure your report as follows:
 
 ## Executive Summary
 2-3 sentences: the exploration scope, the central question, and the most important
-conclusion. Be precise about what the evidence actually supports.
+conclusion. Lead with the simplest, most direct answer to the original question before
+introducing complexity. If the question asks "which is best," name it and give the key
+number. Secondary mechanisms and nuances come after.
 
 ## How Understanding Evolved
 Trace how the exploration's UNDERSTANDING changed over time as a research narrative:
@@ -423,7 +428,9 @@ For each pivotal moment, cite the specific analysis [[chain_id]] and the quantit
 result that triggered the shift.
 
 ## Key Findings
-Synthesize the most significant discoveries. For each:
+Synthesize the most significant discoveries. Order by practical importance: findings
+that directly answer the original question come first, followed by mechanistic
+explanations, then secondary patterns. For each:
 - State the specific result with exact numbers [[chain_id]]
 - Explain the practical or theoretical significance
 
