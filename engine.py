@@ -190,6 +190,7 @@ class ExplorationEngine:
         self._max_iterations = 0
         self._phase = "MAPPING"
         self._question = ""
+        self.data_profile = ""  # Set by auto_explore after orientation
 
         # Output directory setup
         if continue_run:
@@ -255,6 +256,12 @@ class ExplorationEngine:
             qa_pairs=qa_context,
             question=question,
         )
+        # Inject analytical profile from orientation (if available)
+        if self.data_profile:
+            user_msg = user_msg.replace(
+                "Previous findings from this exploration:",
+                f"**Analytical Profile (from orientation — use for group sizes and confounders):**\n{self.data_profile}\n\nPrevious findings from this exploration:",
+            )
         messages = [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
@@ -424,6 +431,133 @@ class ExplorationEngine:
         )
 
     # ──────────────────────────────────────────────
+    # Orientation (data profiling)
+    # ──────────────────────────────────────────────
+
+    def run_orientation(self, seed_question):
+        """Run the orientation phase: profile the dataset's analytical landscape.
+
+        Returns the data profile string, or empty string on failure.
+        Uses the orientation-specific prompts which focus on cross-variable
+        relationships, group sizes, confounders, and power boundaries — NOT
+        column-level stats (already in the schema).
+        """
+        schema = self._get_df_schema()
+
+        system_msg = self.prompts.orientation_system
+        user_msg = self.prompts.orientation_user.format(
+            schema=schema,
+            seed_question=seed_question,
+        )
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        model, _ = self.models.get_model_name("Code Generator")
+        self.output_manager.print_wrapper(
+            style.agent("Orientation", model), chain_id=self.chain_id
+        )
+
+        with style.spinner("Profiling dataset"):
+            llm_response = self.llm_client.call(
+                messages=messages,
+                model=model,
+                max_tokens=10000,
+                temperature=0,
+                agent="Code Generator",
+            )
+
+        code = extract_code(llm_response)
+        if not code:
+            self.output_manager.print_wrapper(
+                style.error_msg("Orientation: no code generated"),
+                chain_id=self.chain_id,
+            )
+            return ""
+
+        # Execute
+        analysis_dir = os.path.join(self.output_dir, "orientation")
+        os.makedirs(analysis_dir, exist_ok=True)
+        results, error, plots = self.executor.execute(code, self.df, analysis_dir)
+
+        # Error correction (up to 3 retries)
+        retries = 0
+        while error and retries < 3:
+            retries += 1
+            self.output_manager.print_wrapper(
+                style.error_msg(f"Retry {retries}/3: {error.strip().split(chr(10))[-1][:120]}"),
+                chain_id=self.chain_id,
+            )
+            fix_msg = self.prompts.error_corrector.format(error=error, schema=schema)
+            messages.append({"role": "assistant", "content": llm_response})
+            messages.append({"role": "user", "content": fix_msg})
+
+            with style.spinner("Fixing orientation code"):
+                llm_response = self.llm_client.call(
+                    messages=messages,
+                    model=model,
+                    max_tokens=10000,
+                    temperature=0,
+                    agent="Error Corrector",
+                )
+            code = extract_code(llm_response)
+            if code:
+                results, error, plots = self.executor.execute(code, self.df, analysis_dir)
+            else:
+                break
+
+        if not results:
+            self.output_manager.print_wrapper(
+                style.error_msg("Orientation failed — continuing without data profile"),
+                chain_id=self.chain_id,
+            )
+            return ""
+
+        # Extract PROFILE block
+        profile = ""
+        start_marker = "###PROFILE_START###"
+        end_marker = "###PROFILE_END###"
+        s_idx = results.find(start_marker)
+        e_idx = results.find(end_marker)
+
+        if s_idx >= 0 and e_idx > s_idx:
+            profile = results[s_idx + len(start_marker):e_idx].strip()
+        else:
+            # Fall back to RESULTS markers or raw output
+            s_idx = results.find("###RESULTS_START###")
+            e_idx = results.find("###RESULTS_END###")
+            if s_idx >= 0 and e_idx > s_idx:
+                profile = results[s_idx + len("###RESULTS_START###"):e_idx].strip()
+            else:
+                profile = results.strip()[:3000]
+
+        # Truncate if excessively long (target ~500-1000 tokens)
+        if len(profile) > 4000:
+            profile = profile[:4000] + "\n[...truncated]"
+
+        # Display
+        code_lines = len(code.strip().split('\n'))
+        self.output_manager.print_wrapper(
+            style.success(f"Orientation: {code_lines} lines, profile {len(profile)} chars"),
+            chain_id=self.chain_id,
+        )
+        self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
+        for line in profile.split('\n')[:25]:
+            self.output_manager.print_wrapper(style.result_line(line), chain_id=self.chain_id)
+        if profile.count('\n') > 25:
+            self.output_manager.print_wrapper(
+                style.result_line(style.dim(f"... ({profile.count(chr(10)) - 25} more lines)")),
+                chain_id=self.chain_id,
+            )
+        self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
+
+        # Write analysis.md for the orientation
+        self._write_analysis_md(analysis_dir, "ORIENTATION: Dataset analytical profile", code, results, error, plots)
+
+        return profile
+
+    # ──────────────────────────────────────────────
     # File Writing
     # ──────────────────────────────────────────────
 
@@ -573,8 +707,14 @@ class ExplorationEngine:
             parts.append(f"  - {col} ({dtype}, {nunique} unique{null_pct})")
             parts.append(f"    {sample_str}")
 
-        parts.append(f"\nFirst 5 rows:\n{self.df.head(5).to_string()}")
-        parts.append(f"\nNumeric summary:\n{self.df.describe().to_string()}")
+        # For narrow datasets (≤50 cols), include head() and describe() — they're
+        # readable and help the code model understand data format and distributions.
+        # For wide datasets (>50 cols), these become unreadable walls of text that
+        # consume most of the context window while adding little value — the column
+        # schema already provides types, nulls, ranges, and sample values.
+        if len(self.df.columns) <= 50:
+            parts.append(f"\nFirst 5 rows:\n{self.df.head(5).to_string()}")
+            parts.append(f"\nNumeric summary:\n{self.df.describe().to_string()}")
         return "\n".join(parts)
 
     def _get_df_schema_slim(self):

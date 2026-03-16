@@ -9,7 +9,7 @@ Modifications from original BambooAI version:
   - Changed: _generate_branching_questions sets chain_id unconditionally
   - Added: iteration context setting, file writing hooks, synthesis step
   - Added: finding_summary compaction, tiered history, score-weighted synthesis,
-           phase oscillation cooldown, evaluator-score-driven CONVERGING
+           model-driven phase transitions via evaluator PHASE recommendation
 """
 
 import json
@@ -34,38 +34,19 @@ class AutoExplorer:
     PHASE_INSTRUCTIONS = {
         "MAPPING": (
             "EXPLORE",
-            "We are in MAPPING phase — surveying the landscape of the data. "
-            "We need to discover what dimensions, patterns, and structures exist before "
-            "committing to any direction. Generate questions that open new angles, examine "
-            "unexplored variables, and build a broad understanding of what this dataset contains. "
-            "Prioritize coverage over depth. The research model's 'Biggest Gap' field is especially "
-            "relevant — try to address gaps in our current understanding."
+            "We are in MAPPING phase — surveying the landscape broadly. "
+            "Generate questions that open new angles, examine unexplored variables, and "
+            "build understanding of what this dataset contains. Prioritize coverage over depth. "
+            "Screening analyses that test many variables at once are especially valuable here — "
+            "they identify promising leads for targeted follow-up."
         ),
         "PURSUING": (
             "EXPLOIT",
-            "We are in PURSUING phase — we have found something interesting and need to go deep. "
-            "Generate questions that add precision to our most promising finding: find exact thresholds, "
-            "identify the specific conditions under which the pattern holds, quantify effect sizes, "
-            "and test whether the relationship is robust across subgroups. The goal is to turn a "
-            "suggestive finding into a well-evidenced conclusion."
-        ),
-        "CONVERGING": (
-            "REFLECT",
-            "We are in CONVERGING phase — our findings have been consistent but are no longer "
-            "updating our understanding. Before moving on, we need to pressure-test what we think "
-            "we know. Generate questions that look for disconfirming evidence, check consistency "
-            "between findings, test whether patterns hold in opposite conditions, and ask whether "
-            "simpler explanations might account for what we have observed. If our understanding "
-            "survives these tests, we can consider this thread complete. If not, we may need to reframe."
-        ),
-        "REFRAMING": (
-            "EXPLORE",
-            "We are in REFRAMING phase — our current line of inquiry has hit a contradiction or "
-            "dead end. We need to step back and look at the data from a fundamentally different angle. "
-            "Generate questions that challenge the assumptions underlying our previous approach. "
-            "Consider: are we looking at the right variables? The right level of aggregation? "
-            "The right time window? The research model's contradictions and weak points should "
-            "guide what new directions to try."
+            "We are in PURSUING phase — deepening a promising lead. "
+            "Generate questions that add precision: find exact thresholds, identify conditions "
+            "under which the pattern holds, quantify effect sizes, test robustness, and look "
+            "for disconfirming evidence. The goal is to turn a suggestive finding into a "
+            "well-evidenced conclusion — or rule it out definitively."
         ),
     }
 
@@ -88,6 +69,9 @@ class AutoExplorer:
         self.evaluator_score_history = []   # FIX 4: track evaluator scores for phase decisions
         self.biggest_gap_history = []        # last N "Biggest Gap" texts from research model
         self.stagnation_count = 0            # consecutive iterations evaluator flagged stagnation
+
+        # Orientation data profile — pinned context, never truncated
+        self.data_profile = ""
 
         # Reset branch endpoints
         self.engine.branch_endpoints = []
@@ -156,6 +140,9 @@ class AutoExplorer:
 - Remaining iterations: {remaining_iterations} of {max_iterations}
 
 {self._get_exploration_history()}"""
+
+        if self.data_profile:
+            exploration_state = f"**Analytical Profile (from orientation):**\n{self.data_profile}\n\n{exploration_state}"
 
         research_model_context = self.research_model if self.research_model else "(No model yet)"
 
@@ -232,12 +219,21 @@ Result:{error_note}
             stag_line = response.upper().split('STAGNATION:')[1].split('\n')[0]
             is_stagnating = 'YES' in stag_line.upper()
 
+        # Parse PHASE recommendation from evaluator
+        phase_recommendation = None
+        if 'PHASE:' in response.upper():
+            phase_line = response.upper().split('PHASE:')[1].split('\n')[0].strip()
+            for candidate in ['MAPPING', 'PURSUING']:
+                if candidate in phase_line:
+                    phase_recommendation = candidate
+                    break
+
         # Parse SUMMARIES — one-sentence summary per solution, pipe-separated
         summaries = [''] * len(solutions_data)
         if 'SUMMARIES:' in response:
             summary_text = response.split('SUMMARIES:')[1]
             # Take until next field
-            for end in ['SELECTED:', 'KEEP_DORMANT:', 'STAGNATION:', 'REASON:', '\n\n']:
+            for end in ['SELECTED:', 'KEEP_DORMANT:', 'STAGNATION:', 'REASON:', 'PHASE:', '\n\n']:
                 idx = summary_text.find(end)
                 if idx > 0:
                     summary_text = summary_text[:idx]
@@ -257,7 +253,7 @@ Result:{error_note}
             if angle_text and angle_text.lower() not in ['', 'none', 'n/a']:
                 follow_up_angle = angle_text
 
-        return selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries
+        return selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries, phase_recommendation
 
     def _generate_branching_questions(self, use_chain_id=None, follow_up_hint=None, model_override=None):
         """
@@ -281,18 +277,6 @@ Result:{error_note}
         if follow_up_hint:
             hint_section = f"\n**Promising direction:** {follow_up_hint}\n"
 
-        # Periodic grounding check — every 8 iterations, nudge the QG to step back
-        # and consider whether basic decompositions or direct comparisons were missed.
-        current_iter = getattr(self, '_current_iteration', 0)
-        if current_iter > 0 and current_iter % 8 == 0:
-            hint_section += (
-                "\n**Grounding check:** Step back from the current thread and consider "
-                "the original question. Are there basic decompositions, direct comparisons, "
-                "or simple summary statistics that have not been computed yet? At least one "
-                "of your 5 questions should address a fundamental aspect of the original "
-                "question using a straightforward analytical approach.\n"
-            )
-
         phase_mode, phase_instruction = self.PHASE_INSTRUCTIONS.get(
             self.current_phase,
             ("EXPLORE", "Generate exploratory questions."),
@@ -310,10 +294,14 @@ Result:{error_note}
         # Complete question log (prevents circular exploration)
         all_questions_log = self.engine.message_manager.format_all_questions()
 
+        profile_section = ""
+        if self.data_profile:
+            profile_section = f"\n**Analytical Profile (from orientation):**\n{self.data_profile}\n"
+
         gen_prompt = f"""Based on our exploration so far:
 
 {dataset_schema}
-
+{profile_section}
 {exploration_context}
 
 {all_questions_log}
@@ -362,6 +350,9 @@ Pool questions are valuable when current direction feels exhausted."""
         # Append complete question log so selector can avoid duplicates
         all_questions_log = self.engine.message_manager.format_all_questions()
         exploration_history = exploration_context + "\n\n" + all_questions_log if all_questions_log else exploration_context
+
+        if self.data_profile:
+            exploration_history = f"**Analytical Profile (from orientation):**\n{self.data_profile}\n\n{exploration_history}"
 
         context_section = ""
         if context_hint:
@@ -485,6 +476,11 @@ Pool questions are valuable when current direction feels exhausted."""
         result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
         current_model = self.research_model if self.research_model else "(No model yet — this is the first result. Initialize the model from scratch.)"
 
+        # Prepend analytical profile so the RI has orientation context
+        if self.data_profile and not self.research_model:
+            # First iteration: include profile so RI can reference it when initializing
+            current_model += f"\n\n**Analytical Profile (from orientation — reference only, do not duplicate in model):**\n{self.data_profile}"
+
         parallel_context = ""
         if solutions_data and len(solutions_data) > 1 and scores:
             parts = ["**Other parallel results this iteration (not selected):**"]
@@ -499,6 +495,7 @@ Pool questions are valuable when current direction feels exhausted."""
             parallel_context = '\n'.join(parts)
 
         interpret_prompt = self.engine.prompts.research_model_updater.format(
+            seed_question=self.seed_question,
             current_model=current_model,
             question=winning_solution['question'],
             score=quality_score,
@@ -566,74 +563,26 @@ Pool questions are valuable when current direction feels exhausted."""
         return updated_model, model_impact, contradiction, thread_completed, result_digest
 
     def _determine_phase(self, model_impact, contradiction, thread_completed,
-                         evaluator_stagnating=0):
-        """Rule-based phase transition with stagnation detection.
+                         evaluator_stagnating=0, phase_recommendation=None):
+        """Model-driven phase transition. Two phases: MAPPING (explore) and PURSUING (deepen).
 
-        Stagnation signals:
-        - evaluator_stagnating: consecutive iterations the evaluator flagged STAGNATION: YES.
-          2+ consecutive triggers CONVERGING — this is the primary structural signal for
-          diminishing returns, since the evaluator independently assesses each result.
+        The evaluator recommends a phase based on the full exploration context,
+        research model, and Exploration Health assessment. Thread completion is the
+        only structural override.
         """
-
-        # Oscillation cooldown — checked FIRST so it can override everything.
-        current_iter = getattr(self, '_current_iteration', 0)
-        if current_iter >= 10:
-            recent_changes = sum(
-                1 for i, _o, _n in self.phase_history
-                if i >= current_iter - 4
-            )
-            if recent_changes >= 3:
-                logger.info("Phase → PURSUING (oscillation cooldown: %d transitions in 5 iterations)", recent_changes)
-                return "PURSUING"
-
-        # Stagnation detection — evaluator has flagged consecutive stagnation.
-        # Only activate after iteration 5 to let early exploration breathe.
-        if current_iter >= 5 and self.current_phase != "CONVERGING":
-            if evaluator_stagnating >= 2:
-                logger.info("Phase → CONVERGING (evaluator flagged stagnation %d consecutive times)", evaluator_stagnating)
-                return "CONVERGING"
-
-        if contradiction:
-            latest_score = self.evaluator_score_history[-1] if self.evaluator_score_history else 5
-            if latest_score <= 5:
-                logger.info("Phase → REFRAMING (contradiction confirmed by low evaluator score %d)", latest_score)
-                return "REFRAMING"
-            else:
-                logger.info("Contradiction overridden — evaluator score %d suggests refinement, not reversal", latest_score)
-
+        # Thread completion is structural — always triggers MAPPING
         if thread_completed:
             logger.info("Phase → MAPPING (thread completed)")
             return "MAPPING"
 
-        if self.current_phase == "CONVERGING":
-            recent_lows = sum(1 for m in self.model_impact_history[-3:] if m == "LOW")
-            if recent_lows >= 3:
-                logger.info("Phase → MAPPING (CONVERGING exhausted)")
-                return "MAPPING"
+        # Use evaluator's phase recommendation if provided
+        if phase_recommendation in ("MAPPING", "PURSUING"):
+            if phase_recommendation != self.current_phase:
+                logger.info("Phase → %s (evaluator recommendation)", phase_recommendation)
+            return phase_recommendation
 
-        if model_impact == "HIGH":
-            logger.info("Phase → PURSUING (high model impact)")
-            return "PURSUING"
-
-        if model_impact == "LOW":
-            recent = self.model_impact_history[-3:] if len(self.model_impact_history) >= 3 else self.model_impact_history
-            low_count = sum(1 for m in recent if m == "LOW")
-            if low_count >= 2:
-                logger.info("Phase → CONVERGING (sustained low model impact)")
-                return "CONVERGING"
-
-        # Evaluator-score-driven CONVERGING trigger
-        if self.current_phase in ("PURSUING", "REFRAMING") and len(self.evaluator_score_history) >= 3:
-            recent_scores = self.evaluator_score_history[-3:]
-            if all(s <= 6 for s in recent_scores):
-                logger.info("Phase → CONVERGING (3 consecutive winning scores ≤ 6: %s)", recent_scores)
-                return "CONVERGING"
-
-        if self.current_phase == "REFRAMING" and model_impact == "MEDIUM":
-            logger.info("Phase → MAPPING (reframing produced new angle)")
-            return "MAPPING"
-
-        logger.info(f"Phase → {self.current_phase} (maintained)")
+        # Fallback: maintain current phase if evaluator didn't recommend
+        logger.info(f"Phase → {self.current_phase} (maintained — no evaluator recommendation)")
         return self.current_phase
 
     # ══════════════════════════════════════════════
@@ -641,7 +590,7 @@ Pool questions are valuable when current direction feels exhausted."""
     # ══════════════════════════════════════════════
 
     def run(self, seed_question, initial_image=None, max_iterations=5, num_parallel_solutions=2,
-            interactive=False, resumed_state=None):
+            interactive=False, resumed_state=None, orientation=True):
         """Run the autonomous exploration loop.
 
         Args:
@@ -650,6 +599,9 @@ Pool questions are valuable when current direction feels exhausted."""
                 *additional* iterations on top of what was already completed.
             resumed_state: If provided, a dict loaded from state.json to restore
                 the exploration from a previous run.
+            orientation: If True (default), run a data profiling step before the
+                main loop to characterize the analytical landscape. Skipped on
+                resumed runs. Use --no-orientation to disable for simple tasks.
         """
 
         num_parallel_solutions = max(2, min(5, num_parallel_solutions))
@@ -703,6 +655,9 @@ Pool questions are valuable when current direction feels exhausted."""
                 self.biggest_gap_history = []
                 self.stagnation_count = 0
 
+                # Reset data profile (will be populated by orientation if enabled)
+                self.data_profile = ""
+
                 start_iteration = 0
 
             iteration = start_iteration
@@ -726,6 +681,16 @@ Pool questions are valuable when current direction feels exhausted."""
             print()
 
             logger.info(f"Starting auto-explore: {seed_question[:50]}... max_iterations={max_iterations}")
+
+            # ── ORIENTATION PHASE (fresh runs only) ──
+            if orientation and not resumed_state and not self.kill_signal:
+                logger.info("Running orientation phase — data profiling")
+                self.data_profile = self.engine.run_orientation(seed_question)
+                if self.data_profile:
+                    self.engine.data_profile = self.data_profile
+                    logger.info(f"Orientation complete: {len(self.data_profile)} chars")
+                else:
+                    logger.info("Orientation skipped or failed — continuing without profile")
 
             while iteration < max_iterations:
                 self._current_iteration = iteration
@@ -808,10 +773,11 @@ Pool questions are valuable when current direction feels exhausted."""
                     reason = "Seed question — establishing baseline"
                     follow_up_angle = None
                     summaries = ['']  # no evaluator for seed; summary populated below
+                    phase_recommendation = None
                     _is_seed = True
                 else:
                     with style.spinner("Evaluating results"):
-                        selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries = \
+                        selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries, phase_recommendation = \
                             self._evaluate_results_comparative(
                                 solutions_data,
                                 remaining_iterations=max_iterations - iteration,
@@ -878,17 +844,19 @@ Pool questions are valuable when current direction feels exhausted."""
                 # Track Biggest Gap evolution (stored for debugging)
                 self._update_gap_stability(updated_model)
 
-                # Evaluator signal: did the evaluator flag stagnation?
+                # Legacy stagnation count (kept for checkpoint compat)
                 if is_stagnating:
                     self.stagnation_count += 1
                 else:
                     self.stagnation_count = 0
 
                 # === DETERMINE PHASE ===
+                # Phase is driven by the evaluator's recommendation, not hardcoded rules.
+                # Thread completion is the only structural override.
                 old_phase = self.current_phase
                 new_phase = self._determine_phase(
                     model_impact, contradiction, thread_completed,
-                    evaluator_stagnating=self.stagnation_count,
+                    phase_recommendation=phase_recommendation,
                 )
                 if iteration == 0:
                     new_phase = "MAPPING"
@@ -963,24 +931,12 @@ Pool questions are valuable when current direction feels exhausted."""
                 if self.kill_signal:
                     break
 
-                # === PHASE-DRIVEN BRANCH DECISION ===
-                forced_mapping = (
-                    new_phase == "MAPPING"
-                    and old_phase == "CONVERGING"
-                    and not thread_completed
-                    and not contradiction
-                )
-
-                if new_phase == "REFRAMING" or (new_phase == "MAPPING" and (thread_completed or forced_mapping)):
+                # === BRANCH DECISION ===
+                # When a thread completes, mark the branch endpoint and potentially
+                # switch to a dormant branch or start fresh.
+                if new_phase == "MAPPING" and thread_completed:
                     self.engine.branch_endpoints.append(last_solution_chain)
-
-                    if new_phase == "REFRAMING":
-                        reason_msg = "Contradiction detected — reframing"
-                    elif forced_mapping:
-                        reason_msg = "CONVERGING exhausted — pivoting"
-                    else:
-                        reason_msg = "Thread complete — new territory"
-                    print(style.branch_event(reason_msg))
+                    print(style.branch_event("Thread complete — new territory"))
 
                     if self.dormant_branches:
                         new_branch_id = self._pop_best_dormant_branch()
@@ -1116,6 +1072,10 @@ Pool questions are valuable when current direction feels exhausted."""
         synthesis_context = format_trajectory_for_synthesis(
             trajectory, full_results_store=full_store
         )
+
+        # Prepend analytical profile if available
+        if self.data_profile:
+            synthesis_context = f"**Analytical Profile (dataset orientation):**\n{self.data_profile}\n\n{synthesis_context}"
 
         import datetime
         today = datetime.date.today().strftime("%Y-%m-%d")
@@ -1392,6 +1352,7 @@ Pool questions are valuable when current direction feels exhausted."""
                 "biggest_gap_history": self.biggest_gap_history,
                 "stagnation_count": self.stagnation_count,
                 "node_counter": AutoExplorer._node_counter,
+                "data_profile": self.data_profile,
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
@@ -1427,6 +1388,9 @@ Pool questions are valuable when current direction feels exhausted."""
         self.biggest_gap_history = ex.get('biggest_gap_history', [])
         self.stagnation_count = ex.get('stagnation_count', 0)
         AutoExplorer._node_counter = ex.get('node_counter', 0)
+        self.data_profile = ex.get('data_profile', '')
+        # Sync to engine so code generator can use it
+        self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']
         self.engine.message_manager.qa_pairs = mm['qa_pairs']

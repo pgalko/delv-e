@@ -1,6 +1,6 @@
 # delv-e
 
-Autonomous, long-running data exploration - finds patterns, tests hypotheses, and surfaces insights from any dataset, powered by LLMs. Give it a dataset and a seed question — it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers. Capable of running autonomously for hours over hundreds of iterations. Every step produces a detailed analysis report coupled with charts and visualisations, with a final synthesis report at the end of the run tying everything together.
+Autonomous data investigation powered by LLMs. Give it a dataset and a question — it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers.
 
 ## Quick Start
 
@@ -18,27 +18,26 @@ python run.py data.csv "What factors drive churn?" --iterations 10
 
 ## How It Works
 
-![delv-e screenshot](assets/screenshot.png)
-
+Before the main loop, an **orientation phase** profiles the dataset's analytical landscape — group sizes, confounders, power boundaries, and variable structure. This produces a compact brief that is pinned into every agent's context for the entire run, preventing wasted iterations on underpowered comparisons or rediscovering confounds.
 
 Each iteration:
 
-1. **Generate questions** — LLM proposes analytical questions based on findings so far
+1. **Generate questions** — LLM proposes analytical questions guided by the research model's Exploration Health section, which tracks what's been explored, what's unexplored, and whether breadth is adequate
 2. **Write & execute code** — code model writes Python, runs it against your DataFrame
-3. **Evaluate results** — LLM scores parallel solutions, summarises findings, detects stagnation
-4. **Update research model** — living document of hypotheses, findings, and open gaps
-5. **Decide what's next** — phase system shifts between exploration modes based on progress
+3. **Evaluate results** — LLM scores parallel solutions, selects the best, and recommends the next exploration phase (MAPPING or PURSUING) based on the full trajectory
+4. **Update research model** — living document of hypotheses, findings, open gaps, and an honest assessment of exploration breadth
+5. **Transition phase** — system follows the evaluator's phase recommendation; the only structural override is thread completion, which triggers MAPPING
 
 ### Phase System
 
-| Phase | Mode | Triggers |
-|---|---|---|
-| **MAPPING** | Broad survey | Thread completed, CONVERGING exhausted |
-| **PURSUING** | Deep dive on a lead | High model impact, oscillation cooldown |
-| **CONVERGING** | Pressure-test findings | Evaluator stagnation (2+ consecutive), sustained low model impact, low evaluator scores |
-| **REFRAMING** | Different angle | Contradiction confirmed by low evaluator score |
+delv-e uses two phases with model-driven transitions. The evaluator recommends a phase after every iteration based on the full exploration context, research model, and Exploration Health assessment.
 
-CONVERGING is the diminishing-returns detector. It activates when the evaluator independently flags consecutive iterations as stagnating, when the RI reports sustained LOW model impact, or when winning scores drop below 6 for three consecutive iterations. Once in CONVERGING, the system generates questions that look for disconfirming evidence and simpler alternative explanations.
+| Phase | Mode | When the evaluator recommends it |
+|---|---|---|
+| **MAPPING** | Broad survey, screening | Recent analyses concentrated on same topic, large unexplored territory, thread concluded, or exploration is early-stage |
+| **PURSUING** | Deep dive, validation | Latest result opened genuinely new territory, finding needs verification or robustness testing |
+
+The system's purpose is **discovery** — surveying a dataset's full landscape to find what is interesting. The evaluator is instructed that breadth is more valuable than depth: a run covering 8 topics at moderate depth is better than one covering 2 topics exhaustively. Phase transitions have no hardcoded rules — the models see the exploration state and decide.
 
 ## Usage
 
@@ -52,6 +51,7 @@ python run.py <dataset> ["<question>"] [options]
 | `--parallel N` | 2 | Parallel solutions per iteration |
 | `--output DIR` | output/ | Output directory |
 | `--continue` | | Resume from previous run's checkpoint |
+| `--no-orientation` | | Skip the orientation phase (data profiling) |
 | `--agent-model` | anthropic:claude-haiku-4-5-20251001 | Model for agents (evaluator, QG, RI, selector) |
 | `--code-model` | anthropic:claude-haiku-4-5-20251001 | Model for code generation and synthesis |
 
@@ -74,23 +74,23 @@ OpenRouter provides access to hundreds of models (DeepSeek, Qwen, Kimi, GLM, Gem
 # All Haiku (cheapest cloud option)
 python run.py data.csv "Analyze trends" --iterations 15
 
+# Quick 3-iteration run — skip orientation
+python run.py data.csv "What's the class balance?" --iterations 3 --no-orientation
+
 # OSS models via OpenRouter
 python run.py data.csv "What predicts price?" \
     --agent-model openrouter:moonshotai/kimi-k2.5 \
-    --code-model openrouter:moonshotai/kimi-k2.5 \
-    --iterations 15
+    --code-model openrouter:moonshotai/kimi-k2.5
 
 # Mix providers — OSS agents, Anthropic code
 python run.py data.csv "Deep analysis" \
     --agent-model openrouter:z-ai/glm-5 \
-    --code-model anthropic:claude-haiku-4-5-20251001 \
-    --iterations 15
+    --code-model anthropic:claude-haiku-4-5-20251001
 
-# Ollama - Local agents, Cloud code
+# Local Ollama
 python run.py data.csv "Quick look" \
     --agent-model ollama:qwen3:30b \
-    --code-model ollama:kimi-k2.5:cloud \
-    --iterations 15
+    --code-model ollama:qwen3:30b
 ```
 
 ## Resuming Runs
@@ -117,6 +117,8 @@ output/
 ├── state.json               # Checkpoint for --continue
 ├── dataframe.parquet        # Preserved DataFrame
 ├── cost.txt                 # Cost breakdown
+├── orientation/
+│   └── analysis.md          # Dataset analytical profile
 └── exploration/
     ├── 01_MAPPING/
     │   ├── _summary.md      # Iteration evaluation + phase decision
@@ -129,19 +131,27 @@ output/
 
 ## Memory Architecture
 
-LLMs have no memory between calls. delv-e manages context through four layers:
+LLMs have no memory between calls. delv-e manages context through five layers:
+
+**Data Profile** — produced by the orientation phase before iteration 1. A compact analytical brief (~500-1000 tokens) covering group sizes, confounders, power boundaries, and variable structure. Pinned into every agent's context for the entire run — never truncated or compacted. This is how the system knows "LumA-chemo has only n=26" at iteration 50 without having to rediscover it.
 
 **Insight Tree** — every analysis is a node with question, results, score, and summaries. Agents see a tiered view: recent entries with RI-curated key numbers (result_digest), older entries compressed to one-sentence summaries (finding_summary from the evaluator). Nothing is deleted — the system manages visibility, not existence.
 
-**Research Model** — a structured document tracking active hypotheses, established findings (each with a quantitative anchor), open threads, and the biggest gap driving the next investigation. Updated after every iteration, read by every agent. This is how findings from iteration 3 still influence question generation at iteration 50.
+**Research Model** — a structured document with six sections, updated after every iteration and read by every agent:
+- *Active Hypotheses* (max 4) — testable claims the next analysis could change
+- *Established Findings* (max 6) — confirmed facts with quantitative anchors
+- *Threads* (max 3) — active lines of inquiry with open questions
+- *Biggest Gap* — the most important thing not yet investigated
+- *Exploration Health* — honest self-assessment of breadth, recent topic concentration, and unexplored territory. This section drives the exploration's strategic direction: when the RI reports low breadth, the evaluator recommends MAPPING, and the question generator pivots to new territory. Breadth is assessed based on *recent concentration* (what the last 5-8 analyses focused on), not total topic count.
+- *Narrative* — 2-3 sentences connecting the latest result to prior understanding
 
-**Q&A Pairs** — the Code Generator sees the 20 most recent question-result pairs plus the full dataset schema. A deliberate sliding window — the code writer needs tactical context, not the full exploration history.
+**Q&A Pairs** — the Code Generator sees the 20 most recent question-result pairs plus the dataset schema. A deliberate sliding window — the code writer needs tactical context, not the full exploration history.
 
 **Full Results Store** — untruncated results from every analysis, never shown to agents during exploration. Used only by the Synthesis Generator, which selects up to 40 analyses via score-weighted selection (top-scoring from the entire run + most recent 15 for continuity).
 
 ### Context Management
 
-The system uses two schema modes: a full schema (with `head()` and `describe()`) for the Code Generator, and a slim schema (column names, types, and unique counts only) for all other agents — an 80% reduction.
+The system uses two schema modes: a full schema for the Code Generator, and a slim schema (column names, types, and unique counts only) for all other agents. For datasets with more than 50 columns, `head()` and `describe()` are omitted from the full schema — these become unreadable noise at high column counts and the column-level metadata (types, ranges, sample values) provides what the code model needs. This reduces code generator input by up to 70% on wide datasets.
 
 The evaluator generates one-sentence summaries for all parallel solutions (not just the winner), giving every node in the tree an LLM-curated finding_summary. The RI generates a 3-5 line result_digest of key numbers for winning nodes only. Non-winning nodes that are marked dormant get hypothesis labels combining the question and finding summary, which direct the QG on branch switches.
 
@@ -160,8 +170,8 @@ Check `output/cost.txt` after each run for exact breakdown by agent.
 
 ```
 run.py               CLI — dataset loading, --continue handling
-engine.py            ExplorationEngine — runtime, code execution, file output
-auto_explore.py      Core loop — phases, research model, insight tree, stagnation
+engine.py            ExplorationEngine — runtime, code execution, orientation, file output
+auto_explore.py      Core loop — model-driven phases, research model, insight tree
 llm.py               Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama)
 executor.py          Local code execution with security guards
 prompts.py           All prompt templates
@@ -176,4 +186,4 @@ Generated code runs locally via `exec()`. A module blacklist blocks dangerous op
 
 ## Origin
 
-Standalone extraction of the auto-explore module from [BambooAI](https://bambooai.io). Core exploration logic preserved; web UI, database, billing, and multi-tenant routing replaced with minimal local equivalents.
+Standalone extraction of the auto-explore module from [BambooAI](https://github.com/pgalko/BambooAI). Core exploration logic preserved; web UI, database, billing, and multi-tenant routing replaced with minimal local equivalents.

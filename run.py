@@ -43,6 +43,10 @@ def main():
     parser.add_argument("--continue", dest="continue_run", action="store_true",
                         help="Resume from a previous run's saved state. "
                              "Iterations are additive (e.g. 25 completed + --iterations 30 = 30 more).")
+    parser.add_argument("--no-orientation", dest="orientation", action="store_false",
+                        default=True,
+                        help="Skip the orientation phase (data profiling). "
+                             "Useful for simple datasets or short runs.")
     args = parser.parse_args()
 
     # Load environment
@@ -127,6 +131,7 @@ def main():
         num_parallel_solutions=args.parallel,
         interactive=args.question is None,
         resumed_state=resumed_state,
+        orientation=args.orientation,
     )
 
 
