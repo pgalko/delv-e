@@ -68,7 +68,7 @@ class AutoExplorer:
         self.model_impact_history = []
         self.evaluator_score_history = []   # FIX 4: track evaluator scores for phase decisions
         self.biggest_gap_history = []        # last N "Biggest Gap" texts from research model
-        self.stagnation_count = 0            # consecutive iterations evaluator flagged stagnation
+        self.stagnation_count = 0            # legacy — kept for checkpoint compatibility
 
         # Orientation data profile — pinned context, never truncated
         self.data_profile = ""
@@ -214,10 +214,7 @@ Result:{error_note}
                     if 0 <= idx < len(solutions_data) and idx != selected_index:
                         keep_dormant_indices.append(idx)
 
-        is_stagnating = False
-        if 'STAGNATION:' in response.upper():
-            stag_line = response.upper().split('STAGNATION:')[1].split('\n')[0]
-            is_stagnating = 'YES' in stag_line.upper()
+        is_stagnating = False  # Legacy — kept for return signature compatibility
 
         # Parse PHASE recommendation from evaluator
         phase_recommendation = None
@@ -233,7 +230,7 @@ Result:{error_note}
         if 'SUMMARIES:' in response:
             summary_text = response.split('SUMMARIES:')[1]
             # Take until next field
-            for end in ['SELECTED:', 'KEEP_DORMANT:', 'STAGNATION:', 'REASON:', 'PHASE:', '\n\n']:
+            for end in ['SELECTED:', 'KEEP_DORMANT:', 'REASON:', 'PHASE:', '\n\n']:
                 idx = summary_text.find(end)
                 if idx > 0:
                     summary_text = summary_text[:idx]
@@ -833,8 +830,8 @@ Pool questions are valuable when current direction feels exhausted."""
                 if len(self.research_model) > 6000:
                     self.research_model += (
                         "\n\n**NOTE: This model is getting long. On next update, "
-                        "consider consolidating Established Findings that overlap "
-                        "and keeping the Narrative focused on the latest shift.**"
+                        "consolidate Established Findings that overlap and compress "
+                        "the Exploration Health section.**"
                     )
                 self.model_impact_history.append(model_impact)
                 if len(self.model_impact_history) > 10:
@@ -843,12 +840,6 @@ Pool questions are valuable when current direction feels exhausted."""
                 # === STAGNATION TRACKING ===
                 # Track Biggest Gap evolution (stored for debugging)
                 self._update_gap_stability(updated_model)
-
-                # Legacy stagnation count (kept for checkpoint compat)
-                if is_stagnating:
-                    self.stagnation_count += 1
-                else:
-                    self.stagnation_count = 0
 
                 # === DETERMINE PHASE ===
                 # Phase is driven by the evaluator's recommendation, not hardcoded rules.
@@ -1062,20 +1053,19 @@ Pool questions are valuable when current direction feels exhausted."""
             self.engine.MAX_ERROR_CORRECTIONS = original_max_errors
 
     def _generate_synthesis(self, seed_question, max_retries=3):
-        """Generate final synthesis report using exploration trajectory."""
-        trajectory = self.engine.exploration_trajectory
-        if not trajectory:
+        """Generate final synthesis report from exploration state."""
+        if not self.insight_tree:
             return None
 
-        # Use full untruncated results for synthesis (not the 500-char tree summaries)
         full_store = self.engine.message_manager.full_results_store
-        synthesis_context = format_trajectory_for_synthesis(
-            trajectory, full_results_store=full_store
-        )
 
-        # Prepend analytical profile if available
-        if self.data_profile:
-            synthesis_context = f"**Analytical Profile (dataset orientation):**\n{self.data_profile}\n\n{synthesis_context}"
+        synthesis_context = format_synthesis_input(
+            insight_tree=self.insight_tree,
+            full_results_store=full_store,
+            research_model=self.research_model,
+            seed_question=seed_question,
+            data_profile=self.data_profile or '',
+        )
 
         import datetime
         today = datetime.date.today().strftime("%Y-%m-%d")
@@ -1115,7 +1105,7 @@ Pool questions are valuable when current direction feels exhausted."""
             return ""
         gap_text = model_text.split('## Biggest Gap')[1]
         # Take until next section header or end
-        for marker in ['## Narrative', '## Phase History', '## ']:
+        for marker in ['## Exploration Health', '## Phase History', '## ']:
             idx = gap_text.find(marker)
             if idx > 0:
                 gap_text = gap_text[:idx]
@@ -1546,5 +1536,81 @@ def format_trajectory_for_synthesis(trajectory, full_results_store=None,
 
     if trajectory['research_model']:
         parts.append(f"\n**Final Research Model:**\n{trajectory['research_model']}")
+
+    return '\n'.join(parts)
+
+
+def format_synthesis_input(insight_tree, full_results_store, research_model,
+                           seed_question, data_profile=''):
+    """
+    Build structured synthesis input from exploration state.
+
+    Four sections:
+    A) Framing — seed question + data profile
+    B) Findings Index — all active nodes, compact (finding_summary)
+    C) Full Evidence — all active nodes, complete results
+    D) Research Model — current understanding, confidence, open questions
+    """
+    full_results_store = full_results_store or {}
+    active = sorted(
+        [n for n in insight_tree.values() if n.get('status') == 'active'],
+        key=lambda n: n['chain_id'],
+    )
+
+    if not active:
+        return "No exploration data available."
+
+    parts = []
+
+    # ── Section A: Framing ──
+    parts.append("═══════════════════════════════════════")
+    parts.append("SECTION A: EXPLORATION CONTEXT")
+    parts.append("═══════════════════════════════════════\n")
+    parts.append(f"**Original question:** {seed_question}\n")
+    if data_profile:
+        parts.append(f"**Dataset profile:**\n{data_profile}\n")
+    parts.append(f"**Exploration scope:** {len(active)} analyses completed\n")
+
+    # ── Section B: Findings Index ──
+    parts.append("═══════════════════════════════════════")
+    parts.append("SECTION B: COMPLETE FINDINGS INDEX")
+    parts.append("═══════════════════════════════════════")
+    parts.append("Scan this index to identify ALL major themes and discoveries.")
+    parts.append("Each entry is one analysis with its quality score and one-sentence summary.\n")
+
+    for n in active:
+        fs = n.get('finding_summary', '') or '(no summary)'
+        parts.append(f"[{n['quality_score']}] [[{n['chain_id']}]] {fs}")
+
+    # ── Section C: Full Evidence ──
+    parts.append("\n═══════════════════════════════════════")
+    parts.append("SECTION C: FULL EVIDENCE")
+    parts.append("═══════════════════════════════════════")
+    parts.append("Complete results for every analysis. Use these numbers in your report.\n")
+
+    for n in active:
+        chain_key = str(n['chain_id'])
+        result_text = full_results_store.get(
+            chain_key, n.get('result_summary', 'Results not available')
+        )
+        # Safety cap per node
+        if len(result_text) > 3000:
+            result_text = result_text[:1500] + "\n[...truncated...]\n" + result_text[-1500:]
+
+        parts.append(
+            f"[[{n['chain_id']}]] Score: {n['quality_score']}/10\n"
+            f"Question: {n['question']}\n"
+            f"Results:\n{result_text}\n"
+            f"{'─' * 5}"
+        )
+
+    # ── Section D: Research Model ──
+    parts.append("\n═══════════════════════════════════════")
+    parts.append("SECTION D: FINAL RESEARCH MODEL")
+    parts.append("═══════════════════════════════════════")
+    parts.append("This reflects the exploration's FINAL understanding. It may not cover")
+    parts.append("important earlier discoveries that were graduated out as new findings arrived.")
+    parts.append("Always cross-reference against the Findings Index above.\n")
+    parts.append(research_model or "(No research model available)")
 
     return '\n'.join(parts)

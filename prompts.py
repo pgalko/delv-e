@@ -37,18 +37,19 @@ INSTRUCTIONS
 **CURRENT PHASE: {current_phase}**
 {phase_instruction}
 
-Read the Exploration Health section in the research model carefully. If breadth is LOW or
-there is significant unexplored territory listed, at least 3 of your 5 questions MUST target
-that unexplored territory — not the current thread.
+Read the Exploration Health section in the research model carefully. If breadth is LOW,
+at least 3 of your 5 questions MUST target unexplored territory — regardless of phase.
 
 **Question types:**
 - EXPLORE: Open new angles. Examine untouched variables, relationships, or dataset features.
   Screening analyses that test many variables at once are especially valuable during MAPPING
-  (e.g., "fit survival models for each gene and report the top 10 most significant").
+  (e.g., "test each feature for association with the outcome and report the top 10").
 - EXPLOIT: Deepen a current finding. Add precision, find conditions, quantify effect sizes,
   test robustness, and look for disconfirming evidence or simpler explanations.
 
-All 5 questions should follow the {phase_mode} style.
+During {current_phase}, questions should primarily be {phase_mode}-style — but the breadth
+override above takes precedence. If breadth is LOW and phase is PURSUING, the 3 breadth-
+required questions should be EXPLORE while the remaining 2 can be EXPLOIT.
 
 **Analytical moves** (use these for creative, data-grounded questions):
 Inversion, Residuals, Extremes, Interaction, Contradiction, Temporal dynamics,
@@ -133,27 +134,34 @@ the exploration should do next:
 
 **MAPPING** — Survey broadly. Open new angles, examine unexplored variables, screen many
 features at once. Recommend this when:
-- The exploration has been focused on the same topic/variables for 4+ consecutive analyses
-- The Exploration Health section shows low breadth or large unexplored territory
+- The Exploration Health section shows LOW breadth (concentrated AND declining scores)
 - A thread has reached a natural conclusion (findings confirmed, no open questions)
 - The exploration is in its early stages and needs to discover what the dataset contains
-- Scores have been declining — the current thread may be exhausting its value
+- Recent scores are declining below 7 — the current thread is exhausting its value
+- Large parts of the dataset remain completely untouched
 
 **PURSUING** — Go deep on a lead. Add precision, find conditions, quantify effect sizes,
 test robustness, and look for disconfirming evidence. Recommend this when:
 - The latest result revealed something genuinely new that demands follow-up
 - There is a specific, testable hypothesis that could change understanding
 - The finding is surprising enough that it needs verification before moving on
+- The current thread is producing high scores (8+) — productive depth should continue
 
 **CRITICAL GUIDANCE for phase recommendation:**
-Discovery requires breadth. If the last 5+ analyses investigate the same variables, subtypes,
-or relationships — even from different angles — the exploration is too narrow. Recommend
-MAPPING to open new territory. A run that covers 8 topics at moderate depth is MORE VALUABLE
-than a run that covers 2 topics exhaustively.
+Discovery requires breadth, but productive depth is valuable. The key distinction:
+- A thread that is still changing the narrative — overturning assumptions, revealing
+  mechanisms, or opening sub-questions — deserves PURSUING regardless of how many
+  iterations it has run, as long as breadth is not LOW.
+- A thread that is confirming, refining, or extending an already-established conclusion
+  has reached diminishing returns. Recommend MAPPING even if recent scores are high.
+  High scores on confirmatory work don't justify continued depth.
+- A thread producing scores of 5-6 is clearly EXHAUSTED — recommend MAPPING.
+- If the Exploration Health section shows LOW breadth, recommend MAPPING.
+- If breadth is MEDIUM and the current result genuinely changed understanding (not
+  just added precision), PURSUING is appropriate.
 
-Review the Exploration Health section in the research model. If breadth is LOW or there is
-significant unexplored territory, recommend MAPPING regardless of how promising the current
-thread appears.
+Review the Exploration Health section in the research model carefully. Trust its
+breadth assessment — it applies a novelty test to concentrated threads.
 
 ═══════════════════════════════════════
 RESPONSE FORMAT (strict)
@@ -218,6 +226,25 @@ THREAD_COMPLETED: [YES / NO]
 YES if a line of inquiry is sufficiently answered and further investigation would yield
 diminishing returns.
 
+IMPORTANT — findings that link a variable to an outcome have validation requirements
+before a thread is complete:
+- If the dataset has multiple outcome measures or a composite outcome that can be
+  decomposed (e.g., overall outcome vs category-specific outcomes, total vs component
+  metrics), a finding tested on only one outcome type is NOT complete. An effect that
+  appears on an aggregate outcome but vanishes on the component outcomes may reflect
+  confounding or selection, not a genuine relationship. This applies to ALL associations
+  — treatment effects, gene effects, clinical features, anatomical features, ANY variable
+  linked to the outcome. Do not selectively test some associations and skip others.
+- CRITICAL: If a finding shows an effect on an aggregate outcome, decompose it. If the
+  effect cannot be attributed to ANY specific component, the finding is an artifact.
+  Do not build mediation analyses or mechanistic explanations on top of an effect that
+  has not passed outcome decomposition.
+- If a variable predicts both the outcome AND which group/condition a record belongs to,
+  the apparent effect may be an artefact of group assignment rather than a real
+  relationship. Check whether the variable is associated with group membership.
+- A thread tested with only one outcome definition is NOT complete if alternative
+  outcome definitions are available in the data.
+
 RESULT_DIGEST: [3-5 lines extracting ONLY the key numbers that matter for ongoing analysis]
 
 ═══════════════════════════════════════
@@ -233,13 +260,23 @@ Observations that no analysis will alter are NOT hypotheses — move them immedi
 Format: - [H1] claim | Confidence: low/medium/high | Evidence: brief source
 
 ## Established Findings
-Confirmed facts providing context. Max 6 bullet points. Each must include at least one
-key number — the quantitative anchor a reader needs to evaluate the claim.
+Confirmed discoveries providing context. Max 10 bullet points. Each must include at least
+one key number — the quantitative anchor a reader needs to evaluate the claim.
 When approaching the limit, consolidate related findings rather than dropping them.
+Before dropping or consolidating a finding, check whether any active hypothesis, thread,
+or open question depends on it. A finding that is referenced by a current hypothesis or
+needed to interpret an active thread is LOAD-BEARING — consolidate something else first.
+Do NOT include baseline dataset facts (group sizes, distributions, treatment rates) that
+are already in the data profile — those are pinned separately and visible to all agents.
+Reserve these slots for things the exploration DISCOVERED, not things the data profile
+already states.
 
 ## Threads
 Active lines of inquiry. Max 3. Each gets max 2 open questions.
 Format: - thread name | Completeness: low/medium/high | Open: question 1; question 2
+A thread linking a variable to an outcome is NOT high completeness until tested with
+alternative outcome definitions (if available) and checked for confounding by group
+assignment.
 
 ## Biggest Gap
 Single sentence: the most important thing NOT yet investigated, or the weakest point in
@@ -251,12 +288,13 @@ consider pivoting to unexplored territory."
 THIS SECTION IS CRITICAL. It controls whether the system explores broadly or drills narrowly.
 Assess honestly — the system depends on your candor here.
 
-- Topics investigated so far: [List distinct themes explored. Count them honestly.
-  IMPORTANT: Variations on the same variable, gene, or relationship are ONE topic, not many.
-  "ARID1B mutation," "ARID1B treatment interaction," and "ARID1A expression" = 1 topic (ARID1 family).
-  "TP53-chemo interaction" and "TP53 confounding" = 1 topic (TP53).
-  "Chemo confounding by age" and "chemo confounding by NPI" = 1 topic (chemo confounding).
-  A new topic means a genuinely different variable, pathway, or analytical dimension.]
+- Topics investigated: [Total count of distinct themes explored, plus the 10 most recently
+  added themes for reference. Do NOT list all themes — carry forward the count from the
+  previous model and add new themes as they appear.
+  IMPORTANT: Variations on the same variable, feature, or relationship are ONE topic, not many.
+  "Variable X main effect," "Variable X interaction with Y," and "Variable X in subgroup Z" = 1 topic.
+  A new topic means a genuinely different variable, feature group, or analytical dimension.
+  Format: "N distinct themes (recent: theme1, theme2, theme3, ...)"]
 - Recent focus (last 5-8 analyses): [What have they concentrated on? Name the specific
   variables and subtypes. Count how many of the last 8 analyses share the same core
   variable or theme.]
@@ -264,19 +302,22 @@ Assess honestly — the system depends on your candor here.
   have NOT been examined? Be concrete — name specific columns, variable groups, or analytical
   approaches. If the dataset has hundreds of columns and only a handful have been touched,
   say so explicitly.]
-- Breadth: [LOW / MEDIUM / HIGH — based PRIMARILY on recent concentration, not total count]
-  LOW = 4+ of the last 8 analyses share the same core variable/theme, OR large parts of
-        dataset remain untouched. A run can have 10 total topics but still be LOW if the
-        last 8 analyses all investigate the same gene.
-  MEDIUM = last 8 analyses span 3-4 distinct themes, moderate unexplored territory
+- Breadth: [LOW / MEDIUM / HIGH — based on recent concentration AND trajectory]
+  LOW = 5+ of the last 8 analyses share the same core variable/theme AND recent scores
+        on that topic are declining or below 7 (the thread is exhausting its value).
+        Also LOW if large parts of the dataset remain completely untouched regardless of
+        scores.
+  MEDIUM = last 8 analyses span 3-4 distinct themes with moderate unexplored territory,
+        OR concentrated on one theme but still producing genuinely new insights (not just
+        adding precision to the same relationship). Apply the novelty test: would the
+        thread's core conclusions change meaningfully if the last 3 analyses hadn't been
+        done? If the answer is no — if they confirmed, refined, or extended what was
+        already established rather than changing the narrative — breadth is LOW, not
+        MEDIUM, even if scores are high.
   HIGH = last 8 analyses span 5+ distinct themes, most major dataset features examined
 - Recommendation: [What should the exploration prioritize next? If breadth is LOW, recommend
   specific unexplored directions — name the columns or features. If breadth is HIGH,
   recommend deepening the most promising thread.]
-
-## Narrative
-2-3 sentences ONLY. What changed with this result, how it connects to previous understanding,
-and what it implies for next steps. Do not repeat findings already listed above.
 
 END_MODEL
 
@@ -309,109 +350,100 @@ END_MODEL
    is LOW, prioritize questions that open new territory over questions that refine existing
    findings — regardless of phase.
 
-2. **Phase alignment:**
+2. **Information gain:** Prefer questions where a surprising answer would most change the
+   research model. A question whose answer is already predictable from the model has low
+   value regardless of topic importance. The best questions are ones where you genuinely
+   don't know what the result will be.
+
+3. **Phase alignment:**
    - MAPPING: prefer questions covering unexplored dimensions, screening analyses, new variables
    - PURSUING: prefer questions deepening, validating, or pressure-testing the most promising finding
 
-3. **Avoid repetition:** Don't select questions similar to low-scoring attempts in the history.
+4. **Avoid repetition:** Don't select questions similar to low-scoring attempts in the history.
    Build on high-scoring findings. Prefer untried analytical approaches.
 
-4. **Model awareness:** Prefer questions addressing identified gaps or unexplored territory.
+5. **Model awareness:** Prefer questions addressing identified gaps or unexplored territory.
    Avoid questions whose answers the model already captures with high confidence.
 
 Select exactly {num_to_select} questions. Respond with ONLY the question numbers,
 comma-separated, best first. Nothing else."""
 
 
-    exploration_synthesis = """You are a Research Specialist generating a comprehensive synthesis report of the data exploration.
+    exploration_synthesis = """You are a Research Specialist generating a synthesis report from an autonomous data exploration.
 
 Today's date is: {0}
 
-History of Previous Analyses:
 {1}
 
-Here is the task you need to address:
-{2}
+Task: {2}
 
 ---
 
-Generate a comprehensive synthesis report of the data exploration that has been conducted.
+Generate a synthesis report of what this exploration discovered. Write for a researcher who
+wants to understand WHAT was found and WHY it matters — not how the system operated.
 
-CRITICAL RULES  -- THESE OVERRIDE EVERYTHING ELSE:
-1. The RAW NUMBERS in each analysis's Result section are the ground truth.
-   If the Research Model narrative contradicts the actual numbers, TRUST THE NUMBERS.
-2. If a result contains NaN, "INSUFFICIENT DATA", or fewer than 5 records for a group,
-   that result is INCONCLUSIVE. Do not interpret it, do not build claims on it,
-   and flag it explicitly in "What Didn't Work."
-3. Watch for inverted metrics. If a metric is defined as "lower is better" (e.g.,
-   power-to-speed ratio), an increase is a WORSENING, not an improvement.
-   Verify the direction of every claim you make against the actual numbers.
+THE INPUT HAS FOUR SECTIONS:
+- **Section A (Context):** The original question and dataset profile
+- **Section B (Findings Index):** One-line summary of EVERY analysis, with quality scores
+  and reference IDs. This is your table of contents — scan it to identify ALL major themes.
+- **Section C (Full Evidence):** Complete numerical results for every analysis. Pull your
+  numbers from here.
+- **Section D (Research Model):** The exploration's final understanding. IMPORTANT: This
+  reflects only the LAST few iterations of focus. It may not mention important earlier
+  discoveries. Always cross-reference against the Findings Index.
 
-IMPORTANT - REFERENCE FORMAT:
-Each analysis in the history includes a Reference ID in the format [[chain_id]]. You MUST
-include these reference IDs when citing findings throughout your report. Format citations
-as [[chain_id]] immediately after the relevant finding or statement. Copy the exact numeric
-ID from each analysis's Reference field. Do NOT use empty brackets [].
+YOUR APPROACH:
+1. Scan the Findings Index to identify clusters of related analyses — these are your themes.
+   Look for groups of 3+ analyses about the same variable, relationship, or concept.
+2. For each theme, read the Full Evidence section for those analyses to extract key numbers.
+3. Use the Research Model for confidence levels and current interpretation, but do NOT
+   limit your report to what the Research Model mentions.
+4. A finding supported by multiple high-scoring analyses (7+) is more reliable than one
+   from a single analysis.
 
-Review the COMPLETE history of analyses provided above. Each entry shows the question
-investigated and the quantitative results obtained. If a Final Research Model is included,
-use it as context for emphasis  -- but always verify its claims against the actual numbers.
+CITATION RULES:
+- Every quantitative claim must include a reference: [[chain_id]]
+- Copy the exact chain_id from the analysis's Reference field
+- The RAW NUMBERS in the Full Evidence section are ground truth. If the Research Model
+  narrative contradicts the actual numbers, TRUST THE NUMBERS.
 
-Write this report for a researcher who wants to understand WHAT was discovered and WHY
-it matters  -- not how the system operated internally. Avoid technical references to
-branches, phases, scores, or system architecture.
-
-Structure your report as follows:
+REPORT STRUCTURE:
 
 ## Executive Summary
 2-3 sentences: the exploration scope, the central question, and the most important
-conclusion. Lead with the simplest, most direct answer to the original question before
-introducing complexity. If the question asks "which is best," name it and give the key
-number. Secondary mechanisms and nuances come after.
-
-## How Understanding Evolved
-Trace how the exploration's UNDERSTANDING changed over time as a research narrative:
-- What was the initial question or hypothesis?
-- What key results shifted, deepened, or overturned that understanding?
-- What contradictions were encountered, and how did they redirect the inquiry?
-For each pivotal moment, cite the specific analysis [[chain_id]] and the quantitative
-result that triggered the shift.
+conclusion. Lead with the simplest, most direct answer to the original question.
 
 ## Key Findings
-Synthesize the most significant discoveries. Order by practical importance: findings
-that directly answer the original question come first, followed by mechanistic
-explanations, then secondary patterns. For each:
-- State the specific result with exact numbers [[chain_id]]
-- Explain the practical or theoretical significance
-
-## What Didn't Work
-Document analyses that showed weak, null, NaN, or insufficient-data results [[chain_id]].
-Include:
-- The specific metrics that were NaN, inconclusive, or based on too few records
-- Why this null result limits what can be concluded
+Synthesize the most significant discoveries — these are CONCLUSIONS, not individual
+analyses. Group related analyses into coherent findings. Order by practical importance.
+For each finding:
+- State the conclusion with key numbers and citations [[chain_id]]
+- Note the strength of evidence (how many analyses support it, score range)
+- Flag if the finding was tested with alternative endpoints or robustness checks
 
 ## Cross-Cutting Patterns
-Identify at least 2-3 patterns that emerged across multiple analyses [[chain_id1]], [[chain_id2]].
+Identify 2-3 patterns that emerged across multiple themes [[chain_id1]], [[chain_id2]].
 
 ## Limitations & Caveats
-Note methodological limitations, data gaps, or caveats that should temper conclusions.
+Note methodological limitations, data gaps, small sample sizes, or unresolved confounding
+that should temper conclusions.
 
 ## Recommended Next Steps
-2-3 specific, promising directions for future analysis. If the research model includes
-a "Biggest Gap," the FIRST recommendation must directly address it.
+2-3 specific, promising directions for future analysis. If the Research Model identifies
+a "Biggest Gap," the FIRST recommendation must address it.
 
 ## Conclusion
-An integrated narrative tying together the exploration.
+An integrated narrative tying together the key discoveries and their implications.
 
 ---
 
 IMPORTANT:
-- Use SPECIFIC NUMBERS from results  -- copy them exactly
-- Every citation must contain the numeric chain_id: [[1771557216]] not []
-- Prioritize insight over completeness
-- Every analysis in the history must be cited at least once
+- Use SPECIFIC NUMBERS from the Full Evidence section — copy them exactly
+- Every finding must cite at least one [[chain_id]]
+- Avoid references to system internals (iterations, phases, branches, scores)
+- Write about CONCLUSIONS, not about individual analyses
 - Do NOT build conclusions on NaN or insufficient-data results
-- Verify metric direction (higher/lower = better/worse) before making claims"""
+- Include ALL major themes from the Findings Index, not just those in the Research Model"""
 
 
     # ──────────────────────────────────────────────
