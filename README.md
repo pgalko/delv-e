@@ -30,6 +30,10 @@ Each iteration:
 
 Periodically, a **connection explorer** generates questions testing interactions between established findings — compounding effects, mediating relationships, and conditional dependencies.
 
+A live dashboard (`output/dashboard.html`) updates after each iteration — open it in a browser to monitor progress, scores, findings, and exploration health in real time.
+
+![delv-e dashboard](assets/dashboard.png)
+
 ### Phase System
 
 Two phases with model-driven transitions. The evaluator recommends a phase after every iteration based on the full exploration context, research model, and finding maturity state.
