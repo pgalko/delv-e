@@ -39,8 +39,8 @@ PRICING = {
     "moonshotai/kimi-k2.5":       {"input": 0.45, "output": 2.20},
     "z-ai/glm-5":                 {"input": 0.72, "output": 2.30},
     "deepseek/deepseek-v3.2":     {"input": 0.26, "output": 0.38},
-    "qwen/qwen3.5-122b-a10b":     {"input": 0.26, "output": 2.08},
-    "minimax/minimax-m2.5":       {"input": 0.27, "output": 0.95},
+    "qwen/qwen3.5-397b-a17b":     {"input": 0.39, "output": 2.34},
+    "minimax/minimax-m2.7":       {"input": 0.30, "output": 1.20},
     # Ollama (local, free)
 }
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
@@ -84,8 +84,11 @@ class AnthropicProvider:
         except self._api_error as e:
             logger.error(f"Anthropic API error: {e}")
             raise
+        content = ""
+        if response.content and len(response.content) > 0:
+            content = response.content[0].text or ""
         return (
-            response.content[0].text,
+            content,
             response.usage.input_tokens,
             response.usage.output_tokens,
         )
@@ -156,7 +159,7 @@ class OpenAIProvider:
             params["instructions"] = instructions
         response = self.client.responses.create(**params)
         return (
-            response.output_text,
+            response.output_text or "",
             response.usage.input_tokens if response.usage else 0,
             response.usage.output_tokens if response.usage else 0,
         )
@@ -206,8 +209,11 @@ class OllamaProvider:
             max_tokens=max_tokens,
             temperature=temperature,
         )
+        content = ""
+        if response.choices and len(response.choices) > 0:
+            content = response.choices[0].message.content or ""
         return (
-            response.choices[0].message.content,
+            content,
             response.usage.prompt_tokens if response.usage else 0,
             response.usage.completion_tokens if response.usage else 0,
         )
@@ -267,8 +273,11 @@ class OpenRouterProvider:
             max_tokens=max_tokens,
             temperature=temperature,
         )
+        content = ""
+        if response.choices and len(response.choices) > 0:
+            content = response.choices[0].message.content or ""
         return (
-            response.choices[0].message.content,
+            content,
             response.usage.prompt_tokens if response.usage else 0,
             response.usage.completion_tokens if response.usage else 0,
         )
@@ -446,7 +455,7 @@ class LLMClient:
         return self._providers[provider_name]
 
     def call(self, messages, model, max_tokens=10000, temperature=0, agent=None):
-        """Non-streaming call. Returns response text."""
+        """Non-streaming call. Returns response text (always a string, never None)."""
         provider_name, model_name = parse_model_string(model)
         provider = self._get_provider(provider_name)
         start_time = time.time()
@@ -458,6 +467,10 @@ class LLMClient:
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")
             raise
+
+        # Guarantee string return — providers should already handle this,
+        # but belt-and-suspenders against None leaking through.
+        content = content or ""
 
         elapsed = time.time() - start_time
         self.cost_tracker.record(input_tokens, output_tokens, model_name)

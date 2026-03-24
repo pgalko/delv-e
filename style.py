@@ -115,7 +115,7 @@ LOGO = (
 VERSION = "0.1.0"
 TAGLINE = "Deep Exploratory Learning & Visualization Engine"
 
-def config_lines(df_shape, max_iterations, num_parallel, output_dir, agent_model, code_model):
+def config_lines(df_shape, max_iterations, num_parallel, output_dir, agent_model, code_model, premium_model=None):
     """Run config info without logo — used after interactive prompt."""
     def short_model(m):
         return m.split("-202")[0] if "-202" in m else m
@@ -124,11 +124,13 @@ def config_lines(df_shape, max_iterations, num_parallel, output_dir, agent_model
     lines.append(f"    {DIM}Loop{RESET}   {WHITE}{max_iterations} iterations{RESET}  {DIM}×{RESET}  {WHITE}{num_parallel} parallel{RESET}")
     lines.append(f"    {DIM}Code{RESET}   {WHITE}{short_model(code_model)}{RESET}")
     lines.append(f"    {DIM}Agents{RESET} {WHITE}{short_model(agent_model)}{RESET}")
+    if premium_model:
+        lines.append(f"    {DIM}Prem.{RESET}  {WHITE}{short_model(premium_model)}{RESET}")
     lines.append(f"    {DIM}Output{RESET} {WHITE}{output_dir}/{RESET}")
     return "\n".join(lines)
 
 
-def splash_header(df_shape, max_iterations, num_parallel, output_dir, agent_model, code_model):
+def splash_header(df_shape, max_iterations, num_parallel, output_dir, agent_model, code_model, premium_model=None):
     """Full startup banner with logo and run info — used for inline mode."""
     def short_model(m):
         return m.split("-202")[0] if "-202" in m else m
@@ -140,6 +142,8 @@ def splash_header(df_shape, max_iterations, num_parallel, output_dir, agent_mode
     lines.append(f"    {DIM}Loop{RESET}   {WHITE}{max_iterations} iterations{RESET}  {DIM}×{RESET}  {WHITE}{num_parallel} parallel{RESET}")
     lines.append(f"    {DIM}Code{RESET}   {WHITE}{short_model(code_model)}{RESET}")
     lines.append(f"    {DIM}Agents{RESET} {WHITE}{short_model(agent_model)}{RESET}")
+    if premium_model:
+        lines.append(f"    {DIM}Prem.{RESET}  {WHITE}{short_model(premium_model)}{RESET}")
     lines.append(f"    {DIM}Output{RESET} {WHITE}{output_dir}/{RESET}")
     return "\n".join(lines)
 

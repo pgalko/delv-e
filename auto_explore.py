@@ -2,14 +2,11 @@
 Auto-explore module for autonomous recursive exploration.
 Handles the exploration loop, result evaluation, and adaptive branching.
 
-Modifications from original BambooAI version:
-  - Removed: Supabase auth, orchestrator heartbeat, billing, webui queue pushes
-  - Changed: _get_dataset_schema uses pandas directly (no bambooai.utils)
-  - Changed: format_trajectory_for_synthesis uses node data (no interaction_store)
-  - Changed: _generate_branching_questions sets chain_id unconditionally
-  - Added: iteration context setting, file writing hooks, synthesis step
-  - Added: finding_summary compaction, tiered history, score-weighted synthesis,
-           model-driven phase transitions via evaluator PHASE recommendation
+Key mechanisms:
+  - Finding Maturity: tracks significant findings through an analytical arc
+    (DETECTED → QUANTIFIED → DECOMPOSED → REGIME-TESTED → COMPLETE)
+  - Cross-Finding Connections: periodically tests interactions between
+    established findings to discover compound effects
 """
 
 import json
@@ -34,21 +31,21 @@ class AutoExplorer:
     PHASE_INSTRUCTIONS = {
         "MAPPING": (
             "EXPLORE",
-            "We are in MAPPING phase — surveying the landscape broadly. "
-            "Generate questions that open new angles, examine unexplored variables, and "
-            "build understanding of what this dataset contains. Prioritize coverage over depth. "
-            "Screening analyses that test many variables at once are especially valuable here — "
-            "they identify promising leads for targeted follow-up."
+            "We are in MAPPING phase — survey broadly. Prioritise coverage: "
+            "open new angles, examine unexplored variables, screen many features at once."
         ),
         "PURSUING": (
             "EXPLOIT",
-            "We are in PURSUING phase — deepening a promising lead. "
-            "Generate questions that add precision: find exact thresholds, identify conditions "
-            "under which the pattern holds, quantify effect sizes, test robustness, and look "
-            "for disconfirming evidence. The goal is to turn a suggestive finding into a "
-            "well-evidenced conclusion — or rule it out definitively."
+            "We are in PURSUING phase — all 5 questions must advance THE SAME finding. "
+            "Consult Finding Maturity: pick the least-mature finding and generate 5 "
+            "different ways to advance it to its next stage. Do not split across topics."
         ),
     }
+
+    # ── NEW: Connection trigger configuration ──
+    CONNECTION_INTERVAL = 8          # check every N iterations
+    CONNECTION_MIN_FINDINGS = 4      # need this many established findings
+    CONNECTION_QUESTIONS = 3         # how many connection questions to generate
 
     def __init__(self, engine_instance):
         self.engine = engine_instance
@@ -62,18 +59,23 @@ class AutoExplorer:
 
         # Research model state
         self.research_model = ""
-        self.seed_question = ""  # original exploration question — used as relevance anchor
+        self.seed_question = ""
         self.current_phase = "MAPPING"
         self.phase_history = []
         self.model_impact_history = []
-        self.evaluator_score_history = []   # FIX 4: track evaluator scores for phase decisions
-        self.biggest_gap_history = []        # last N "Biggest Gap" texts from research model
-        self.stagnation_count = 0            # legacy — kept for checkpoint compatibility
+        self.evaluator_score_history = []
+        self.biggest_gap_history = []
+        self.stagnation_count = 0
 
-        # Orientation data profile — pinned context, never truncated
+        # Orientation data profile
         self.data_profile = ""
 
-        # Reset branch endpoints
+        # ── NEW: track when connections were last run ──
+        self.last_connection_iteration = 0
+
+        # Model override for orientation + synthesis (set from --premium-model)
+        self.premium_model = None
+
         self.engine.branch_endpoints = []
 
     @property
@@ -115,34 +117,55 @@ class AutoExplorer:
         finally:
             output_manager.set_silent(False)
 
-    def _evaluate_results_comparative(self, solutions_data, remaining_iterations=0, max_iterations=10):
-        """
-        Compare multiple solution results and select the most analytically valuable one.
-        """
-        if self.kill_signal:
-            return 0, [5] * len(solutions_data), [], False, "Interrupted", None, [''] * len(solutions_data)
+    def _call_agent_with_retry(self, messages, agent, model_override=None):
+        """Shared agent call: try → retry → fallback to alternate model."""
+        # Attempt 1
+        response = self._llm_stream_silent(messages, agent, model_override=model_override)
+        if response and response.strip():
+            return response
 
-        # Build exploration state context
+        # Attempt 2: retry same model
+        response = self._llm_stream_silent(messages, agent, model_override=model_override)
+        if response and response.strip():
+            return response
+
+        # Attempt 3: fallback
+        fallback_model = self._get_fallback_model(agent)
+        if fallback_model:
+            logger.info(f"{agent} empty after retry, falling back to {fallback_model}")
+            response = self._llm_stream_silent(messages, agent, model_override=fallback_model)
+
+        return response or ""
+
+    # ══════════════════════════════════════════════
+    # EVALUATOR
+    # ══════════════════════════════════════════════
+
+    def _evaluate_results_comparative(self, solutions_data, remaining_iterations=0, max_iterations=10):
+        """Compare multiple solution results and select the most analytically valuable one."""
+        if self.kill_signal:
+            return 0, [5] * len(solutions_data), [], False, "Interrupted", None, [''] * len(solutions_data), None
+
+        # Build context
+        dormant_info = "None"
         if self.dormant_branches:
             dormant_scores = [
                 self.insight_tree[nid]['quality_score']
                 for nid in self.dormant_branches
                 if nid in self.insight_tree
             ]
-            best_dormant_score = max(dormant_scores) if dormant_scores else 0
-            dormant_info = f"{len(self.dormant_branches)} branch(es) available, best score: {best_dormant_score}"
-        else:
-            best_dormant_score = 0
-            dormant_info = "None"
+            if dormant_scores:
+                dormant_info = f"{len(self.dormant_branches)} branch(es), best score: {max(dormant_scores)}"
 
-        exploration_state = f"""**Current Exploration State:**
-- Dormant branches: {dormant_info}
-- Remaining iterations: {remaining_iterations} of {max_iterations}
-
-{self._get_exploration_history()}"""
+        exploration_state = (
+            f"**Current Exploration State:**\n"
+            f"- Dormant branches: {dormant_info}\n"
+            f"- Remaining iterations: {remaining_iterations} of {max_iterations}\n\n"
+            f"{self._get_exploration_history()}"
+        )
 
         if self.data_profile:
-            exploration_state = f"**Analytical Profile (from orientation):**\n{self.data_profile}\n\n{exploration_state}"
+            exploration_state = f"**Analytical Profile:**\n{self.data_profile}\n\n{exploration_state}"
 
         research_model_context = self.research_model if self.research_model else "(No model yet)"
 
@@ -160,11 +183,11 @@ class AutoExplorer:
                 result_text = str(sol.get('text_answer', 'No output'))
 
             error_note = " (Error occurred during execution)" if sol['error_occurred'] else ""
-            solutions_parts.append(f"""**Solution {i}:**
-Question: {sol['question']}
-Result:{error_note}
-{result_text}
-""")
+            solutions_parts.append(
+                f"**Solution {i}:**\n"
+                f"Question: {sol['question']}\n"
+                f"Result:{error_note}\n{result_text}\n"
+            )
 
         solutions_block = "\n---\n".join(solutions_parts)
 
@@ -176,30 +199,18 @@ Result:{error_note}
         )
 
         eval_messages = [{"role": "user", "content": eval_prompt}]
-        response = self._llm_stream_silent(eval_messages, 'Result Evaluator')
-
-        # Cross-model fallback if response is empty
-        if not response or not response.strip():
-            fallback_model = self._get_fallback_model('Result Evaluator')
-            if fallback_model:
-                logger.info(f"Evaluator returned empty, falling back to {fallback_model}")
-                response = self._llm_stream_silent(eval_messages, 'Result Evaluator',
-                                                    model_override=fallback_model)
-            if not response or not response.strip():
-                response = ""
+        response = self._call_agent_with_retry(eval_messages, 'Result Evaluator')
 
         # Parse response
         scores = [5] * len(solutions_data)
         if 'SCORES:' in response.upper():
             scores_line = response.upper().split('SCORES:')[1].split('\n')[0]
-            score_matches = re.findall(r'\d+', scores_line)
-            for i, match in enumerate(score_matches[:len(solutions_data)]):
+            for i, match in enumerate(re.findall(r'\d+', scores_line)[:len(solutions_data)]):
                 scores[i] = max(1, min(10, int(match)))
 
         selected_index = 0
         if 'SELECTED:' in response.upper():
-            selected_line = response.upper().split('SELECTED:')[1].split('\n')[0]
-            match = re.search(r'\d+', selected_line)
+            match = re.search(r'\d+', response.upper().split('SELECTED:')[1].split('\n')[0])
             if match:
                 idx = int(match.group()) - 1
                 if 0 <= idx < len(solutions_data):
@@ -214,9 +225,7 @@ Result:{error_note}
                     if 0 <= idx < len(solutions_data) and idx != selected_index:
                         keep_dormant_indices.append(idx)
 
-        is_stagnating = False  # Legacy — kept for return signature compatibility
-
-        # Parse PHASE recommendation from evaluator
+        # Parse PHASE recommendation
         phase_recommendation = None
         if 'PHASE:' in response.upper():
             phase_line = response.upper().split('PHASE:')[1].split('\n')[0].strip()
@@ -225,18 +234,16 @@ Result:{error_note}
                     phase_recommendation = candidate
                     break
 
-        # Parse SUMMARIES — one-sentence summary per solution, pipe-separated
+        # Parse SUMMARIES
         summaries = [''] * len(solutions_data)
         if 'SUMMARIES:' in response:
             summary_text = response.split('SUMMARIES:')[1]
-            # Take until next field
             for end in ['SELECTED:', 'KEEP_DORMANT:', 'REASON:', 'PHASE:', '\n\n']:
                 idx = summary_text.find(end)
                 if idx > 0:
                     summary_text = summary_text[:idx]
                     break
-            parts = [s.strip() for s in summary_text.split('|')]
-            for i, part in enumerate(parts[:len(solutions_data)]):
+            for i, part in enumerate([s.strip() for s in summary_text.split('|')][:len(solutions_data)]):
                 if part and len(part) > 5:
                     summaries[i] = part[:200]
 
@@ -250,24 +257,24 @@ Result:{error_note}
             if angle_text and angle_text.lower() not in ['', 'none', 'n/a']:
                 follow_up_angle = angle_text
 
-        return selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries, phase_recommendation
+        return (selected_index, scores, keep_dormant_indices, False,
+                reason, follow_up_angle, summaries, phase_recommendation)
+
+    # ══════════════════════════════════════════════
+    # QUESTION GENERATION & SELECTION
+    # ══════════════════════════════════════════════
 
     def _generate_branching_questions(self, use_chain_id=None, follow_up_hint=None, model_override=None):
-        """
-        Generate 5 branching questions. Phase-driven: all 5 are the same type.
-        """
+        """Generate 5 branching questions. Phase-driven."""
         if self.kill_signal:
             return [], {}, ""
 
-        # --- CHANGED: set chain_id unconditionally (was inside webui block) ---
         if use_chain_id is not None:
             self.chain_id = use_chain_id
         else:
             self.chain_id = int(time.time())
 
-        # Build context
         exploration_context = self._get_exploration_history()
-        # FIX 5: use slim schema for question generation (non-code agent)
         dataset_schema = self._get_dataset_schema_slim()
 
         hint_section = ""
@@ -282,44 +289,32 @@ Result:{error_note}
         model_context = self.research_model if self.research_model else "(No model yet — first iteration)"
 
         phase_prompt = self.engine.prompts.ideas_explorer_auto.format(
-            phase_mode=phase_mode,
             current_phase=self.current_phase,
             phase_instruction=phase_instruction,
             research_model=model_context,
         )
 
-        # Complete question log (prevents circular exploration)
         all_questions_log = self.engine.message_manager.format_all_questions()
 
         profile_section = ""
         if self.data_profile:
-            profile_section = f"\n**Analytical Profile (from orientation):**\n{self.data_profile}\n"
+            profile_section = f"\n**Analytical Profile:**\n{self.data_profile}\n"
 
-        gen_prompt = f"""Based on our exploration so far:
-
-{dataset_schema}
-{profile_section}
-{exploration_context}
-
-{all_questions_log}
-{hint_section}
-
-{phase_prompt}"""
+        gen_prompt = (
+            f"Based on our exploration so far:\n\n"
+            f"{dataset_schema}\n{profile_section}\n{exploration_context}\n\n"
+            f"{all_questions_log}\n{hint_section}\n\n{phase_prompt}"
+        )
 
         gen_messages = [{"role": "user", "content": gen_prompt}]
-
-        agent = 'Question Generator'
-        questions_response = self._llm_stream_silent(gen_messages, agent, model_override=model_override)
-
+        questions_response = self._call_agent_with_retry(gen_messages, 'Question Generator', model_override=model_override)
         questions, categories = self._parse_questions_with_categories(questions_response)
 
         return questions, categories, questions_response
 
     def _select_best_questions(self, questions, categories, context_hint=None, num_to_select=1):
         """Use LLM to select the most promising questions from a pool."""
-        if not questions:
-            return [], []
-        if self.kill_signal:
+        if not questions or self.kill_signal:
             return [], []
 
         num_to_select = min(num_to_select, len(questions))
@@ -335,21 +330,19 @@ Result:{error_note}
             for j, pq in enumerate(self.question_pool[-5:]):
                 pool_idx = len(questions) + j + 1
                 pool_lines.append(f"{pool_idx}. [POOL-{pq['category'].upper()}] {pq['question']}")
-            pool_section = f"""
-
-**Question Pool (from previous iterations):**
-{chr(10).join(pool_lines)}
-
-You may select from EITHER the new questions (1-{len(questions)}) OR the pool ({len(questions)+1}-{len(questions)+len(pool_lines)}).
-Pool questions are valuable when current direction feels exhausted."""
+            pool_section = (
+                f"\n\n**Question Pool (from previous iterations):**\n"
+                f"{chr(10).join(pool_lines)}\n\n"
+                f"You may select from new questions (1-{len(questions)}) "
+                f"or pool ({len(questions)+1}-{len(questions)+len(pool_lines)})."
+            )
 
         exploration_context = self._get_exploration_history()
-        # Append complete question log so selector can avoid duplicates
         all_questions_log = self.engine.message_manager.format_all_questions()
         exploration_history = exploration_context + "\n\n" + all_questions_log if all_questions_log else exploration_context
 
         if self.data_profile:
-            exploration_history = f"**Analytical Profile (from orientation):**\n{self.data_profile}\n\n{exploration_history}"
+            exploration_history = f"**Analytical Profile:**\n{self.data_profile}\n\n{exploration_history}"
 
         context_section = ""
         if context_hint:
@@ -367,7 +360,7 @@ Pool questions are valuable when current direction feels exhausted."""
         )
 
         select_messages = [{"role": "user", "content": selection_prompt}]
-        selection = self._llm_stream_silent(select_messages, 'Question Selector')
+        selection = self._call_agent_with_retry(select_messages, 'Question Selector')
 
         # Parse selection
         selected_questions = []
@@ -396,13 +389,13 @@ Pool questions are valuable when current direction feels exhausted."""
         except (AttributeError, ValueError):
             pass
 
-        # Fallback: if nothing parsed at all, take first N
+        # Fallback
         if not selected_questions:
             selected_indices = list(range(min(num_to_select, len(questions))))
             selected_questions = [questions[i] for i in selected_indices]
             selected_categories = [categories.get(i, 'exploit') for i in selected_indices]
 
-        # Pad: if parsed fewer than needed, fill from remaining questions
+        # Pad if needed
         if len(selected_questions) < num_to_select:
             for i in range(len(questions)):
                 if i not in selected_indices and len(selected_questions) < num_to_select:
@@ -438,7 +431,6 @@ Pool questions are valuable when current direction feels exhausted."""
 
         for line in lines:
             stripped = line.strip()
-            # Match numbering: "1.", "1)", "1:", "## 1.", "- 1.", etc.
             is_numbered = re.match(r'^(?:[-•*#]*\s*)?([1-9])[.):]', stripped)
 
             if is_numbered:
@@ -446,7 +438,6 @@ Pool questions are valuable when current direction feels exhausted."""
                     question_text = ' '.join(current_q).strip()
                     if len(question_text) > 10:
                         questions.append(question_text)
-                # Strip the number prefix
                 cleaned = re.sub(r'^(?:[-•*#]*\s*)?[1-9][.):][\s]*', '', stripped)
                 current_q = [cleaned] if cleaned else []
             elif current_q and stripped and stripped != '---':
@@ -459,6 +450,10 @@ Pool questions are valuable when current direction feels exhausted."""
 
         categories = {i: phase_mode for i in range(len(questions))}
         return questions, categories
+
+    # ══════════════════════════════════════════════
+    # RESEARCH MODEL INTERPRETER
+    # ══════════════════════════════════════════════
 
     def _interpret_and_update_model(self, winning_solution, quality_score,
                                      solutions_data=None, selected_index=0, scores=None):
@@ -473,10 +468,8 @@ Pool questions are valuable when current direction feels exhausted."""
         result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
         current_model = self.research_model if self.research_model else "(No model yet — this is the first result. Initialize the model from scratch.)"
 
-        # Prepend analytical profile so the RI has orientation context
         if self.data_profile and not self.research_model:
-            # First iteration: include profile so RI can reference it when initializing
-            current_model += f"\n\n**Analytical Profile (from orientation — reference only, do not duplicate in model):**\n{self.data_profile}"
+            current_model += f"\n\n**Analytical Profile (reference only):**\n{self.data_profile}"
 
         parallel_context = ""
         if solutions_data and len(solutions_data) > 1 and scores:
@@ -501,40 +494,20 @@ Pool questions are valuable when current direction feels exhausted."""
         )
 
         interpret_messages = [{"role": "user", "content": interpret_prompt}]
-        response = self._llm_stream_silent(interpret_messages, 'Research Interpreter')
+        response = self._call_agent_with_retry(interpret_messages, 'Research Interpreter')
 
-        # Cross-model fallback if response is empty
-        if not response or not response.strip():
-            fallback_model = self._get_fallback_model('Research Interpreter')
-            if fallback_model:
-                logger.info(f"RI returned empty, falling back to {fallback_model}")
-                response = self._llm_stream_silent(interpret_messages, 'Research Interpreter',
-                                                    model_override=fallback_model)
-            if not response or not response.strip():
-                response = ""
+        # Parse structured fields
+        model_impact = self._parse_field(response, 'MODEL_IMPACT', default='MEDIUM',
+                                          valid={'HIGH', 'MEDIUM', 'LOW'})
+        contradiction = 'YES' in self._parse_field(response, 'CONTRADICTION', default='NO')
+        thread_completed = 'YES' in self._parse_field(response, 'THREAD_COMPLETED', default='NO')
 
-        # Parse MODEL_IMPACT
-        model_impact = "MEDIUM"
-        if 'MODEL_IMPACT:' in response.upper():
-            impact_line = response.upper().split('MODEL_IMPACT:')[1].split('\n')[0]
-            if 'HIGH' in impact_line:
-                model_impact = "HIGH"
-            elif 'LOW' in impact_line:
-                model_impact = "LOW"
+        # ── NEW: Parse MATURITY_ADVANCE (logged for observability) ──
+        maturity_advance = self._parse_field(response, 'MATURITY_ADVANCE', default='NONE')
+        if maturity_advance and maturity_advance != 'NONE':
+            logger.info(f"Finding maturity advanced: {maturity_advance}")
 
-        # Parse CONTRADICTION
-        contradiction = False
-        if 'CONTRADICTION:' in response.upper():
-            contra_line = response.upper().split('CONTRADICTION:')[1].split('\n')[0]
-            contradiction = 'YES' in contra_line
-
-        # Parse THREAD_COMPLETED
-        thread_completed = False
-        if 'THREAD_COMPLETED:' in response.upper():
-            thread_line = response.upper().split('THREAD_COMPLETED:')[1].split('\n')[0]
-            thread_completed = 'YES' in thread_line
-
-        # Parse RESULT_DIGEST — RI-curated extract of key numbers (3-5 lines)
+        # Parse RESULT_DIGEST
         result_digest = ""
         if 'RESULT_DIGEST:' in response:
             digest_text = response.split('RESULT_DIGEST:')[1]
@@ -543,7 +516,6 @@ Pool questions are valuable when current direction feels exhausted."""
                     digest_text = digest_text.split(end_marker)[0]
                     break
             result_digest = digest_text.strip()
-            # Safety cap — this should be 3-5 lines, ~500-800 chars
             if len(result_digest) > 1000:
                 result_digest = result_digest[:997] + "..."
 
@@ -559,27 +531,136 @@ Pool questions are valuable when current direction feels exhausted."""
 
         return updated_model, model_impact, contradiction, thread_completed, result_digest
 
-    def _determine_phase(self, model_impact, contradiction, thread_completed,
-                         evaluator_stagnating=0, phase_recommendation=None):
-        """Model-driven phase transition. Two phases: MAPPING (explore) and PURSUING (deepen).
+    @staticmethod
+    def _parse_field(response, field_name, default='', valid=None):
+        """Parse a single FIELD_NAME: value line from an LLM response."""
+        key = f'{field_name}:'
+        if key not in response.upper():
+            return default
+        line = response.upper().split(key)[1].split('\n')[0].strip()
+        if valid:
+            for v in valid:
+                if v in line:
+                    return v
+            return default
+        # Return original-case version
+        orig_key = f'{field_name}:'
+        if orig_key in response:
+            return response.split(orig_key)[1].split('\n')[0].strip()
+        return line
 
-        The evaluator recommends a phase based on the full exploration context,
-        research model, and Exploration Health assessment. Thread completion is the
-        only structural override.
+    # ══════════════════════════════════════════════
+    # CROSS-FINDING CONNECTION EXPLORER (NEW)
+    # ══════════════════════════════════════════════
+
+    def _should_run_connections(self, iteration):
+        """Determine whether to run cross-finding connection testing this iteration.
+
+        Triggers when:
+        1. Enough iterations since last run (CONNECTION_INTERVAL)
+        2. Enough established findings (CONNECTION_MIN_FINDINGS)
+        3. Not in early exploration (iteration > 10)
         """
-        # Thread completion is structural — always triggers MAPPING
+        if iteration <= 10:
+            return False
+        if iteration - self.last_connection_iteration < self.CONNECTION_INTERVAL:
+            return False
+        # Count established findings in the research model
+        n_findings = self._count_established_findings()
+        if n_findings < self.CONNECTION_MIN_FINDINGS:
+            return False
+        return True
+
+    def _count_established_findings(self):
+        """Count bullet points in ## Established Findings section."""
+        findings_text = self._extract_model_section('Established Findings')
+        if not findings_text:
+            return 0
+        return len([line for line in findings_text.split('\n') if line.strip().startswith('-')])
+
+    def _extract_model_section(self, section_name):
+        """Extract content of a named ## section from the research model."""
+        if not self.research_model or f'## {section_name}' not in self.research_model:
+            return ""
+        text = self.research_model.split(f'## {section_name}')[1]
+        # Take until next ## header or end
+        next_section = text.find('\n## ')
+        if next_section > 0:
+            text = text[:next_section]
+        return text.strip()
+
+    def _generate_connection_questions(self):
+        """Generate questions testing interactions between established findings.
+
+        Returns list of connection questions to inject into the question pool.
+        """
+        if self.kill_signal:
+            return []
+
+        established = self._extract_model_section('Established Findings')
+        if not established:
+            return []
+
+        tested = self._extract_model_section('Cross-Finding Connections')
+        if not tested:
+            tested = "(None tested yet)"
+
+        profile = self.data_profile if self.data_profile else "(No profile)"
+
+        prompt = self.engine.prompts.connection_explorer.format(
+            established_findings=established,
+            tested_connections=tested,
+            data_profile=profile,
+            num_questions=self.CONNECTION_QUESTIONS,
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        response = self._call_agent_with_retry(
+            messages, 'Connection Explorer', model_override=self.premium_model)
+
+        # Parse numbered questions (reuse existing parser)
+        questions, _ = self._parse_questions_with_categories(response)
+
+        logger.info(f"Connection explorer generated {len(questions)} questions")
+        return questions
+
+    def _inject_connection_questions(self, iteration):
+        """Run connection explorer and inject questions into pool."""
+        logger.info(f"Running cross-finding connection test (iteration {iteration})")
+        self.last_connection_iteration = iteration
+
+        connection_questions = self._generate_connection_questions()
+        for q in connection_questions:
+            self.question_pool.append({
+                'question': q,
+                'source_branch_id': self.active_branch_id,
+                'category': 'connection',
+                'iteration_added': iteration,
+            })
+        if connection_questions:
+            print(style.branch_event(f"Connection explorer: {len(connection_questions)} interaction questions added to pool"))
+
+    # ══════════════════════════════════════════════
+    # PHASE DETERMINATION
+    # ══════════════════════════════════════════════
+
+    def _determine_phase(self, model_impact, contradiction, thread_completed,
+                         phase_recommendation=None):
+        """Model-driven phase transition.
+
+        The evaluator recommends a phase based on the full context.
+        Thread completion is the only structural override.
+        """
         if thread_completed:
             logger.info("Phase → MAPPING (thread completed)")
             return "MAPPING"
 
-        # Use evaluator's phase recommendation if provided
         if phase_recommendation in ("MAPPING", "PURSUING"):
             if phase_recommendation != self.current_phase:
                 logger.info("Phase → %s (evaluator recommendation)", phase_recommendation)
             return phase_recommendation
 
-        # Fallback: maintain current phase if evaluator didn't recommend
-        logger.info(f"Phase → {self.current_phase} (maintained — no evaluator recommendation)")
+        logger.info(f"Phase → {self.current_phase} (maintained)")
         return self.current_phase
 
     # ══════════════════════════════════════════════
@@ -588,18 +669,7 @@ Pool questions are valuable when current direction feels exhausted."""
 
     def run(self, seed_question, initial_image=None, max_iterations=5, num_parallel_solutions=2,
             interactive=False, resumed_state=None, orientation=True):
-        """Run the autonomous exploration loop.
-
-        Args:
-            seed_question: Starting question (or new direction when resuming).
-            max_iterations: Number of iterations to run. When resuming, this is
-                *additional* iterations on top of what was already completed.
-            resumed_state: If provided, a dict loaded from state.json to restore
-                the exploration from a previous run.
-            orientation: If True (default), run a data profiling step before the
-                main loop to characterize the analytical landscape. Skipped on
-                resumed runs. Use --no-orientation to disable for simple tasks.
-        """
+        """Run the autonomous exploration loop."""
 
         num_parallel_solutions = max(2, min(5, num_parallel_solutions))
 
@@ -617,22 +687,18 @@ Pool questions are valuable when current direction feels exhausted."""
             current_image = initial_image
 
             if resumed_state:
-                # ── RESTORE from checkpoint ──
                 self._restore_checkpoint(resumed_state)
                 start_iteration = resumed_state['iterations_completed']
-                max_iterations = start_iteration + max_iterations  # additive
+                max_iterations = start_iteration + max_iterations
                 last_solution_chain = resumed_state.get('last_solution_chain')
                 last_follow_up_angle = resumed_state.get('last_follow_up_angle')
 
-                # The new seed_question becomes the first analysis in the resumed run
                 current_questions = [seed_question]
                 current_categories = ['exploit']
-                # Keep original seed_question as the relevance anchor (restored from checkpoint)
 
                 logger.info(f"Resuming from iteration {start_iteration}, "
                             f"running {max_iterations - start_iteration} more")
             else:
-                # ── FRESH start ──
                 current_questions = [seed_question]
                 current_categories = ['exploit']
                 last_solution_chain = None
@@ -644,16 +710,15 @@ Pool questions are valuable when current direction feels exhausted."""
                 self.question_pool = []
                 self.root_node_id = None
                 self.research_model = ""
-                self.seed_question = seed_question  # store as relevance anchor
+                self.seed_question = seed_question
                 self.current_phase = "MAPPING"
                 self.phase_history = []
                 self.model_impact_history = []
                 self.evaluator_score_history = []
                 self.biggest_gap_history = []
                 self.stagnation_count = 0
-
-                # Reset data profile (will be populated by orientation if enabled)
                 self.data_profile = ""
+                self.last_connection_iteration = 0
 
                 start_iteration = 0
 
@@ -666,28 +731,37 @@ Pool questions are valuable when current direction feels exhausted."""
             code_model = self.engine.models.code_model
             if interactive and not resumed_state:
                 print(style.config_lines(df_shape, max_iterations, num_parallel_solutions,
-                                         self.engine.output_dir, agent_model, code_model))
+                                         self.engine.output_dir, agent_model, code_model,
+                                         premium_model=self.premium_model))
             else:
                 extra = ""
                 if resumed_state:
                     extra = f" (resuming from iteration {start_iteration})"
                 print(style.splash_header(df_shape, max_iterations, num_parallel_solutions,
-                                          self.engine.output_dir, agent_model, code_model))
+                                          self.engine.output_dir, agent_model, code_model,
+                                          premium_model=self.premium_model))
                 if extra:
                     print(f"    {style.DIM}{extra}{style.RESET}")
             print()
 
             logger.info(f"Starting auto-explore: {seed_question[:50]}... max_iterations={max_iterations}")
 
-            # ── ORIENTATION PHASE (fresh runs only) ──
+            # ── ORIENTATION (fresh runs only) ──
             if orientation and not resumed_state and not self.kill_signal:
-                logger.info("Running orientation phase — data profiling")
-                self.data_profile = self.engine.run_orientation(seed_question)
+                logger.info("Running orientation phase")
+                try:
+                    self.data_profile = self.engine.run_orientation(
+                        seed_question, model_override=self.premium_model)
+                except Exception as e:
+                    logger.warning(f"Orientation failed: {e}")
+                    self.data_profile = ""
                 if self.data_profile:
                     self.engine.data_profile = self.data_profile
                     logger.info(f"Orientation complete: {len(self.data_profile)} chars")
-                else:
-                    logger.info("Orientation skipped or failed — continuing without profile")
+
+            # ══════════════════════════════════════════════
+            # MAIN ITERATION LOOP
+            # ══════════════════════════════════════════════
 
             while iteration < max_iterations:
                 self._current_iteration = iteration
@@ -695,7 +769,6 @@ Pool questions are valuable when current direction feels exhausted."""
                 if self.kill_signal:
                     break
 
-                # --- ADDED: set iteration context on engine ---
                 self.engine._iteration = iteration + 1
                 self.engine._max_iterations = max_iterations
                 self.engine._phase = self.current_phase
@@ -711,17 +784,15 @@ Pool questions are valuable when current direction feels exhausted."""
                     questions_to_process = current_questions[:num_parallel_solutions]
                     categories_to_process = current_categories[:num_parallel_solutions]
 
-                # --- Print iteration header ---
                 print(style.iteration_bar(iteration + 1, max_iterations, self.current_phase))
 
-                # Process each question
+                # ── PROCESS QUESTIONS ──
                 solutions_data = []
 
                 for q_idx, question in enumerate(questions_to_process):
                     if self.kill_signal:
                         break
 
-                    # Restore to common starting point for parallel branches
                     if len(questions_to_process) > 1 and last_solution_chain is not None:
                         self.engine.message_manager.restore_interaction(
                             self.engine.thread_id,
@@ -735,7 +806,6 @@ Pool questions are valuable when current direction feels exhausted."""
                     print()
                     print(style.question_display(q_idx + 1, len(questions_to_process), cat, question))
 
-                    # Process question
                     error_occurred = False
                     try:
                         self.engine._process_question(question, current_image if q_idx == 0 else None, None, None)
@@ -757,24 +827,23 @@ Pool questions are valuable when current direction feels exhausted."""
                     self.engine.message_manager.reset_non_cumul_messages()
                     time.sleep(1)
 
-                # Supporting chain
                 self.chain_id = int(time.time())
                 supporting_chain_id = self.chain_id
 
-                # === EVALUATE ===
+                # ── EVALUATE ──
                 if len(solutions_data) == 1:
                     selected_index = 0
                     scores = [7]
                     keep_dormant_indices = []
-                    is_stagnating = False
                     reason = "Seed question — establishing baseline"
                     follow_up_angle = None
-                    summaries = ['']  # no evaluator for seed; summary populated below
+                    summaries = ['']
                     phase_recommendation = None
                     _is_seed = True
                 else:
                     with style.spinner("Evaluating results"):
-                        selected_index, scores, keep_dormant_indices, is_stagnating, reason, follow_up_angle, summaries, phase_recommendation = \
+                        (selected_index, scores, keep_dormant_indices, _,
+                         reason, follow_up_angle, summaries, phase_recommendation) = \
                             self._evaluate_results_comparative(
                                 solutions_data,
                                 remaining_iterations=max_iterations - iteration,
@@ -782,16 +851,13 @@ Pool questions are valuable when current direction feels exhausted."""
                             )
                     _is_seed = False
 
-                # FIX 4: track evaluator scores for phase decisions
                 self.evaluator_score_history.append(scores[selected_index])
                 if len(self.evaluator_score_history) > 15:
                     self.evaluator_score_history = self.evaluator_score_history[-15:]
 
-                # === UPDATE TREE ===
+                # ── UPDATE TREE ──
                 winning_solution = solutions_data[selected_index]
                 result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
-
-                # Save the common parent BEFORE updating active_branch_id
                 common_parent_id = self.active_branch_id
 
                 new_node_id = self._add_node_to_tree(
@@ -801,7 +867,6 @@ Pool questions are valuable when current direction feels exhausted."""
                     chain_id=winning_solution['chain_id'],
                     parent_id=common_parent_id,
                 )
-                # Store evaluator-generated summary on winning node
                 if selected_index < len(summaries) and summaries[selected_index]:
                     self.insight_tree[new_node_id]['finding_summary'] = summaries[selected_index]
 
@@ -809,7 +874,7 @@ Pool questions are valuable when current direction feels exhausted."""
                 last_solution_chain = winning_solution['chain_id']
                 last_follow_up_angle = follow_up_angle
 
-                # === INTERPRET & UPDATE MODEL ===
+                # ── INTERPRET & UPDATE MODEL ──
                 with style.spinner("Updating research model"):
                     updated_model, model_impact, contradiction, thread_completed, result_digest = \
                         self._interpret_and_update_model(
@@ -820,30 +885,21 @@ Pool questions are valuable when current direction feels exhausted."""
                             scores=scores,
                         )
 
-                # Store RI-generated result_digest on winning node
-                if new_node_id in self.insight_tree:
-                    if result_digest:
-                        self.insight_tree[new_node_id]['result_digest'] = result_digest
+                if new_node_id in self.insight_tree and result_digest:
+                    self.insight_tree[new_node_id]['result_digest'] = result_digest
 
                 self.research_model = updated_model
-                # Size guard: if model gets very large, nudge interpreter to consolidate
                 if len(self.research_model) > 6000:
                     self.research_model += (
-                        "\n\n**NOTE: This model is getting long. On next update, "
-                        "consolidate Established Findings that overlap and compress "
-                        "the Exploration Health section.**"
+                        "\n\n**NOTE: Model getting long — consolidate on next update.**"
                     )
                 self.model_impact_history.append(model_impact)
                 if len(self.model_impact_history) > 10:
                     self.model_impact_history = self.model_impact_history[-10:]
 
-                # === STAGNATION TRACKING ===
-                # Track Biggest Gap evolution (stored for debugging)
                 self._update_gap_stability(updated_model)
 
-                # === DETERMINE PHASE ===
-                # Phase is driven by the evaluator's recommendation, not hardcoded rules.
-                # Thread completion is the only structural override.
+                # ── DETERMINE PHASE ──
                 old_phase = self.current_phase
                 new_phase = self._determine_phase(
                     model_impact, contradiction, thread_completed,
@@ -854,13 +910,12 @@ Pool questions are valuable when current direction feels exhausted."""
 
                 if new_phase != self.current_phase:
                     self.phase_history.append((iteration, self.current_phase, new_phase))
-
                 self.current_phase = new_phase
 
-                # === ADD ALL NON-WINNING SOLUTIONS TO TREE ===
+                # ── ADD NON-WINNING SOLUTIONS TO TREE ──
                 for idx in range(len(solutions_data)):
                     if idx == selected_index:
-                        continue  # winner already added above
+                        continue
                     sol = solutions_data[idx]
                     node_id = self._add_node_to_tree(
                         question=sol['question'],
@@ -869,12 +924,10 @@ Pool questions are valuable when current direction feels exhausted."""
                         chain_id=sol['chain_id'],
                         parent_id=common_parent_id,
                     )
-                    # Store evaluator-generated summary
                     if idx < len(summaries) and summaries[idx]:
                         self.insight_tree[node_id]['finding_summary'] = summaries[idx]
 
                     if idx in keep_dormant_indices:
-                        # Compose hypothesis label — describes what this branch was pursuing
                         summary = self.insight_tree[node_id].get('finding_summary', '')
                         label = sol['question'][:120]
                         if summary:
@@ -884,7 +937,7 @@ Pool questions are valuable when current direction feels exhausted."""
                     else:
                         self.insight_tree[node_id]['status'] = 'runner_up'
 
-                # --- ADDED: write iteration summary ---
+                # ── WRITE ITERATION SUMMARY ──
                 self.engine.write_iteration_summary(
                     iteration=iteration + 1,
                     phase=old_phase,
@@ -898,14 +951,10 @@ Pool questions are valuable when current direction feels exhausted."""
                     old_phase=old_phase,
                 )
 
-                # Increment
                 iteration += 1
-
-                # Save checkpoint after each completed iteration
                 self._save_checkpoint(iteration, last_solution_chain, last_follow_up_angle)
 
                 if iteration >= max_iterations:
-                    # Show final evaluation summary even though we won't generate more questions
                     print(style.pipeline_summary(
                         selected_q=selected_index + 1,
                         selected_score=scores[selected_index],
@@ -922,9 +971,7 @@ Pool questions are valuable when current direction feels exhausted."""
                 if self.kill_signal:
                     break
 
-                # === BRANCH DECISION ===
-                # When a thread completes, mark the branch endpoint and potentially
-                # switch to a dormant branch or start fresh.
+                # ── BRANCH DECISION ──
                 if new_phase == "MAPPING" and thread_completed:
                     self.engine.branch_endpoints.append(last_solution_chain)
                     print(style.branch_event("Thread complete — new territory"))
@@ -938,11 +985,15 @@ Pool questions are valuable when current direction feels exhausted."""
                         )
                         self.active_branch_id = new_branch_id
                         last_solution_chain = new_branch['chain_id']
-                        # Connect the dormant branch's hypothesis to the QG hint
                         last_follow_up_angle = new_branch.get('hypothesis_label') or new_branch['question'][:150]
                         print(style.branch_event(f"Switched to dormant branch (score: {style.score(new_branch['quality_score'])})"))
 
-                # === GENERATE NEW QUESTIONS ===
+                # ── NEW: CROSS-FINDING CONNECTION CHECK ──
+                if self._should_run_connections(iteration):
+                    with style.spinner("Testing cross-finding connections"):
+                        self._inject_connection_questions(iteration)
+
+                # ── GENERATE NEW QUESTIONS ──
                 with style.spinner("Generating questions"):
                     new_questions, new_categories, raw_response = self._generate_branching_questions(
                         use_chain_id=supporting_chain_id,
@@ -951,29 +1002,18 @@ Pool questions are valuable when current direction feels exhausted."""
 
                 # Retry once if parsing failed
                 if not new_questions:
-                    logger.info(f"Question generation returned empty. Raw response: {raw_response[:200] if raw_response else '(empty)'}")
+                    logger.info(f"Question generation empty. Raw: {raw_response[:200] if raw_response else '(empty)'}")
                     print(style.error_msg("Question generation failed, retrying..."))
                     new_questions, new_categories, raw_response = self._generate_branching_questions(
                         use_chain_id=supporting_chain_id,
+                        follow_up_hint=last_follow_up_angle,
                     )
 
-                # Cross-model fallback: if still empty, try the alternate model
                 if not new_questions:
-                    fallback_model = self._get_fallback_model('Question Generator')
-                    if fallback_model:
-                        logger.info(f"QG retry failed, falling back to {fallback_model}")
-                        print(style.error_msg(f"Retrying with fallback model..."))
-                        new_questions, new_categories, raw_response = self._generate_branching_questions(
-                            use_chain_id=supporting_chain_id,
-                            follow_up_hint=last_follow_up_angle,
-                            model_override=fallback_model,
-                        )
-
-                if not new_questions:
-                    print(style.error_msg("Could not generate new questions after retry. Exploration complete."))
+                    print(style.error_msg("Could not generate questions. Exploration complete."))
                     break
 
-                # === SELECT QUESTIONS ===
+                # ── SELECT QUESTIONS ──
                 num_to_select = num_parallel_solutions + 1 if iteration == 1 else num_parallel_solutions
                 with style.spinner("Selecting questions"):
                     selected_questions, selected_categories = self._select_best_questions(
@@ -985,7 +1025,6 @@ Pool questions are valuable when current direction feels exhausted."""
                 if not selected_questions:
                     break
 
-                # --- Print pipeline summary (evaluate → interpret → plan) ---
                 phase_mode = self.PHASE_INSTRUCTIONS.get(self.current_phase, ("EXPLORE",))[0]
                 print(style.pipeline_summary(
                     selected_q=selected_index + 1,
@@ -1004,27 +1043,23 @@ Pool questions are valuable when current direction feels exhausted."""
                 current_categories = selected_categories
                 current_image = None
 
-            # === CAPTURE FINAL BRANCH ENDPOINT ===
+            # ── POST-LOOP ──
             if last_solution_chain:
                 self.engine.branch_endpoints.append(last_solution_chain)
 
-            # === BUILD TRAJECTORY ===
             self.engine.exploration_trajectory = self._build_exploration_trajectory()
 
-            # === SYNTHESIS ===
             with style.spinner("Generating synthesis report"):
                 synthesis_text = self._generate_synthesis(seed_question)
 
             if not synthesis_text:
-                print(f"  {style.YELLOW}✗ Synthesis failed (individual analyses saved in output/exploration/){style.RESET}")
+                print(f"  {style.YELLOW}✗ Synthesis failed{style.RESET}")
                 synthesis_text = ""
 
-            # === EXPLORATION TREE ===
             print(style.exploration_tree(self.insight_tree, self.root_node_id,
                                          phase_history=self.phase_history,
                                          total_iterations=iteration))
 
-            # === FINAL SUMMARY ===
             dormant_count = len(self.dormant_branches)
             avg_score = sum(n['quality_score'] for n in self.insight_tree.values()) / len(self.insight_tree) if self.insight_tree else 0
 
@@ -1038,22 +1073,20 @@ Pool questions are valuable when current direction feels exhausted."""
                 output_dir=self.engine.output_dir,
             ))
 
-            # Write final files
             self.engine.write_final_outputs(
                 research_model=self.research_model,
                 phase_history=self.phase_history,
                 synthesis_text=synthesis_text,
             )
-            print()  # trailing newline
+            print()
 
         finally:
-            # Restore original settings
             self.engine.user_feedback = original_user_feedback
             self.engine.message_manager.select_analyst_messages[0]["content"] = original_analyst_system_content
             self.engine.MAX_ERROR_CORRECTIONS = original_max_errors
 
-    def _generate_synthesis(self, seed_question, max_retries=3):
-        """Generate final synthesis report from exploration state."""
+    def _generate_synthesis(self, seed_question):
+        """Generate final synthesis report."""
         if not self.insight_tree:
             return None
 
@@ -1077,21 +1110,27 @@ Pool questions are valuable when current direction feels exhausted."""
 
         messages = [{"role": "user", "content": prompt}]
 
-        for attempt in range(1, max_retries + 1):
-            response = self._llm_stream_silent(messages, 'Synthesis Generator')
+        # Synthesis is the payoff of the entire run — retry indefinitely
+        # with exponential backoff (10→20→40→80s cap) until a response is received.
+        attempt = 0
+        backoff = 10
+        while True:
+            attempt += 1
+            response = self._call_agent_with_retry(
+                messages, 'Synthesis Generator', model_override=self.premium_model)
             if response and response.strip():
+                if attempt > 1:
+                    logger.info(f"Synthesis succeeded on attempt {attempt}")
                 return response
-            if attempt < max_retries:
-                wait = attempt * 5
-                logger.warning(f"Synthesis attempt {attempt}/{max_retries} failed, retrying in {wait}s...")
-                time.sleep(wait)
 
-        logger.error("Synthesis generation failed after all retries")
-        return None
+            logger.warning(f"Synthesis attempt {attempt} failed, retrying in {backoff}s...")
+            print(f"  {style.YELLOW}⟳ Synthesis attempt {attempt} failed — retrying in {backoff}s...{style.RESET}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 80)
 
-    ##################
-    # Helper Methods #
-    ##################
+    # ══════════════════════════════════════════════
+    # HELPER METHODS
+    # ══════════════════════════════════════════════
 
     _node_counter = 0
 
@@ -1100,48 +1139,32 @@ Pool questions are valuable when current direction feels exhausted."""
         return f"node_{int(time.time() * 1000)}_{AutoExplorer._node_counter}"
 
     def _extract_biggest_gap(self, model_text):
-        """Extract the Biggest Gap section from the research model text."""
-        if not model_text or '## Biggest Gap' not in model_text:
-            return ""
-        gap_text = model_text.split('## Biggest Gap')[1]
-        # Take until next section header or end
-        for marker in ['## Exploration Health', '## Phase History', '## ']:
-            idx = gap_text.find(marker)
-            if idx > 0:
-                gap_text = gap_text[:idx]
-                break
-        return gap_text.strip()
+        """Extract the Biggest Gap section from the research model."""
+        return self._extract_model_section('Biggest Gap') if model_text else ""
 
     def _update_gap_stability(self, updated_model):
-        """Track whether the Biggest Gap has changed. Returns True if gap is stale."""
+        """Track whether the Biggest Gap has changed."""
         current_gap = self._extract_biggest_gap(updated_model)
         if not current_gap:
             return False
 
         self.biggest_gap_history.append(current_gap)
-        # Keep last 5
         if len(self.biggest_gap_history) > 5:
             self.biggest_gap_history = self.biggest_gap_history[-5:]
 
         if len(self.biggest_gap_history) < 2:
             return False
 
-        # Compare current gap to previous — use simple word overlap ratio
-        # rather than exact string match, since phrasing may change slightly
-        prev_gap = self.biggest_gap_history[-2]
-        prev_words = set(prev_gap.lower().split())
+        prev_words = set(self.biggest_gap_history[-2].lower().split())
         curr_words = set(current_gap.lower().split())
-
         if not prev_words or not curr_words:
             return False
 
         overlap = len(prev_words & curr_words) / max(len(prev_words | curr_words), 1)
-        # > 70% word overlap means the gap hasn't substantively changed
         return overlap > 0.70
 
     def _add_node_to_tree(self, question, result_summary, quality_score, chain_id, parent_id=None):
         node_id = self._generate_node_id()
-        # Extract the results block if present.
         if result_summary:
             start_marker = "###RESULTS_START###"
             end_marker = "###RESULTS_END###"
@@ -1160,9 +1183,9 @@ Pool questions are valuable when current direction feels exhausted."""
             'status': 'active',
             'depth': 0 if parent_id is None else self.insight_tree[parent_id]['depth'] + 1,
             'chain_id': chain_id,
-            'finding_summary': '',  # populated by evaluator SUMMARIES
-            'result_digest': '',   # populated by RI — key numbers for full-detail history tier
-            'hypothesis_label': '',  # populated when marked dormant — describes the analytical direction
+            'finding_summary': '',
+            'result_digest': '',
+            'hypothesis_label': '',
         }
         if parent_id and parent_id in self.insight_tree:
             self.insight_tree[parent_id]['children_ids'].append(node_id)
@@ -1171,19 +1194,12 @@ Pool questions are valuable when current direction feels exhausted."""
         return node_id
 
     def _get_exploration_history(self, max_entries=40, full_detail_count=15):
-        """Build exploration history with tiered compaction.
-
-        Three tiers of detail:
-        - Compact tier (older entries): question + finding_summary (one sentence)
-        - Full tier (recent entries): question + result_digest (RI-curated key numbers)
-        - Fallback: raw result_summary when RI-generated fields are unavailable
-        """
+        """Build exploration history with tiered compaction."""
         if not self.insight_tree:
             return ""
         all_nodes = sorted(self.insight_tree.values(), key=lambda n: n['chain_id'])
         recent = all_nodes[-max_entries:]
 
-        # Split into compact (older) and full-detail (recent)
         if len(recent) > full_detail_count:
             compact_nodes = recent[:-full_detail_count]
             full_nodes = recent[-full_detail_count:]
@@ -1194,21 +1210,17 @@ Pool questions are valuable when current direction feels exhausted."""
         history_parts = ["**Exploration History (all branches):**"]
 
         if compact_nodes:
-            history_parts.append(f"\n*Earlier analyses (compacted, {len(compact_nodes)} entries):*")
+            history_parts.append(f"\n*Earlier analyses ({len(compact_nodes)} entries):*")
             for node in compact_nodes:
                 score = node['quality_score']
                 question = node['question']
                 status_marker = " [DORMANT]" if node['status'] == 'dormant' else ""
-
-                # Use finding_summary if available, else first line of result
                 summary = node.get('finding_summary', '')
                 if not summary:
                     finding = node['result_summary'] if node['result_summary'] else "No results"
                     summary = finding.split('\n')[0][:200]
-
                 history_parts.append(
-                    f"- [{score}/10]{status_marker} Q: {question}\n"
-                    f"  → {summary}"
+                    f"- [{score}/10]{status_marker} Q: {question}\n  → {summary}"
                 )
 
         if full_nodes:
@@ -1219,15 +1231,10 @@ Pool questions are valuable when current direction feels exhausted."""
                 question = node['question']
                 status_marker = " [DORMANT]" if node['status'] == 'dormant' else ""
 
-                # Only winning (active) nodes with a digest get full-detail display.
-                # Non-winning nodes (runner_up, dormant, abandoned) use compact format
-                # even in the recent tier — their raw result_summaries are too verbose
-                # and they're preserved in full_results_store for synthesis anyway.
                 digest = node.get('result_digest', '')
                 if digest and node['status'] == 'active':
                     history_parts.append(
-                        f"- [{score}/10]{status_marker} Q: {question}\n"
-                        f"  Finding: {digest}"
+                        f"- [{score}/10]{status_marker} Q: {question}\n  Finding: {digest}"
                     )
                 else:
                     summary = node.get('finding_summary', '')
@@ -1235,8 +1242,7 @@ Pool questions are valuable when current direction feels exhausted."""
                         finding = node['result_summary'] if node['result_summary'] else "No results"
                         summary = finding.split('\n')[0][:200]
                     history_parts.append(
-                        f"- [{score}/10]{status_marker} Q: {question}\n"
-                        f"  → {summary}"
+                        f"- [{score}/10]{status_marker} Q: {question}\n  → {summary}"
                     )
 
         if self.phase_history:
@@ -1245,7 +1251,6 @@ Pool questions are valuable when current direction feels exhausted."""
         return '\n'.join(history_parts)
 
     def _get_dataset_schema(self):
-        """Get full dataset schema for Code Generator context."""
         try:
             return f"**Available Data:**\n{self.engine._get_df_schema()}"
         except Exception as e:
@@ -1253,22 +1258,18 @@ Pool questions are valuable when current direction feels exhausted."""
             return ""
 
     def _get_dataset_schema_slim(self):
-        """FIX 5: Lightweight schema for non-code agents (QG, Selector, Evaluator)."""
         try:
             return f"**Available Data:**\n{self.engine._get_df_schema_slim()}"
         except Exception as e:
-            logger.warning(f"Could not get slim dataset schema: {e}")
-            # Fall back to full schema if slim not available
+            logger.warning(f"Could not get slim schema: {e}")
             return self._get_dataset_schema()
 
     def _add_to_dormant(self, node_id):
         if node_id not in self.insight_tree:
             return False
         node = self.insight_tree[node_id]
-        # Minimum depth: must have some development
         if node['depth'] < 2:
             return False
-        # Minimum score: only save genuinely promising branches
         if node['quality_score'] < 6:
             node['status'] = 'abandoned'
             return False
@@ -1297,17 +1298,7 @@ Pool questions are valuable when current direction feels exhausted."""
         return best_id
 
     def _get_fallback_model(self, agent):
-        """Get the alternate model for cross-model fallback.
-
-        If the agent normally uses the agent_model, returns the code_model,
-        and vice versa. Returns None if both models are the same.
-        """
-        agent_model = self.engine.models.agent_model
-        code_model = self.engine.models.code_model
-        if agent_model == code_model:
-            return None
-        normal_model = self.engine.models.get_model_name(agent)[0]
-        return code_model if normal_model == agent_model else agent_model
+        return self.engine._get_fallback_model(agent)
 
     def _trim_question_pool(self):
         if len(self.question_pool) > 10:
@@ -1318,14 +1309,9 @@ Pool questions are valuable when current direction feels exhausted."""
     # ══════════════════════════════════════════════
 
     def _save_checkpoint(self, iteration, last_solution_chain, last_follow_up_angle):
-        """Save complete exploration state to disk after each iteration.
-
-        Writes atomically (tmp + rename) so a crash mid-write won't corrupt
-        the checkpoint.  The companion _restore_checkpoint() rebuilds all
-        in-memory structures from this file.
-        """
+        """Save complete exploration state to disk."""
         state = {
-            "version": 1,
+            "version": 2,  # bumped for new fields
             "iterations_completed": iteration,
             "explorer": {
                 "insight_tree": self.insight_tree,
@@ -1343,6 +1329,7 @@ Pool questions are valuable when current direction feels exhausted."""
                 "stagnation_count": self.stagnation_count,
                 "node_counter": AutoExplorer._node_counter,
                 "data_profile": self.data_profile,
+                "last_connection_iteration": self.last_connection_iteration,  # NEW
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
@@ -1371,7 +1358,6 @@ Pool questions are valuable when current direction feels exhausted."""
         self.research_model = ex['research_model']
         self.seed_question = ex.get('seed_question', '')
         self.current_phase = ex['current_phase']
-        # phase_history: JSON stores tuples as lists — convert back
         self.phase_history = [tuple(t) for t in ex['phase_history']]
         self.model_impact_history = ex['model_impact_history']
         self.evaluator_score_history = ex.get('evaluator_score_history', [])
@@ -1379,7 +1365,7 @@ Pool questions are valuable when current direction feels exhausted."""
         self.stagnation_count = ex.get('stagnation_count', 0)
         AutoExplorer._node_counter = ex.get('node_counter', 0)
         self.data_profile = ex.get('data_profile', '')
-        # Sync to engine so code generator can use it
+        self.last_connection_iteration = ex.get('last_connection_iteration', 0)  # NEW
         self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']
@@ -1390,7 +1376,7 @@ Pool questions are valuable when current direction feels exhausted."""
         self.engine.branch_endpoints = state.get('branch_endpoints', [])
 
     def _build_exploration_trajectory(self):
-        """Build trajectory for synthesis. Includes result_summary for each node."""
+        """Build trajectory for synthesis."""
         if not self.insight_tree:
             return None
 
@@ -1450,16 +1436,7 @@ Pool questions are valuable when current direction feels exhausted."""
 
 def format_trajectory_for_synthesis(trajectory, full_results_store=None,
                                     selected_chain_id=None, max_nodes=40):
-    """
-    Format exploration trajectory for the synthesis prompt.
-
-    FIX 3: Uses **score-weighted** node selection instead of recency-only.
-    Ensures high-scoring early analyses survive into synthesis even at 100+
-    iterations, while still including recent context.
-
-    Prefers full_results_store for complete stdout. Falls back to tree node
-    result_summary if store is unavailable.
-    """
+    """Format exploration trajectory for synthesis. Score-weighted node selection."""
     if not trajectory or not trajectory['nodes']:
         return "No exploration data available."
 
@@ -1470,22 +1447,17 @@ def format_trajectory_for_synthesis(trajectory, full_results_store=None,
     if not nodes:
         return "No exploration data available for this point."
 
-    # ── FIX 3: Score-weighted node selection ──
-    # Instead of nodes[-max_nodes:] (pure recency), blend top-scoring with recent.
+    # Score-weighted selection: blend top-scoring with recent
     if len(nodes) > max_nodes:
-        # Always include the last `recent_count` nodes for continuity
         recent_count = min(15, max_nodes // 3)
         recent_nodes = nodes[-recent_count:]
         recent_chain_ids = {n['chain_id'] for n in recent_nodes}
 
-        # From remaining pool, take highest-scoring nodes
         remaining = [n for n in nodes if n['chain_id'] not in recent_chain_ids]
         remaining.sort(key=lambda n: n['quality_score'], reverse=True)
         top_scoring = remaining[:max_nodes - recent_count]
 
-        # Combine and restore chronological order
         nodes = sorted(recent_nodes + top_scoring, key=lambda n: n['chain_id'])
-    # ── End FIX 3 ──
 
     full_results_store = full_results_store or {}
     parts = []
@@ -1501,7 +1473,6 @@ def format_trajectory_for_synthesis(trajectory, full_results_store=None,
         transitions = [f"{old}→{new} (iter {i})" for i, old, new in trajectory['phase_history']]
         parts.append(f"**Phase transitions:** {' | '.join(transitions)}\n")
 
-    # Map nodes to branches
     node_branches = {}
     for b_idx, branch in enumerate(relevant_branches, 1):
         for nid in branch['node_ids']:
@@ -1518,11 +1489,9 @@ def format_trajectory_for_synthesis(trajectory, full_results_store=None,
         branch_label = node_to_branch.get(node['node_id'], "Shared")
         status_label = f" [{node['status'].upper()}]" if node['status'] in ('dormant', 'runner_up') else ""
 
-        # Prefer full results from store; fall back to tree node summary
         chain_key = str(node['chain_id'])
         result_text = full_results_store.get(chain_key, node.get('result_summary', 'Results not available'))
 
-        # Safety cap — generous for synthesis (runs once, can afford tokens)
         if len(result_text) > 3000:
             result_text = result_text[:1500] + "\n[...]\n" + result_text[-1500:]
 
@@ -1542,15 +1511,7 @@ def format_trajectory_for_synthesis(trajectory, full_results_store=None,
 
 def format_synthesis_input(insight_tree, full_results_store, research_model,
                            seed_question, data_profile=''):
-    """
-    Build structured synthesis input from exploration state.
-
-    Four sections:
-    A) Framing — seed question + data profile
-    B) Findings Index — all active nodes, compact (finding_summary)
-    C) Full Evidence — all active nodes, complete results
-    D) Research Model — current understanding, confidence, open questions
-    """
+    """Build structured synthesis input from exploration state."""
     full_results_store = full_results_store or {}
     active = sorted(
         [n for n in insight_tree.values() if n.get('status') == 'active'],
@@ -1562,7 +1523,7 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
 
     parts = []
 
-    # ── Section A: Framing ──
+    # Section A: Framing
     parts.append("═══════════════════════════════════════")
     parts.append("SECTION A: EXPLORATION CONTEXT")
     parts.append("═══════════════════════════════════════\n")
@@ -1571,29 +1532,25 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
         parts.append(f"**Dataset profile:**\n{data_profile}\n")
     parts.append(f"**Exploration scope:** {len(active)} analyses completed\n")
 
-    # ── Section B: Findings Index ──
+    # Section B: Findings Index
     parts.append("═══════════════════════════════════════")
     parts.append("SECTION B: COMPLETE FINDINGS INDEX")
-    parts.append("═══════════════════════════════════════")
-    parts.append("Scan this index to identify ALL major themes and discoveries.")
-    parts.append("Each entry is one analysis with its quality score and one-sentence summary.\n")
+    parts.append("═══════════════════════════════════════\n")
 
     for n in active:
         fs = n.get('finding_summary', '') or '(no summary)'
         parts.append(f"[{n['quality_score']}] [[{n['chain_id']}]] {fs}")
 
-    # ── Section C: Full Evidence ──
+    # Section C: Full Evidence
     parts.append("\n═══════════════════════════════════════")
     parts.append("SECTION C: FULL EVIDENCE")
-    parts.append("═══════════════════════════════════════")
-    parts.append("Complete results for every analysis. Use these numbers in your report.\n")
+    parts.append("═══════════════════════════════════════\n")
 
     for n in active:
         chain_key = str(n['chain_id'])
         result_text = full_results_store.get(
             chain_key, n.get('result_summary', 'Results not available')
         )
-        # Safety cap per node
         if len(result_text) > 3000:
             result_text = result_text[:1500] + "\n[...truncated...]\n" + result_text[-1500:]
 
@@ -1604,13 +1561,10 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
             f"{'─' * 5}"
         )
 
-    # ── Section D: Research Model ──
+    # Section D: Research Model
     parts.append("\n═══════════════════════════════════════")
     parts.append("SECTION D: FINAL RESEARCH MODEL")
-    parts.append("═══════════════════════════════════════")
-    parts.append("This reflects the exploration's FINAL understanding. It may not cover")
-    parts.append("important earlier discoveries that were graduated out as new findings arrived.")
-    parts.append("Always cross-reference against the Findings Index above.\n")
+    parts.append("═══════════════════════════════════════\n")
     parts.append(research_model or "(No research model available)")
 
     return '\n'.join(parts)

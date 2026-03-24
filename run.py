@@ -8,6 +8,10 @@ Usage:
     python run.py data.csv "Explore revenue" --iterations 10
     python run.py data.csv --code-model openai:gpt-5.3-codex
 
+    # Use a stronger model for orientation and synthesis
+    python run.py data.csv "Explore patterns" \
+        --code-model ollama:kimi-k2.5 --premium-model anthropic:claude-opus-4-6
+
     # Resume a previous run with 20 additional iterations
     python run.py data.csv "Pursue the MSS3 finding" --continue --iterations 20
 
@@ -39,7 +43,10 @@ def main():
     parser.add_argument("--agent-model", default=None,
                         help="provider:model for agents (default: anthropic:claude-haiku-4-5-20251001)")
     parser.add_argument("--code-model", default=None,
-                        help="provider:model for code gen and synthesis (default: anthropic:claude-opus-4-6)")
+                        help="provider:model for code generation (default: anthropic:claude-opus-4-6)")
+    parser.add_argument("--premium-model", default=None,
+                        help="provider:model for orientation, connection explorer, and final synthesis — "
+                             "high-leverage calls that bookend the run (default: same as code-model)")
     parser.add_argument("--continue", dest="continue_run", action="store_true",
                         help="Resume from a previous run's saved state. "
                              "Iterations are additive (e.g. 25 completed + --iterations 30 = 30 more).")
@@ -125,6 +132,7 @@ def main():
     # Run exploration
     from auto_explore import AutoExplorer
     explorer = AutoExplorer(engine)
+    explorer.premium_model = args.premium_model
     explorer.run(
         seed_question=question,
         max_iterations=args.iterations,

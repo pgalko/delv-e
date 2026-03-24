@@ -238,6 +238,86 @@ class ExplorationEngine:
         return response
 
     # ──────────────────────────────────────────────
+    # Shared LLM helpers (used by _process_question and run_orientation)
+    # ──────────────────────────────────────────────
+
+    def _get_fallback_model(self, agent):
+        """Get the alternate model for cross-model fallback.
+
+        If the agent normally uses the agent_model, returns the code_model,
+        and vice versa. Returns None if both models are the same.
+        """
+        agent_model = self.models.agent_model
+        code_model = self.models.code_model
+        if agent_model == code_model:
+            return None
+        normal_model = self.models.get_model_name(agent)[0]
+        return code_model if normal_model == agent_model else agent_model
+
+    def _call_llm_for_code(self, messages, model, agent="Code Generator"):
+        """Call LLM and extract code with retry + model fallback.
+
+        Pattern: try → retry same model with nudge → fallback alternate model.
+        Returns (code, llm_response) where code may be None if all attempts fail.
+        """
+        # Attempt 1: primary model
+        try:
+            llm_response = self.llm_client.call(
+                messages=messages, model=model,
+                max_tokens=10000, temperature=0, agent=agent,
+            )
+        except Exception as e:
+            logger.warning(f"Code gen LLM call failed ({agent}): {e}")
+            llm_response = ""
+
+        code = extract_code(llm_response or "")
+        if code:
+            return code, llm_response
+
+        # Attempt 2: retry same model with nudge
+        retry_msg = (
+            "Your previous response did not contain a ```python``` code block. "
+            "Please return ONLY executable Python code inside ```python``` markers. "
+            "The DataFrame `df` is pre-loaded. Do not explain — just provide the code."
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": llm_response or ""},
+            {"role": "user", "content": retry_msg},
+        ]
+        try:
+            llm_response = self.llm_client.call(
+                messages=retry_messages, model=model,
+                max_tokens=10000, temperature=0, agent=agent,
+            )
+        except Exception as e:
+            logger.warning(f"Code gen retry failed ({agent}): {e}")
+            llm_response = ""
+
+        code = extract_code(llm_response or "")
+        if code:
+            return code, llm_response
+
+        # Attempt 3: fallback to alternate model
+        fallback_model = self._get_fallback_model(agent)
+        if fallback_model:
+            logger.info(f"Code gen falling back to {fallback_model}")
+            self.output_manager.print_wrapper(
+                style.error_msg(f"Retrying with fallback model..."),
+                chain_id=self.chain_id,
+            )
+            try:
+                llm_response = self.llm_client.call(
+                    messages=messages, model=fallback_model,
+                    max_tokens=10000, temperature=0, agent=agent,
+                )
+            except Exception as e:
+                logger.warning(f"Code gen fallback failed ({agent}): {e}")
+                llm_response = ""
+            code = extract_code(llm_response or "")
+
+        return code, llm_response or ""
+
+    # ──────────────────────────────────────────────
     # _process_question (called by auto_explore per iteration)
     # ──────────────────────────────────────────────
 
@@ -273,35 +353,7 @@ class ExplorationEngine:
         )
 
         with style.spinner("Generating code"):
-            llm_response = self.llm_client.call(
-                messages=messages,
-                model=model,
-                max_tokens=10000,
-                temperature=0,
-                agent="Code Generator",
-            )
-
-        code = extract_code(llm_response)
-
-        # If no code was extracted, retry with a more explicit prompt
-        if not code:
-            retry_msg = (
-                "Your previous response did not contain a ```python``` code block. "
-                "Please return ONLY executable Python code inside ```python``` markers. "
-                "The DataFrame `df` is pre-loaded. Do not explain — just provide the code."
-            )
-            messages.append({"role": "assistant", "content": llm_response})
-            messages.append({"role": "user", "content": retry_msg})
-
-            with style.spinner("Retrying code generation"):
-                llm_response = self.llm_client.call(
-                    messages=messages,
-                    model=model,
-                    max_tokens=10000,
-                    temperature=0,
-                    agent="Code Generator",
-                )
-            code = extract_code(llm_response)
+            code, llm_response = self._call_llm_for_code(messages, model)
 
         if not code:
             self.output_manager.print_wrapper(
@@ -349,7 +401,7 @@ class ExplorationEngine:
                     "The DataFrame `df` is pre-loaded. Include all imports."
                 )
 
-            messages.append({"role": "assistant", "content": llm_response})
+            messages.append({"role": "assistant", "content": llm_response or ""})
             messages.append({"role": "user", "content": fix_msg})
 
             with style.spinner("Fixing code"):
@@ -360,7 +412,7 @@ class ExplorationEngine:
                     temperature=0,
                     agent="Error Corrector",
                 )
-            code = extract_code(llm_response)
+            code = extract_code(llm_response or "")
             if code:
                 code_lines = len(code.strip().split('\n'))
                 results, error, plots = self.executor.execute(code, self.df, analysis_dir)
@@ -434,13 +486,11 @@ class ExplorationEngine:
     # Orientation (data profiling)
     # ──────────────────────────────────────────────
 
-    def run_orientation(self, seed_question):
+    def run_orientation(self, seed_question, model_override=None):
         """Run the orientation phase: profile the dataset's analytical landscape.
 
         Returns the data profile string, or empty string on failure.
-        Uses the orientation-specific prompts which focus on cross-variable
-        relationships, group sizes, confounders, and power boundaries — NOT
-        column-level stats (already in the schema).
+        Uses the same code generation + retry + fallback pattern as _process_question.
         """
         schema = self._get_df_schema()
 
@@ -454,21 +504,15 @@ class ExplorationEngine:
             {"role": "user", "content": user_msg},
         ]
 
-        model, _ = self.models.get_model_name("Code Generator")
+        model = model_override or self.models.get_model_name("Code Generator")[0]
         self.output_manager.print_wrapper(
             style.agent("Orientation", model), chain_id=self.chain_id
         )
 
+        # Code generation: try → retry with nudge → model fallback (shared method)
         with style.spinner("Profiling dataset"):
-            llm_response = self.llm_client.call(
-                messages=messages,
-                model=model,
-                max_tokens=10000,
-                temperature=0,
-                agent="Code Generator",
-            )
+            code, llm_response = self._call_llm_for_code(messages, model)
 
-        code = extract_code(llm_response)
         if not code:
             self.output_manager.print_wrapper(
                 style.error_msg("Orientation: no code generated"),
@@ -481,27 +525,44 @@ class ExplorationEngine:
         os.makedirs(analysis_dir, exist_ok=True)
         results, error, plots = self.executor.execute(code, self.df, analysis_dir)
 
-        # Error correction (up to 3 retries)
+        # Error correction loop (same pattern as _process_question)
         retries = 0
-        while error and retries < 3:
+        while error and retries < self.MAX_ERROR_CORRECTIONS:
             retries += 1
             self.output_manager.print_wrapper(
-                style.error_msg(f"Retry {retries}/3: {error.strip().split(chr(10))[-1][:120]}"),
+                style.error_msg(f"Retry {retries}/{self.MAX_ERROR_CORRECTIONS}: {error.strip().split(chr(10))[-1][:120]}"),
                 chain_id=self.chain_id,
             )
-            fix_msg = self.prompts.error_corrector.format(error=error, schema=schema)
-            messages.append({"role": "assistant", "content": llm_response})
+
+            if retries > 2 and len(messages) >= 6:
+                del messages[2]
+                del messages[2]
+
+            if retries == 1:
+                fix_msg = self.prompts.error_corrector.format(error=error, schema=schema)
+            else:
+                fix_msg = (
+                    f"Still failing. Error:\n{error}\n\n"
+                    "Return the complete corrected code within ```python``` blocks. "
+                    "The DataFrame `df` is pre-loaded. Include all imports."
+                )
+
+            messages.append({"role": "assistant", "content": llm_response or ""})
             messages.append({"role": "user", "content": fix_msg})
 
             with style.spinner("Fixing orientation code"):
-                llm_response = self.llm_client.call(
-                    messages=messages,
-                    model=model,
-                    max_tokens=10000,
-                    temperature=0,
-                    agent="Error Corrector",
-                )
-            code = extract_code(llm_response)
+                try:
+                    llm_response = self.llm_client.call(
+                        messages=messages,
+                        model=model,
+                        max_tokens=10000,
+                        temperature=0,
+                        agent="Error Corrector",
+                    )
+                except Exception as e:
+                    logger.warning(f"Orientation error correction failed: {e}")
+                    break
+            code = extract_code(llm_response or "")
             if code:
                 results, error, plots = self.executor.execute(code, self.df, analysis_dir)
             else:
@@ -707,12 +768,12 @@ class ExplorationEngine:
             parts.append(f"  - {col} ({dtype}, {nunique} unique{null_pct})")
             parts.append(f"    {sample_str}")
 
-        # For narrow datasets (≤50 cols), include head() and describe() — they're
+        # For narrow datasets (≤40 cols), include head() and describe() — they're
         # readable and help the code model understand data format and distributions.
-        # For wide datasets (>50 cols), these become unreadable walls of text that
+        # For wide datasets (>40 cols), these become unreadable walls of text that
         # consume most of the context window while adding little value — the column
         # schema already provides types, nulls, ranges, and sample values.
-        if len(self.df.columns) <= 50:
+        if len(self.df.columns) <= 40:
             parts.append(f"\nFirst 5 rows:\n{self.df.head(5).to_string()}")
             parts.append(f"\nNumeric summary:\n{self.df.describe().to_string()}")
         return "\n".join(parts)
