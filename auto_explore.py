@@ -953,6 +953,7 @@ class AutoExplorer:
 
                 iteration += 1
                 self._save_checkpoint(iteration, last_solution_chain, last_follow_up_angle)
+                self._write_dashboard(iteration, max_iterations)
 
                 if iteration >= max_iterations:
                     print(style.pipeline_summary(
@@ -1346,6 +1347,15 @@ class AutoExplorer:
         with open(tmp_path, 'w') as f:
             json.dump(state, f, indent=2, default=str)
         os.replace(tmp_path, path)
+
+    def _write_dashboard(self, iteration, max_iterations):
+        """Write live dashboard HTML (best-effort, failures are silent)."""
+        try:
+            from dashboard import write_dashboard
+            write_dashboard(self.engine.output_dir, self, self.engine,
+                            iteration, max_iterations)
+        except Exception as e:
+            logger.debug(f"Dashboard write skipped: {e}")
 
     def _restore_checkpoint(self, state):
         """Restore exploration state from a loaded checkpoint dict."""

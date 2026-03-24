@@ -145,6 +145,7 @@ The seed question on `--continue` becomes the first analysis in the resumed run.
 
 ```
 output/
+├── dashboard.html           # Live dashboard — open in browser, auto-refreshes
 ├── synthesis_report.md      # Final report with citations
 ├── research_model.md        # Hypotheses, findings, maturity, connections, gaps
 ├── run_log.json             # Full log of every LLM call
@@ -209,6 +210,7 @@ Check `output/cost.txt` after each run for exact breakdown by agent.
 run.py               CLI — dataset loading, --continue handling, --premium-model override
 engine.py            ExplorationEngine — runtime, code execution, orientation, file output
 auto_explore.py      Core loop — phases, maturity tracking, connections, research model
+dashboard.py         Live HTML dashboard — written after each iteration, auto-refreshes
 llm.py               Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama)
 executor.py          Local code execution with security guards
 prompts.py           All prompt templates (agents, code generation, orientation, connections)
