@@ -5,8 +5,14 @@ Handles the exploration loop, result evaluation, and adaptive branching.
 Key mechanisms:
   - Finding Maturity: tracks significant findings through an analytical arc
     (DETECTED → QUANTIFIED → DECOMPOSED → REGIME-TESTED → COMPLETE)
-  - Cross-Finding Connections: periodically tests interactions between
-    established findings to discover compound effects
+  - Strategic Review: premium model runs every iteration to enforce commitment,
+    detect missed opportunities, surface untested connections, and maintain
+    a Strategic Trajectory narrative in the research model
+  - Reframing Probe: when strategic review requests it (on any commitment type),
+    premium model reads full analytical output (not digests) and looks for
+    patterns the headline tests missed: distributional shifts on null results,
+    threshold effects on positive findings, or derived metrics that would
+    sharpen the operational value of existing discoveries
 """
 
 import json
@@ -30,22 +36,15 @@ class AutoExplorer:
 
     PHASE_INSTRUCTIONS = {
         "MAPPING": (
-            "EXPLORE",
             "We are in MAPPING phase — survey broadly. Prioritise coverage: "
             "open new angles, examine unexplored variables, screen many features at once."
         ),
         "PURSUING": (
-            "EXPLOIT",
             "We are in PURSUING phase — all 5 questions must advance THE SAME finding. "
             "Consult Finding Maturity: pick the least-mature finding and generate 5 "
             "different ways to advance it to its next stage. Do not split across topics."
         ),
     }
-
-    # ── NEW: Connection trigger configuration ──
-    CONNECTION_INTERVAL = 8          # check every N iterations
-    CONNECTION_MIN_FINDINGS = 4      # need this many established findings
-    CONNECTION_QUESTIONS = 3         # how many connection questions to generate
 
     def __init__(self, engine_instance):
         self.engine = engine_instance
@@ -70,10 +69,15 @@ class AutoExplorer:
         # Orientation data profile
         self.data_profile = ""
 
-        # ── NEW: track when connections were last run ──
-        self.last_connection_iteration = 0
+        # ── Strategic review state ──
+        self.last_review_iteration = 0
+        self.strategic_commitment = None     # {phase, reason, next_direction}
+        self.strategic_next_direction = ""   # set by premium model on PIVOT/ABANDON
+        self._initial_trajectory = ""        # set by seed decomposition, consumed on iteration 0
+        self.last_probe_iteration = 0        # tracks when last probe ran (observability)
+        self.probe_history = []              # [(iteration, brief_result)] for dashboard
 
-        # Model override for orientation + synthesis (set from --premium-model)
+        # Model override for orientation, strategic review, and synthesis
         self.premium_model = None
 
         self.engine.branch_endpoints = []
@@ -267,7 +271,7 @@ class AutoExplorer:
     def _generate_branching_questions(self, use_chain_id=None, follow_up_hint=None, model_override=None):
         """Generate 5 branching questions. Phase-driven."""
         if self.kill_signal:
-            return [], {}, ""
+            return [], ""
 
         if use_chain_id is not None:
             self.chain_id = use_chain_id
@@ -281,17 +285,28 @@ class AutoExplorer:
         if follow_up_hint:
             hint_section = f"\n**Promising direction:** {follow_up_hint}\n"
 
-        phase_mode, phase_instruction = self.PHASE_INSTRUCTIONS.get(
+        phase_instruction = self.PHASE_INSTRUCTIONS.get(
             self.current_phase,
-            ("EXPLORE", "Generate exploratory questions."),
+            "Generate exploratory questions.",
         )
 
         model_context = self.research_model if self.research_model else "(No model yet — first iteration)"
+
+        # Build strategic direction block — binding constraint from premium model
+        strategic_direction = ""
+        if self.strategic_next_direction:
+            strategic_direction = (
+                f"**STRATEGIC DIRECTION (from strategic review — this is a binding constraint):**\n"
+                f"{self.strategic_next_direction}\n"
+                f"All 5 questions must align with this direction. Do not generate questions "
+                f"on the previous thread."
+            )
 
         phase_prompt = self.engine.prompts.ideas_explorer_auto.format(
             current_phase=self.current_phase,
             phase_instruction=phase_instruction,
             research_model=model_context,
+            strategic_direction=strategic_direction,
         )
 
         all_questions_log = self.engine.message_manager.format_all_questions()
@@ -308,28 +323,25 @@ class AutoExplorer:
 
         gen_messages = [{"role": "user", "content": gen_prompt}]
         questions_response = self._call_agent_with_retry(gen_messages, 'Question Generator', model_override=model_override)
-        questions, categories = self._parse_questions_with_categories(questions_response)
+        questions = self._parse_questions(questions_response)
 
-        return questions, categories, questions_response
+        return questions, questions_response
 
-    def _select_best_questions(self, questions, categories, context_hint=None, num_to_select=1):
+    def _select_best_questions(self, questions, context_hint=None, num_to_select=1):
         """Use LLM to select the most promising questions from a pool."""
         if not questions or self.kill_signal:
-            return [], []
+            return []
 
         num_to_select = min(num_to_select, len(questions))
 
-        formatted_questions = []
-        for i, q in enumerate(questions):
-            cat = categories.get(i, 'exploit')
-            formatted_questions.append(f"{i+1}. [{cat.upper()}] {q}")
+        formatted_questions = [f"{i+1}. {q}" for i, q in enumerate(questions)]
 
         pool_section = ""
         if self.question_pool:
             pool_lines = []
             for j, pq in enumerate(self.question_pool[-5:]):
                 pool_idx = len(questions) + j + 1
-                pool_lines.append(f"{pool_idx}. [POOL-{pq['category'].upper()}] {pq['question']}")
+                pool_lines.append(f"{pool_idx}. [POOL] {pq['question']}")
             pool_section = (
                 f"\n\n**Question Pool (from previous iterations):**\n"
                 f"{chr(10).join(pool_lines)}\n\n"
@@ -364,7 +376,6 @@ class AutoExplorer:
 
         # Parse selection
         selected_questions = []
-        selected_categories = []
         selected_indices = []
 
         try:
@@ -375,14 +386,12 @@ class AutoExplorer:
                     if idx not in selected_indices:
                         selected_indices.append(idx)
                         selected_questions.append(questions[idx])
-                        selected_categories.append(categories.get(idx, 'exploit'))
                 else:
                     pool_idx = idx - len(questions)
                     pool_subset = self.question_pool[-5:]
                     if 0 <= pool_idx < len(pool_subset):
                         pq = pool_subset[pool_idx]
                         selected_questions.append(pq['question'])
-                        selected_categories.append(pq['category'])
                         self.question_pool.remove(pq)
                 if len(selected_questions) >= num_to_select:
                     break
@@ -393,7 +402,6 @@ class AutoExplorer:
         if not selected_questions:
             selected_indices = list(range(min(num_to_select, len(questions))))
             selected_questions = [questions[i] for i in selected_indices]
-            selected_categories = [categories.get(i, 'exploit') for i in selected_indices]
 
         # Pad if needed
         if len(selected_questions) < num_to_select:
@@ -401,7 +409,6 @@ class AutoExplorer:
                 if i not in selected_indices and len(selected_questions) < num_to_select:
                     selected_indices.append(i)
                     selected_questions.append(questions[i])
-                    selected_categories.append(categories.get(i, 'exploit'))
 
         # Store unselected in pool
         for i, q in enumerate(questions):
@@ -409,22 +416,25 @@ class AutoExplorer:
                 self.question_pool.append({
                     'question': q,
                     'source_branch_id': self.active_branch_id,
-                    'category': categories.get(i, 'exploit'),
                     'iteration_added': getattr(self, '_current_iteration', 0),
                 })
         self._trim_question_pool()
 
-        return selected_questions, selected_categories
+        return selected_questions
 
-    def _parse_questions_with_categories(self, questions_response):
+    def _parse_questions(self, questions_response):
         """Parse numbered questions from LLM response."""
         questions = []
-        phase_mode = self.PHASE_INSTRUCTIONS.get(
-            self.current_phase, ("EXPLORE",)
-        )[0].lower()
 
         if not questions_response or not questions_response.strip():
-            return [], {}
+            return []
+
+        # Pattern to strip LLM-generated tags like [EXPLORE], [EXPLOIT], [REGIME-TEST], etc.
+        _tag_pattern = re.compile(
+            r'\[(?:EXPLORE|EXPLOIT|MAPPING|PURSUING|CONNECTION|'
+            r'DETECTED|QUANTIFIED|DECOMPOSED?|REGIME[- ]TEST(?:ED)?|COMPLETE)\]\s*',
+            re.IGNORECASE
+        )
 
         lines = questions_response.split('\n')
         current_q = []
@@ -435,7 +445,7 @@ class AutoExplorer:
 
             if is_numbered:
                 if current_q:
-                    question_text = ' '.join(current_q).strip()
+                    question_text = _tag_pattern.sub('', ' '.join(current_q)).strip()
                     if len(question_text) > 10:
                         questions.append(question_text)
                 cleaned = re.sub(r'^(?:[-•*#]*\s*)?[1-9][.):][\s]*', '', stripped)
@@ -444,12 +454,11 @@ class AutoExplorer:
                 current_q.append(stripped)
 
         if current_q:
-            question_text = ' '.join(current_q).strip()
+            question_text = _tag_pattern.sub('', ' '.join(current_q)).strip()
             if len(question_text) > 10:
                 questions.append(question_text)
 
-        categories = {i: phase_mode for i in range(len(questions))}
-        return questions, categories
+        return questions
 
     # ══════════════════════════════════════════════
     # RESEARCH MODEL INTERPRETER
@@ -460,10 +469,10 @@ class AutoExplorer:
         """Interpret the latest result and update the research model.
 
         Returns:
-            (updated_model, model_impact, contradiction, thread_completed, result_digest)
+            (updated_model, model_impact, contradiction, thread_completed, result_digest, method_used)
         """
         if self.kill_signal:
-            return self.research_model, "LOW", False, False, ""
+            return self.research_model, "LOW", False, False, "", ""
 
         result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
         current_model = self.research_model if self.research_model else "(No model yet — this is the first result. Initialize the model from scratch.)"
@@ -511,13 +520,20 @@ class AutoExplorer:
         result_digest = ""
         if 'RESULT_DIGEST:' in response:
             digest_text = response.split('RESULT_DIGEST:')[1]
-            for end_marker in ['UPDATED_MODEL:', '\n\n\n']:
+            for end_marker in ['METHOD_USED:', 'UPDATED_MODEL:', '\n\n\n']:
                 if end_marker in digest_text:
                     digest_text = digest_text.split(end_marker)[0]
                     break
             result_digest = digest_text.strip()
             if len(result_digest) > 1000:
                 result_digest = result_digest[:997] + "..."
+
+        # Parse METHOD_USED
+        method_used = ""
+        if 'METHOD_USED:' in response:
+            method_text = response.split('METHOD_USED:')[1].split('\n')[0].strip()
+            if method_text and method_text.upper() not in ('', 'NONE', 'N/A'):
+                method_used = method_text[:150]
 
         # Extract updated model
         updated_model = self.research_model
@@ -529,7 +545,7 @@ class AutoExplorer:
             if model_text:
                 updated_model = model_text
 
-        return updated_model, model_impact, contradiction, thread_completed, result_digest
+        return updated_model, model_impact, contradiction, thread_completed, result_digest, method_used
 
     @staticmethod
     def _parse_field(response, field_name, default='', valid=None):
@@ -550,33 +566,8 @@ class AutoExplorer:
         return line
 
     # ══════════════════════════════════════════════
-    # CROSS-FINDING CONNECTION EXPLORER (NEW)
+    # STRATEGIC REVIEW (premium model)
     # ══════════════════════════════════════════════
-
-    def _should_run_connections(self, iteration):
-        """Determine whether to run cross-finding connection testing this iteration.
-
-        Triggers when:
-        1. Enough iterations since last run (CONNECTION_INTERVAL)
-        2. Enough established findings (CONNECTION_MIN_FINDINGS)
-        3. Not in early exploration (iteration > 10)
-        """
-        if iteration <= 10:
-            return False
-        if iteration - self.last_connection_iteration < self.CONNECTION_INTERVAL:
-            return False
-        # Count established findings in the research model
-        n_findings = self._count_established_findings()
-        if n_findings < self.CONNECTION_MIN_FINDINGS:
-            return False
-        return True
-
-    def _count_established_findings(self):
-        """Count bullet points in ## Established Findings section."""
-        findings_text = self._extract_model_section('Established Findings')
-        if not findings_text:
-            return 0
-        return len([line for line in findings_text.split('\n') if line.strip().startswith('-')])
 
     def _extract_model_section(self, section_name):
         """Extract content of a named ## section from the research model."""
@@ -589,56 +580,312 @@ class AutoExplorer:
             text = text[:next_section]
         return text.strip()
 
-    def _generate_connection_questions(self):
-        """Generate questions testing interactions between established findings.
+    def _build_review_context(self):
+        """Build the recent iteration context for the strategic review."""
+        if not self.insight_tree:
+            return "(No iterations yet)"
 
-        Returns list of connection questions to inject into the question pool.
+        all_nodes = sorted(self.insight_tree.values(), key=lambda n: n['chain_id'])
+        recent = all_nodes[-5:]
+
+        parts = []
+        for node in recent:
+            score = node['quality_score']
+            question = node['question']
+            digest = node.get('result_digest', '')
+            method = node.get('method_used', '')
+            status = node['status']
+
+            entry = f"- [{score}/10] Q: {question}"
+            if digest:
+                entry += f"\n  Finding: {digest}"
+            if method:
+                entry += f"\n  Method: {method}"
+            if status in ('dormant', 'runner_up'):
+                entry += f" [{status.upper()}]"
+            parts.append(entry)
+
+        return '\n'.join(parts)
+
+    def _run_strategic_review(self, iteration):
+        """Run premium model strategic review.
+
+        Called every iteration after model update. The premium model:
+        1. Checks whether the current commitment should hold/pivot/abandon
+        2. Identifies missed opportunities and untested connections
+        3. Rewrites the Strategic Trajectory section of the research model
         """
         if self.kill_signal:
-            return []
+            return
 
-        established = self._extract_model_section('Established Findings')
-        if not established:
-            return []
+        logger.info(f"Running strategic review (iteration {iteration})")
+        self.last_review_iteration = iteration
 
-        tested = self._extract_model_section('Cross-Finding Connections')
-        if not tested:
-            tested = "(None tested yet)"
+        recent_context = self._build_review_context()
 
-        profile = self.data_profile if self.data_profile else "(No profile)"
+        max_iters = getattr(self, '_max_iterations', 100)
+        remaining = max(0, max_iters - iteration - 1)
 
-        prompt = self.engine.prompts.connection_explorer.format(
-            established_findings=established,
-            tested_connections=tested,
-            data_profile=profile,
-            num_questions=self.CONNECTION_QUESTIONS,
+        prompt = self.engine.prompts.strategic_review.format(
+            seed_question=self.seed_question,
+            iteration=iteration + 1,
+            max_iterations=max_iters,
+            remaining_iterations=remaining,
+            data_profile=self.data_profile if self.data_profile else "(No profile available)",
+            research_model=self.research_model,
+            recent_context=recent_context,
         )
 
         messages = [{"role": "user", "content": prompt}]
         response = self._call_agent_with_retry(
-            messages, 'Connection Explorer', model_override=self.premium_model)
+            messages, 'Strategic Review', model_override=self.premium_model)
 
-        # Parse numbered questions (reuse existing parser)
-        questions, _ = self._parse_questions_with_categories(response)
+        if not response or not response.strip():
+            logger.warning("Strategic review returned empty response")
+            return
 
-        logger.info(f"Connection explorer generated {len(questions)} questions")
-        return questions
+        # ── Parse COMMITMENT ──
+        commitment_action = self._parse_field(response, 'COMMITMENT', default='HOLD',
+                                               valid={'HOLD', 'PIVOT', 'ABANDON'})
 
-    def _inject_connection_questions(self, iteration):
-        """Run connection explorer and inject questions into pool."""
-        logger.info(f"Running cross-finding connection test (iteration {iteration})")
-        self.last_connection_iteration = iteration
+        # ── Parse PHASE ──
+        review_phase = self._parse_field(response, 'PHASE', default=None,
+                                          valid={'MAPPING', 'PURSUING'})
 
-        connection_questions = self._generate_connection_questions()
-        for q in connection_questions:
-            self.question_pool.append({
-                'question': q,
-                'source_branch_id': self.active_branch_id,
-                'category': 'connection',
-                'iteration_added': iteration,
-            })
-        if connection_questions:
-            print(style.branch_event(f"Connection explorer: {len(connection_questions)} interaction questions added to pool"))
+        # ── Parse NEXT_DIRECTION ──
+        next_direction = ""
+        if 'NEXT_DIRECTION:' in response:
+            nd_text = response.split('NEXT_DIRECTION:')[1]
+            # Take until next field marker
+            for end_marker in ['PROBE_NEEDED:', 'MISSED:', 'UPDATED_TRAJECTORY:']:
+                if end_marker in nd_text:
+                    nd_text = nd_text.split(end_marker)[0]
+                    break
+            nd_text = nd_text.strip()
+            if nd_text and nd_text.upper() not in ('UNCHANGED', 'NONE', 'N/A'):
+                next_direction = nd_text[:500]  # cap length
+
+        # ── Parse PROBE_NEEDED ──
+        probe_needed = False
+        if 'PROBE_NEEDED:' in response.upper():
+            probe_line = response.upper().split('PROBE_NEEDED:')[1].split('\n')[0].strip()
+            probe_needed = 'YES' in probe_line
+
+        # ── Parse MISSED ──
+        missed = ""
+        if 'MISSED:' in response:
+            missed_text = response.split('MISSED:')[1]
+            if 'UPDATED_TRAJECTORY:' in missed_text:
+                missed_text = missed_text.split('UPDATED_TRAJECTORY:')[0]
+            missed = missed_text.strip()
+            if missed.upper() in ('NONE', 'N/A', ''):
+                missed = ""
+
+        # ── Parse UPDATED_TRAJECTORY ──
+        updated_trajectory = ""
+        if 'UPDATED_TRAJECTORY:' in response:
+            traj_text = response.split('UPDATED_TRAJECTORY:')[1]
+            if 'END_TRAJECTORY' in traj_text:
+                traj_text = traj_text.split('END_TRAJECTORY')[0]
+            updated_trajectory = traj_text.strip()
+
+        # ── Apply commitment ──
+        if commitment_action in ('PIVOT', 'ABANDON'):
+            self.strategic_commitment = None
+            if next_direction:
+                self.strategic_next_direction = next_direction
+                logger.info(f"Strategic review: {commitment_action} → next direction: {next_direction[:100]}")
+            else:
+                self.strategic_next_direction = ""
+                logger.info(f"Strategic review: {commitment_action} (no next direction provided)")
+        else:
+            # HOLD — maintain or establish commitment
+            self.strategic_next_direction = ""
+            logger.info("Strategic review: HOLD commitment")
+
+        # ── REFRAMING PROBE: fires on any commitment when strategic review requests it ──
+        if probe_needed and self._should_run_reframing_probe(iteration):
+            with style.spinner("Reframing probe"):
+                reframing = self._run_reframing_probe(iteration)
+            if reframing:
+                self.strategic_next_direction = reframing
+                logger.info("Reframing probe override: setting next direction")
+                print(style.branch_event(
+                    f"Reframing: {reframing[:120]}"))
+                self.probe_history.append((iteration, reframing[:150]))
+            else:
+                print(style.branch_event("Reframing probe: no alternative framing found"))
+                self.probe_history.append((iteration, "No reframing found"))
+
+        # Apply phase from strategic review (overrides evaluator)
+        if review_phase:
+            self.strategic_commitment = {
+                'phase': review_phase,
+                'reason': commitment_action,
+            }
+
+        # ── Splice updated trajectory into research model ──
+        if updated_trajectory:
+            self._update_strategic_trajectory(updated_trajectory)
+
+        # ── Log missed opportunities ──
+        if missed:
+            logger.info(f"Strategic review missed opportunities: {missed[:200]}")
+
+    def _update_strategic_trajectory(self, new_trajectory):
+        """Splice the premium model's trajectory into the research model."""
+        section_header = '## Strategic Trajectory'
+        if section_header in self.research_model:
+            # Find the section and replace everything up to next ## or end
+            before = self.research_model.split(section_header)[0]
+            after_section = self.research_model.split(section_header)[1]
+            # Find next ## header
+            next_header_idx = after_section.find('\n## ')
+            if next_header_idx > 0:
+                after = after_section[next_header_idx:]
+            else:
+                # Check for END_MODEL marker
+                end_idx = after_section.find('END_MODEL')
+                after = after_section[end_idx:] if end_idx > 0 else ""
+            self.research_model = f"{before}{section_header}\n{new_trajectory}\n{after}"
+        else:
+            # Append if section doesn't exist yet
+            self.research_model += f"\n\n{section_header}\n{new_trajectory}"
+
+    # ══════════════════════════════════════════════
+    # REFRAMING PROBE (premium model)
+    # Fires when strategic review sets PROBE_NEEDED: YES
+    # on any commitment (HOLD, PIVOT, or ABANDON).
+    # ══════════════════════════════════════════════
+
+    PROBE_MIN_ITERATION = 5   # don't probe in early exploration
+
+    def _should_run_reframing_probe(self, iteration):
+        """Check whether a reframing probe is allowed to fire.
+        Called only when strategic review sets PROBE_NEEDED: YES.
+        The iteration guard prevents probing during early exploration."""
+        if iteration < self.PROBE_MIN_ITERATION:
+            return False
+        return True
+
+    def _build_probe_context(self):
+        """Build full-results context for the reframing probe.
+        Returns (thread_summary, why_it_matters, full_results) or None."""
+        # Thread summary from current commitment in trajectory
+        trajectory = self._extract_model_section('Strategic Trajectory')
+        thread_summary = ""
+        if trajectory:
+            for line in trajectory.split('\n'):
+                if 'CURRENT COMMITMENT' in line.upper():
+                    thread_summary = line.strip()
+                    break
+        if not thread_summary:
+            thread_summary = "(Current thread not identified)"
+
+        # Why it matters: try recent findings first, then biggest gap, then seed
+        why_it_matters = ""
+        # Recent established findings give context for positive-finding probes
+        findings = self._extract_model_section('Established Findings')
+        if findings:
+            # Last 3 findings are most relevant to current thread
+            finding_lines = [l.strip() for l in findings.split('\n') if l.strip().startswith('-')]
+            if finding_lines:
+                why_it_matters = "Recent findings:\n" + "\n".join(finding_lines[-3:])
+        if not why_it_matters or len(why_it_matters) < 20:
+            gap = self._extract_model_section('Biggest Gap')
+            if gap and len(gap) > 10:
+                why_it_matters = gap
+        if not why_it_matters or len(why_it_matters) < 10:
+            why_it_matters = self.seed_question[:500]
+
+        # Full results from last 3 analyses (most recent by chain_id)
+        if not self.insight_tree:
+            return None
+
+        recent_nodes = sorted(
+            self.insight_tree.values(),
+            key=lambda n: n['chain_id'],
+        )[-3:]
+
+        full_store = self.engine.message_manager.full_results_store
+        results_parts = []
+        for node in recent_nodes:
+            chain_key = str(node['chain_id'])
+            full_result = full_store.get(chain_key, node.get('result_summary', ''))
+            if not full_result or len(full_result.strip()) < 20:
+                continue
+            results_parts.append(
+                f"**Analysis: {node['question'][:150]}**\n"
+                f"Score: {node['quality_score']}/10\n"
+                f"Full output:\n{full_result}\n"
+                f"{'─' * 40}"
+            )
+
+        if not results_parts:
+            return None
+
+        full_results = '\n\n'.join(results_parts)
+        return thread_summary, why_it_matters, full_results
+
+    def _run_reframing_probe(self, iteration):
+        """Run the reframing probe: premium model reads full analytical output
+        and looks for patterns the headline tests missed.
+
+        Returns a reframing direction string, or empty string if no reframing found.
+        """
+        if self.kill_signal:
+            return ""
+
+        context = self._build_probe_context()
+        if context is None:
+            logger.info("Reframing probe: insufficient context, skipping")
+            return ""
+
+        thread_summary, why_it_matters, full_results = context
+        self.last_probe_iteration = iteration
+
+        prompt = self.engine.prompts.reframing_probe.format(
+            seed_question=self.seed_question,
+            thread_summary=thread_summary,
+            why_it_matters=why_it_matters,
+            full_results=full_results,
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        response = self._call_agent_with_retry(
+            messages, 'Reframing Probe', model_override=self.premium_model)
+
+        if not response or not response.strip():
+            logger.info("Reframing probe: empty response")
+            return ""
+
+        # Parse REFRAMING_DIRECTION
+        direction = ""
+        if 'REFRAMING_DIRECTION:' in response:
+            rd_text = response.split('REFRAMING_DIRECTION:')[1].strip()
+            # Take until end or next obvious section
+            for end_marker in ['\n\n\n']:
+                if end_marker in rd_text:
+                    rd_text = rd_text.split(end_marker)[0]
+                    break
+            rd_text = rd_text.strip()
+            if rd_text and rd_text.upper() not in ('NONE', 'N/A', ''):
+                direction = rd_text[:500]
+
+        if direction:
+            # Log what the probe found
+            hidden = ""
+            if 'HIDDEN_PATTERN:' in response:
+                hp = response.split('HIDDEN_PATTERN:')[1]
+                if 'ALTERNATIVE_FRAMING:' in hp:
+                    hp = hp.split('ALTERNATIVE_FRAMING:')[0]
+                hidden = hp.strip()[:200]
+            logger.info(f"Reframing probe found: {hidden}")
+            logger.info(f"Reframing direction: {direction[:150]}")
+        else:
+            logger.info("Reframing probe: no reframing warranted (null result genuine)")
+
+        return direction
 
     # ══════════════════════════════════════════════
     # PHASE DETERMINATION
@@ -646,14 +893,24 @@ class AutoExplorer:
 
     def _determine_phase(self, model_impact, contradiction, thread_completed,
                          phase_recommendation=None):
-        """Model-driven phase transition.
+        """Phase determination with strategic commitment override.
 
-        The evaluator recommends a phase based on the full context.
-        Thread completion is the only structural override.
+        Priority:
+        1. thread_completed always forces MAPPING
+        2. Strategic commitment (from premium model review) overrides evaluator
+        3. Evaluator recommendation used when no active commitment
         """
         if thread_completed:
             logger.info("Phase → MAPPING (thread completed)")
             return "MAPPING"
+
+        # Strategic commitment takes priority over evaluator
+        if self.strategic_commitment:
+            committed_phase = self.strategic_commitment['phase']
+            if committed_phase != self.current_phase:
+                logger.info("Phase → %s (strategic commitment: %s)",
+                            committed_phase, self.strategic_commitment.get('reason', ''))
+            return committed_phase
 
         if phase_recommendation in ("MAPPING", "PURSUING"):
             if phase_recommendation != self.current_phase:
@@ -662,6 +919,59 @@ class AutoExplorer:
 
         logger.info(f"Phase → {self.current_phase} (maintained)")
         return self.current_phase
+
+    # ══════════════════════════════════════════════
+    # SEED DECOMPOSITION (premium model)
+    # ══════════════════════════════════════════════
+
+    def _decompose_seed_question(self, seed_question, max_iterations=5):
+        """Use the premium model to decompose a broad research agenda into a focused
+        first question and an initial Strategic Trajectory.
+
+        Called once after orientation, before the main loop.
+        Returns (focused_question, initial_trajectory) or (seed_question, "") on failure.
+        """
+        if self.kill_signal:
+            return seed_question, ""
+
+        profile = self.data_profile if self.data_profile else "(No profile available)"
+
+        prompt = self.engine.prompts.seed_decomposition.format(
+            seed_question=seed_question,
+            data_profile=profile,
+            max_iterations=max_iterations,
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        response = self._call_agent_with_retry(
+            messages, 'Seed Decomposition', model_override=self.premium_model)
+
+        if not response or not response.strip():
+            logger.warning("Seed decomposition returned empty — using original question")
+            return seed_question, ""
+
+        # Parse FIRST_QUESTION
+        focused_question = seed_question  # fallback
+        if 'FIRST_QUESTION:' in response:
+            fq_text = response.split('FIRST_QUESTION:')[1]
+            for end_marker in ['INITIAL_TRAJECTORY:', 'END_TRAJECTORY']:
+                if end_marker in fq_text:
+                    fq_text = fq_text.split(end_marker)[0]
+                    break
+            fq_text = fq_text.strip()
+            if fq_text and len(fq_text) > 20:
+                focused_question = fq_text[:1000]
+
+        # Parse INITIAL_TRAJECTORY
+        initial_trajectory = ""
+        if 'INITIAL_TRAJECTORY:' in response:
+            traj_text = response.split('INITIAL_TRAJECTORY:')[1]
+            if 'END_TRAJECTORY' in traj_text:
+                traj_text = traj_text.split('END_TRAJECTORY')[0]
+            initial_trajectory = traj_text.strip()
+
+        logger.info(f"Seed decomposed: {focused_question[:100]}")
+        return focused_question, initial_trajectory
 
     # ══════════════════════════════════════════════
     # MAIN RUN LOOP
@@ -694,13 +1004,11 @@ class AutoExplorer:
                 last_follow_up_angle = resumed_state.get('last_follow_up_angle')
 
                 current_questions = [seed_question]
-                current_categories = ['exploit']
 
                 logger.info(f"Resuming from iteration {start_iteration}, "
                             f"running {max_iterations - start_iteration} more")
             else:
                 current_questions = [seed_question]
-                current_categories = ['exploit']
                 last_solution_chain = None
                 last_follow_up_angle = None
 
@@ -718,7 +1026,11 @@ class AutoExplorer:
                 self.biggest_gap_history = []
                 self.stagnation_count = 0
                 self.data_profile = ""
-                self.last_connection_iteration = 0
+                self.last_review_iteration = 0
+                self.strategic_commitment = None
+                self.strategic_next_direction = ""
+                self.last_probe_iteration = 0
+                self.probe_history = []
 
                 start_iteration = 0
 
@@ -759,12 +1071,25 @@ class AutoExplorer:
                     self.engine.data_profile = self.data_profile
                     logger.info(f"Orientation complete: {len(self.data_profile)} chars")
 
+            # ── SEED DECOMPOSITION (fresh runs only) ──
+            if not resumed_state and not self.kill_signal:
+                with style.spinner("Decomposing research agenda"):
+                    focused_question, initial_trajectory = self._decompose_seed_question(
+                        seed_question, max_iterations=max_iterations)
+                if focused_question != seed_question:
+                    current_questions = [focused_question]
+                    logger.info(f"Seed decomposed into focused first question")
+                if initial_trajectory:
+                    self._initial_trajectory = initial_trajectory
+                    logger.info(f"Initial trajectory: {len(initial_trajectory)} chars")
+
             # ══════════════════════════════════════════════
             # MAIN ITERATION LOOP
             # ══════════════════════════════════════════════
 
             while iteration < max_iterations:
                 self._current_iteration = iteration
+                self._max_iterations = max_iterations
 
                 if self.kill_signal:
                     break
@@ -776,13 +1101,10 @@ class AutoExplorer:
                 # Determine questions to process
                 if iteration == 0:
                     questions_to_process = current_questions[:1]
-                    categories_to_process = current_categories[:1]
                 elif iteration == 1:
                     questions_to_process = current_questions[:num_parallel_solutions + 1]
-                    categories_to_process = current_categories[:num_parallel_solutions + 1]
                 else:
                     questions_to_process = current_questions[:num_parallel_solutions]
-                    categories_to_process = current_categories[:num_parallel_solutions]
 
                 print(style.iteration_bar(iteration + 1, max_iterations, self.current_phase))
 
@@ -802,9 +1124,8 @@ class AutoExplorer:
                     self.chain_id = int(time.time()) + q_idx
                     solution_chain_id = self.chain_id
 
-                    cat = categories_to_process[q_idx] if q_idx < len(categories_to_process) else ""
                     print()
-                    print(style.question_display(q_idx + 1, len(questions_to_process), cat, question))
+                    print(style.question_display(q_idx + 1, len(questions_to_process), "", question))
 
                     error_occurred = False
                     try:
@@ -821,7 +1142,6 @@ class AutoExplorer:
                         'text_answer': self.engine.message_manager.last_plan,
                         'chain_id': solution_chain_id,
                         'error_occurred': error_occurred,
-                        'category': categories_to_process[q_idx] if q_idx < len(categories_to_process) else 'exploit',
                     })
 
                     self.engine.message_manager.reset_non_cumul_messages()
@@ -875,8 +1195,13 @@ class AutoExplorer:
                 last_follow_up_angle = follow_up_angle
 
                 # ── INTERPRET & UPDATE MODEL ──
+                # Save Strategic Trajectory before update — cheap model must not corrupt it
+                _saved_trajectory = self._extract_model_section('Strategic Trajectory')
+                if _saved_trajectory and '<<< DO NOT MODIFY' in _saved_trajectory:
+                    _saved_trajectory = ""  # placeholder, not real content yet
+
                 with style.spinner("Updating research model"):
-                    updated_model, model_impact, contradiction, thread_completed, result_digest = \
+                    updated_model, model_impact, contradiction, thread_completed, result_digest, method_used = \
                         self._interpret_and_update_model(
                             winning_solution,
                             scores[selected_index],
@@ -887,8 +1212,22 @@ class AutoExplorer:
 
                 if new_node_id in self.insight_tree and result_digest:
                     self.insight_tree[new_node_id]['result_digest'] = result_digest
+                if new_node_id in self.insight_tree and method_used:
+                    self.insight_tree[new_node_id]['method_used'] = method_used
 
                 self.research_model = updated_model
+
+                # ── PROTECT STRATEGIC TRAJECTORY ──
+                # The model updater (cheap model) regenerates the full research model.
+                # It may mangle the Strategic Trajectory despite "DO NOT MODIFY" instructions.
+                # Structurally re-splice the trajectory we saved before the update.
+                if _saved_trajectory:
+                    self._update_strategic_trajectory(_saved_trajectory)
+
+                # On iteration 0, splice the initial trajectory from seed decomposition
+                if self._initial_trajectory:
+                    self._update_strategic_trajectory(self._initial_trajectory)
+                    self._initial_trajectory = ""  # consumed
                 if len(self.research_model) > 6000:
                     self.research_model += (
                         "\n\n**NOTE: Model getting long — consolidate on next update.**"
@@ -898,6 +1237,11 @@ class AutoExplorer:
                     self.model_impact_history = self.model_impact_history[-10:]
 
                 self._update_gap_stability(updated_model)
+
+                # ── STRATEGIC REVIEW (premium model) ──
+                if iteration > 0 and not self.kill_signal:
+                    with style.spinner("Strategic review"):
+                        self._run_strategic_review(iteration)
 
                 # ── DETERMINE PHASE ──
                 old_phase = self.current_phase
@@ -989,44 +1333,43 @@ class AutoExplorer:
                         last_follow_up_angle = new_branch.get('hypothesis_label') or new_branch['question'][:150]
                         print(style.branch_event(f"Switched to dormant branch (score: {style.score(new_branch['quality_score'])})"))
 
-                # ── NEW: CROSS-FINDING CONNECTION CHECK ──
-                if self._should_run_connections(iteration):
-                    with style.spinner("Testing cross-finding connections"):
-                        self._inject_connection_questions(iteration)
-
                 # ── GENERATE NEW QUESTIONS ──
+                # Use strategic next_direction as the primary hint when set (after PIVOT/ABANDON)
+                question_hint = self.strategic_next_direction or last_follow_up_angle
                 with style.spinner("Generating questions"):
-                    new_questions, new_categories, raw_response = self._generate_branching_questions(
+                    new_questions, raw_response = self._generate_branching_questions(
                         use_chain_id=supporting_chain_id,
-                        follow_up_hint=last_follow_up_angle,
+                        follow_up_hint=question_hint,
                     )
 
                 # Retry once if parsing failed
                 if not new_questions:
                     logger.info(f"Question generation empty. Raw: {raw_response[:200] if raw_response else '(empty)'}")
                     print(style.error_msg("Question generation failed, retrying..."))
-                    new_questions, new_categories, raw_response = self._generate_branching_questions(
+                    new_questions, raw_response = self._generate_branching_questions(
                         use_chain_id=supporting_chain_id,
-                        follow_up_hint=last_follow_up_angle,
+                        follow_up_hint=question_hint,
                     )
 
                 if not new_questions:
                     print(style.error_msg("Could not generate questions. Exploration complete."))
                     break
 
+                # Clear one-shot strategic direction after it's been consumed
+                if self.strategic_next_direction:
+                    self.strategic_next_direction = ""
+
                 # ── SELECT QUESTIONS ──
                 num_to_select = num_parallel_solutions + 1 if iteration == 1 else num_parallel_solutions
                 with style.spinner("Selecting questions"):
-                    selected_questions, selected_categories = self._select_best_questions(
+                    selected_questions = self._select_best_questions(
                         new_questions,
-                        new_categories,
-                        context_hint=last_follow_up_angle,
+                        context_hint=question_hint,
                         num_to_select=num_to_select,
                     )
                 if not selected_questions:
                     break
 
-                phase_mode = self.PHASE_INSTRUCTIONS.get(self.current_phase, ("EXPLORE",))[0]
                 print(style.pipeline_summary(
                     selected_q=selected_index + 1,
                     selected_score=scores[selected_index],
@@ -1035,13 +1378,12 @@ class AutoExplorer:
                     old_phase=old_phase,
                     new_phase=new_phase,
                     n_questions=len(new_questions),
-                    phase_mode=phase_mode,
+                    phase_mode=self.current_phase,
                     n_selected=len(selected_questions),
                     is_seed=_is_seed,
                 ))
 
                 current_questions = selected_questions
-                current_categories = selected_categories
                 current_image = None
 
             # ── POST-LOOP ──
@@ -1186,6 +1528,7 @@ class AutoExplorer:
             'chain_id': chain_id,
             'finding_summary': '',
             'result_digest': '',
+            'method_used': '',
             'hypothesis_label': '',
         }
         if parent_id and parent_id in self.insight_tree:
@@ -1312,7 +1655,7 @@ class AutoExplorer:
     def _save_checkpoint(self, iteration, last_solution_chain, last_follow_up_angle):
         """Save complete exploration state to disk."""
         state = {
-            "version": 2,  # bumped for new fields
+            "version": 3,  # bumped: strategic review replaces connection explorer
             "iterations_completed": iteration,
             "explorer": {
                 "insight_tree": self.insight_tree,
@@ -1330,7 +1673,11 @@ class AutoExplorer:
                 "stagnation_count": self.stagnation_count,
                 "node_counter": AutoExplorer._node_counter,
                 "data_profile": self.data_profile,
-                "last_connection_iteration": self.last_connection_iteration,  # NEW
+                "last_review_iteration": self.last_review_iteration,
+                "strategic_commitment": self.strategic_commitment,
+                "strategic_next_direction": self.strategic_next_direction,
+                "last_probe_iteration": self.last_probe_iteration,
+                "probe_history": self.probe_history,
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
@@ -1375,7 +1722,12 @@ class AutoExplorer:
         self.stagnation_count = ex.get('stagnation_count', 0)
         AutoExplorer._node_counter = ex.get('node_counter', 0)
         self.data_profile = ex.get('data_profile', '')
-        self.last_connection_iteration = ex.get('last_connection_iteration', 0)  # NEW
+        self.last_review_iteration = ex.get('last_review_iteration',
+                                             ex.get('last_connection_iteration', 0))
+        self.strategic_commitment = ex.get('strategic_commitment', None)
+        self.strategic_next_direction = ex.get('strategic_next_direction', '')
+        self.last_probe_iteration = ex.get('last_probe_iteration', 0)
+        self.probe_history = ex.get('probe_history', [])
         self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']

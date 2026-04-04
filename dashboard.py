@@ -50,16 +50,21 @@ def _extract_data(explorer, engine, iteration, max_iterations):
             'score': node.get('quality_score', 0),
             'status': node.get('status', ''),
             'summary': node.get('finding_summary', ''),
+            'iteration': node.get('iteration_added', 0),
         })
     nodes.sort(key=lambda x: x['counter'])
 
-    # Group by iteration (parallel pairs)
-    num_parallel = 2
+    # Group by actual iteration (handles variable node counts)
+    from collections import defaultdict
+    iter_groups = defaultdict(list)
+    for n in nodes:
+        iter_groups[n['iteration']].append(n)
+
     iter_data = []
-    for i in range(0, len(nodes), num_parallel):
-        pair = nodes[i:i + num_parallel]
-        winner = max(pair, key=lambda x: x['score'])
-        loser = min(pair, key=lambda x: x['score']) if len(pair) > 1 else winner
+    for it_num in sorted(iter_groups.keys()):
+        group = iter_groups[it_num]
+        winner = max(group, key=lambda x: x['score'])
+        loser = min(group, key=lambda x: x['score']) if len(group) > 1 else winner
         iter_data.append({
             'winner_score': winner['score'],
             'loser_score': loser['score'],
@@ -90,9 +95,8 @@ def _extract_data(explorer, engine, iteration, max_iterations):
     if band_start is not None:
         pursuing_bands.append([band_start, iteration])
 
-    # --- Connection explorer iterations ---
-    conn_interval = explorer.CONNECTION_INTERVAL
-    conn_iters = list(range(conn_interval, iteration + 1, conn_interval))
+    # --- Phase transition iterations (strategic inflection points) ---
+    transition_iters = [t[0] + 1 for t in explorer.phase_history] if explorer.phase_history else []
 
     # --- Parse research model ---
     rm = explorer.research_model or ''
@@ -155,7 +159,7 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'iter_data': iter_data,
         'phase_at': phase_at,
         'pursuing_bands': pursuing_bands,
-        'conn_iters': conn_iters,
+        'transition_iters': transition_iters,
         'established': established,
         'connections': connections,
         'confirmed_connections': confirmed,
@@ -176,6 +180,7 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'dataset_shape': dataset_shape,
         'mean_score': mean_score,
         'significant': significant,
+        'probe_history': getattr(explorer, 'probe_history', []),
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -266,7 +271,7 @@ def _render_html(d):
     agent_order = [
         'Code Generator', 'Question Generator', 'Research Interpreter',
         'Result Evaluator', 'Question Selector', 'Error Corrector',
-        'Connection Explorer', 'Synthesis Generator'
+        'Strategic Review', 'Reframing Probe', 'Seed Decomposition', 'Synthesis Generator'
     ]
     max_calls = max(d['agent_counts'].values()) if d['agent_counts'] else 1
     agent_html = ''
@@ -276,7 +281,7 @@ def _render_html(d):
             continue
         pct = round(count / max_calls * 100)
         label = agent.lower().replace('_', ' ')
-        is_premium = agent in ('Connection Explorer', 'Synthesis Generator')
+        is_premium = agent in ('Strategic Review', 'Reframing Probe', 'Seed Decomposition', 'Synthesis Generator')
         bar_color = 'var(--purple)' if is_premium else ('var(--amber)' if agent == 'Error Corrector' else 'var(--blue)')
         premium_tag = ' <span style="font-weight: 400; color: var(--fg3);">premium</span>' if is_premium else ''
         agent_html += f'''
@@ -294,6 +299,27 @@ def _render_html(d):
     breadth_pct = {'HIGH': 92, 'MEDIUM': 55, 'LOW': 20}.get(d['breadth'].upper(), 50)
     breadth_color = {'HIGH': 'bar-green', 'MEDIUM': 'bar-amber', 'LOW': 'bar-red'}.get(d['breadth'].upper(), 'bar-blue')
 
+    # Probe history HTML
+    probe_html = ''
+    if d['probe_history']:
+        probe_items = ''
+        for it, result in d['probe_history']:
+            is_null = 'null' in result.lower()
+            badge = 'badge-dormant' if is_null else 'badge-complete'
+            label = 'NULL' if is_null else 'HIT'
+            probe_items += f'''
+            <div class="finding-item">
+              <span class="finding-badge {badge}">{label}</span>
+              <span style="color: var(--fg2);">iter {it}</span>
+              <span style="margin-left: 4px;">{_escape(result[:120])}</span>
+            </div>'''
+        probe_html = f'''
+  <div style="margin-top: 16px;">
+    <div class="section-title">Reframing probes ({len(d['probe_history'])})</div>
+    <div class="card">{probe_items}
+    </div>
+  </div>'''
+
     # Phase pill
     phase_class = 'phase-pursuing' if d['current_phase'] == 'PURSUING' else 'phase-mapping'
 
@@ -306,7 +332,7 @@ def _render_html(d):
     winners_json = json.dumps(d['winner_scores'])
     losers_json = json.dumps(d['loser_scores'])
     pursuing_json = json.dumps(d['pursuing_bands'])
-    conn_json = json.dumps(d['conn_iters'])
+    conn_json = json.dumps(d['transition_iters'])
     phases_json = json.dumps(d['phase_at'])
 
     return f'''<!DOCTYPE html>
@@ -462,7 +488,7 @@ def _render_html(d):
         <span><span class="legend-dot" style="background: #DC2626;"></span> Score 1-4</span>
         <span><span class="legend-dot" style="background: #D1D5DB;"></span> Runner-up</span>
         <span><span class="legend-dot" style="background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.25);"></span> PURSUING</span>
-        <span><span class="legend-line" style="background: #2563EB; border-top: 1px dashed #2563EB; height: 0;"></span> Connection explorer</span>
+        <span><span class="legend-line" style="background: #7C3AED; border-top: 1px dashed #7C3AED; height: 0;"></span> Phase transition</span>
       </div>
       <div class="chart-wrap">
         <canvas id="scoreChart"></canvas>
@@ -476,7 +502,7 @@ def _render_html(d):
       <div class="chart-legend">
         <span><span class="legend-dot" style="background: #16A34A;"></span> Cumulative (scores 7+ only)</span>
         <span><span class="legend-dot" style="background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.25);"></span> PURSUING</span>
-        <span><span class="legend-line" style="background: #2563EB; border-top: 1px dashed #2563EB; height: 0;"></span> Connection explorer</span>
+        <span><span class="legend-line" style="background: #7C3AED; border-top: 1px dashed #7C3AED; height: 0;"></span> Phase transition</span>
       </div>
       <div class="chart-wrap">
         <canvas id="cumChart"></canvas>
@@ -543,6 +569,8 @@ def _render_html(d):
     </div>
   </div>
 
+{probe_html}
+
 </div>
 
 <div class="footer">
@@ -582,8 +610,8 @@ function makeConnPlugin(id) {{
     afterDraw(chart) {{
       const {{ctx, chartArea: {{top,bottom}}, scales: {{x}}}} = chart;
       ctx.save();
-      ctx.setLineDash([3,3]);
-      ctx.strokeStyle = isDark ? '#60A5FA' : '#2563EB';
+      ctx.setLineDash([4,4]);
+      ctx.strokeStyle = isDark ? '#A78BFA' : '#7C3AED';
       ctx.lineWidth = 0.8;
       connIters.forEach(i => {{
         const px = x.getPixelForValue(i - 1);

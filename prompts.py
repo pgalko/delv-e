@@ -4,7 +4,8 @@ Prompt templates for delv-e.
 Architecture:
   - Lean, task-specific agent prompts (no repeated preamble)
   - Finding Completeness: maturity tracking in Research Model guides PURSUING depth
-  - Cross-Finding Connections: periodic connection_explorer generates interaction questions
+  - Strategic Review: premium model runs every iteration to maintain strategic coherence,
+    enforce commitments, detect missed opportunities, and surface untested connections
   - Code prompts: rules in system prompt only; user/error inherit
 
 Templates accessed by auto_explore.py:
@@ -12,7 +13,9 @@ Templates accessed by auto_explore.py:
   - ideas_explorer_auto
   - question_selector
   - research_model_updater
-  - connection_explorer       ← NEW: cross-finding interaction questions
+  - seed_decomposition            ← premium model: focused first question + initial trajectory
+  - strategic_review              ← premium model: commitment, trajectory, missed opportunities
+  - reframing_probe               ← premium model: full-results review on thread abandonment
   - exploration_synthesis
 
 Templates used by the engine:
@@ -53,6 +56,12 @@ contradicted at any stage, drop or downgrade it rather than forcing it through r
 **CURRENT PHASE: {current_phase}**
 {phase_instruction}
 
+{strategic_direction}
+
+Consult the **Strategic Trajectory** section in the Research Model for the current
+commitment and planned investigation sequence. All questions should align with the
+CURRENT COMMITMENT stated there.
+
 If the Exploration Health section shows breadth as LOW, at least 3 of your 5 questions
 MUST target unexplored territory — regardless of phase.
 
@@ -64,10 +73,6 @@ advance it to its next stage:
   DECOMPOSED → regime-test (split at temporal breakpoints, rolling windows)
   REGIME-TESTED → connect (test interaction with other established findings)
 Do NOT split questions across different findings during PURSUING.
-
-**Question types:**
-- EXPLORE: Open new angles, examine untouched variables. Screening analyses valuable.
-- EXPLOIT: Deepen a finding — precision, conditions, robustness, disconfirming evidence.
 
 **Requirements:**
 1. Answerable by executing code against the available data
@@ -192,6 +197,10 @@ if the evidence covers them (e.g., a subgroup analysis that also reveals a break
 
 RESULT_DIGEST: [3-5 lines — the key numbers that matter for ongoing analysis]
 
+METHOD_USED: [One phrase describing the analytical technique — e.g. "rolling correlation
+by decade", "logistic regression with interaction term", "binned comparison pre/post 2000".
+This helps the strategic reviewer detect methodological monoculture.]
+
 ═══ TASK 2: UPDATE THE RESEARCH MODEL ═══
 
 UPDATED_MODEL:
@@ -262,6 +271,10 @@ If unchanged from last update: "NOTE: This gap has persisted — consider pivoti
   HIGH = 5+ themes, most major features examined.
 - Recommendation: [What to prioritise. If LOW, name specific unexplored directions.]
 
+## Strategic Trajectory
+<<< DO NOT MODIFY THIS SECTION — it is maintained by a separate strategic review process.
+Copy it through EXACTLY as-is. If this section does not exist yet, leave this placeholder. >>>
+
 END_MODEL
 
 Rules:
@@ -269,6 +282,7 @@ Rules:
 - Be ruthlessly concise. Every word earns its place.
 - Graduate aggressively: confirmed hypotheses → Established Findings.
 - Exploration Health must be HONEST. If narrow, say so.
+- The Strategic Trajectory section is READ-ONLY. Copy it verbatim. Do not edit, summarise, or remove it.
 - Plain text only. No LaTeX."""
 
 
@@ -299,54 +313,256 @@ comma-separated, best first. Nothing else."""
 
 
     # ══════════════════════════════════════════════════
-    # CROSS-FINDING CONNECTION EXPLORER (NEW)
-    # Called periodically by auto_explore.py when
-    # established findings ≥ 4 or every N iterations.
+    # SEED DECOMPOSITION (premium model)
+    # Called once before the main loop to convert a
+    # broad research agenda into a focused first analysis.
     # ══════════════════════════════════════════════════
 
-    connection_explorer = """You are generating connection-testing questions for a data exploration system.
+    seed_decomposition = """You are planning the first analysis for an autonomous data exploration system.
+The user has provided a research agenda — potentially broad and multi-faceted. Your job
+is to decompose it into a focused first analysis and a strategic plan.
 
-The system has established several independent findings. Your job is to identify
-which pairs of findings might INTERACT, COMPOUND, or EXPLAIN each other — and
-generate questions that test those connections.
+**Research Agenda:**
+{seed_question}
 
-**Established Findings:**
-{established_findings}
-
-**Cross-Finding Connections already tested:**
-{tested_connections}
-
-**Available Data:**
+**Dataset Profile:**
 {data_profile}
 
-═══ WHAT MAKES A GOOD CONNECTION QUESTION ═══
+**Iteration Budget:** {max_iterations} iterations available.
+Each iteration produces 2 parallel analyses, so plan for ~{max_iterations} analytical steps total.
+Scale the plan accordingly — a 10-iteration run should focus on 2-3 core threads,
+a 50+ iteration run can afford deeper investigation and more threads.
 
-A connection question tests whether two independently-discovered findings are related:
-- COMPOUNDING: Do they amplify each other? (e.g., "Is snow loss worse on days that are
-  BOTH warm AND windy, beyond what each factor predicts alone?")
-- MEDIATING: Does one explain the other? (e.g., "Does the increase in warm NE days
-  account for the increase in loss days?")
-- CONDITIONAL: Does one modify the other? (e.g., "Is the visitor depth-response curve
-  steeper in post-2000 seasons than pre-2000?")
-- CONTRADICTING: Do they point in opposite directions for the same outcome?
+═══ TASK 1: FIRST ANALYSIS ═══
 
-Bad connection questions:
-- Testing a connection that is obvious from the finding definitions
-- Repeating an analysis that established one of the findings
-- Connections already listed as tested above
+Write a single, focused analytical question that the code generator should tackle first.
+This should be the FOUNDATION — the analysis whose results every subsequent investigation
+will build on. Typically this means establishing baseline trends and distributions before
+testing mechanisms or interactions.
 
-═══ REQUIREMENTS ═══
+Rules:
+- ONE focused question, answerable in 60-120 lines of Python
+- Should cover at most 2-3 closely related variables
+- Must produce precise numbers (slopes, p-values, effect sizes)
+- Should NOT attempt to cover the entire research agenda
+- Prefer descriptive baselines over hypothesis tests for the first pass
 
-1. Each question must name BOTH findings it connects
-2. Each question must be answerable by executing code against the data
-3. Prioritise connections where the result would change operational understanding
-4. Do NOT duplicate connections already tested
+═══ TASK 2: INITIAL STRATEGIC TRAJECTORY ═══
 
-Return exactly {num_questions} questions, one per numbered line. Plain text only.
+Decompose the full research agenda into a logical sequence of investigation arcs.
+Order them by dependency — what needs to be established before what can be tested.
 
-1. [first connection question]
-2. [second connection question]
-3. [third connection question]"""
+IMPORTANT: Plan a brief initial MAPPING phase (5-8 iterations) to establish core
+baselines, then expect the strategic review to INTERLEAVE mapping and pursuing.
+Each arc should take 3-5 iterations of mapping followed by 2-3 iterations of
+pursuing the best discovery from that arc. Do NOT plan all mapping upfront
+as one long block. The strategic review will adapt the plan based on what the
+exploration actually discovers.
+
+Structure:
+- FULL AGENDA: [one-line summary of each thread in the research agenda]
+- CURRENT COMMITMENT: MAPPING — [what the first 5-8 iterations should establish]
+- NEXT AFTER COMMITMENT: [what to pursue once initial baselines are established]
+
+═══ RESPONSE FORMAT (strict) ═══
+
+FIRST_QUESTION: [the focused analytical question]
+INITIAL_TRAJECTORY:
+[the strategic trajectory content]
+END_TRAJECTORY"""
+
+
+    # ══════════════════════════════════════════════════
+    # STRATEGIC REVIEW (premium model)
+    # Called every iteration to maintain strategic
+    # coherence, enforce commitments, and detect
+    # missed opportunities including untested connections.
+    # ══════════════════════════════════════════════════
+
+    strategic_review = """You are the strategic reviewer for an autonomous data exploration system.
+You are the most capable model in the system. The day-to-day exploration is run by
+smaller, faster models. Your job is to maintain strategic coherence across the full arc
+of the investigation — deciding WHEN to go deep, WHEN to go broad, and WHAT to explore next.
+
+**Original question:** {seed_question}
+
+**Iteration:** {iteration} of {max_iterations} ({remaining_iterations} remaining)
+
+**Dataset Profile:**
+{data_profile}
+
+**Research Model:**
+{research_model}
+
+**Recent iterations (last 5):**
+{recent_context}
+
+═══ TASK 1: COMMITMENT CHECK ═══
+
+The Strategic Trajectory (in the research model) states the current commitment.
+Evaluate whether it should hold, pivot, or be abandoned.
+
+BUDGET AWARENESS:
+You have {remaining_iterations} iterations remaining. Use them. When all planned arcs
+are complete but significant budget remains, do NOT declare the investigation finished.
+Instead:
+- Identify findings that were established at DETECTED or QUANTIFIED but never deepened
+  to DECOMPOSED (robustness checks, subgroup decomposition, alternative framings)
+- Decompose aggregate-level findings into finer-grained components to test whether
+  the mechanism is uniform or varies across subgroups, conditions, or strata
+- Test the operational implications of established findings (thresholds, breakpoints,
+  actionable metrics for decision-makers)
+- Run bootstrap or permutation validation on the 3-5 most important findings
+- Explore columns or variable interactions flagged in the data profile but not yet tested
+Do NOT spend remaining iterations on report writing, summary tables, or narrative
+synthesis. These are handled by a dedicated synthesis agent after exploration ends.
+
+HOLD when:
+- The pursued finding is advancing in maturity (scores stable or improving)
+- The finding has not yet reached DECOMPOSED — it needs more depth
+- Recent scores are moderate (5-6) but the finding clearly has substance
+  (moderate scores during deep pursuit are EXPECTED — this is NOT exhaustion)
+
+PIVOT when:
+- A clearly higher-value thread has emerged from recent results
+- The current thread has stalled: 3+ iterations with no maturity advance AND
+  the finding is already at DECOMPOSED or beyond
+- A surprise finding (score 8+) opens a more important direction
+
+ABANDON when:
+- The pursued finding has been directly contradicted
+- Results show the data cannot support further investigation of this thread
+- The thread has reached COMPLETE
+
+On PIVOT or ABANDON, you MUST provide a NEXT_DIRECTION — a specific framing for the
+next thread of exploration. Name the variables, the analytical question, and WHY this
+direction has high expected value. The question generator will use this as its primary
+constraint.
+
+PHASE rule:
+- PURSUING = go deep on a specific finding (all questions target the same thread)
+- MAPPING = go broad across unexplored territory
+
+TRAJECTORY AWARENESS:
+The initial trajectory is a PLAN, not a binding contract. When a MAPPING iteration
+produces a high-value discovery (score 8+ with clear operational significance), you
+should switch to PURSUING for 2-3 iterations to deepen it before returning to the
+next incomplete arc. The trajectory records which arcs are complete and which remain.
+After a brief PURSUING detour, return to the next incomplete arc in the trajectory.
+
+Do NOT stay in MAPPING for 15+ consecutive iterations just because the trajectory
+planned a long mapping phase. Interleave: map a topic, pursue its best finding for
+2-3 iterations, return to mapping. This produces findings at DECOMPOSED maturity
+rather than leaving every topic at DETECTED.
+
+Conversely, do NOT abandon the trajectory for extended PURSUING. If a PURSUING
+detour exceeds 4 iterations without the finding reaching DECOMPOSED, return to
+MAPPING. The trajectory's incomplete arcs represent genuine analytical territory
+that must eventually be covered.
+
+═══ TASK 2: MISSED OPPORTUNITIES ═══
+
+Scan the Exploration Health section and the data profile. Name any specific
+unexplored angles the smaller models appear to be overlooking — columns,
+variable groups, or analytical techniques not yet tried on promising threads.
+If the recent iterations show methodological monoculture (same technique
+repeated), name a specific alternative technique.
+
+Also review the Cross-Finding Connections section. If 2+ established findings
+have NOT been tested for interaction, note the most promising untested pair.
+
+═══ TASK 3: TRAJECTORY UPDATE ═══
+
+Rewrite the Strategic Trajectory section. This is the exploration's strategic
+memory — it records WHY pivots happened and WHAT the current commitment is.
+Structure:
+- 1-2 lines per completed arc (iterations N-M: what was pursued, what was found,
+  why the system moved on)
+- CURRENT COMMITMENT: [phase] on [thread] because [reason]
+- NEXT AFTER COMMITMENT: [direction with highest expected value]
+  If untested cross-finding connections exist and would have high analytical value,
+  name the most important one here. Connection testing is a valid next direction.
+
+═══ RESPONSE FORMAT (strict) ═══
+
+COMMITMENT: [HOLD / PIVOT / ABANDON] — [one sentence reason]
+PHASE: [MAPPING / PURSUING]
+NEXT_DIRECTION: [specific framing for next thread, or UNCHANGED if HOLD]
+PROBE_NEEDED: [YES / NO] — YES when the raw analytical output deserves a second
+  look from a different angle. This includes:
+  (a) A null result that seems suspicious given the broader investigation narrative
+  (b) A positive finding where you can name a SPECIFIC distributional feature,
+      threshold, or decomposition that the current analysis likely missed
+      (e.g., "the outcome-predictor scatter probably saturates above a threshold"
+      or "the seasonal variance likely differs between eras")
+  (c) A thread completing where you can identify a SPECIFIC derived metric that
+      would be more operationally useful than what was tested
+  Say NO for routine completions where the finding is clean and fully captured,
+  and NO when you have only a vague sense that "this could be sharper" without
+  a concrete alternative in mind. Most iterations should be NO.
+  Expect YES roughly 5-8 times per 100 iterations.
+MISSED: [specific missed opportunities or untested connections, or NONE]
+UPDATED_TRAJECTORY:
+[full rewrite of Strategic Trajectory section]
+END_TRAJECTORY"""
+
+
+    # ══════════════════════════════════════════════════
+    # REFRAMING PROBE (premium model)
+    # Fires when strategic review sets PROBE_NEEDED: YES.
+    # Can trigger on any commitment (HOLD, PIVOT, ABANDON).
+    # Receives full analytical output, not digests.
+    # ══════════════════════════════════════════════════
+
+    reframing_probe = """You are reviewing the raw analytical output from a data exploration.
+The strategic review flagged this moment as one where a fresh look at the actual
+numbers could reveal something the standard analysis missed.
+
+Your job is NOT to rerun the analyses. It is to READ THE ACTUAL NUMBERS below and
+notice what the headline statistics missed: distributional shifts, variance changes,
+threshold effects, saturation patterns, era differences, outlier clustering, or any
+pattern that suggests an alternative framing would produce a sharper or more
+operationally useful finding.
+
+**Original research agenda:** {seed_question}
+
+**Current thread:** {thread_summary}
+
+**Why a fresh look matters here:** {why_it_matters}
+
+**Full analytical output from recent analyses:**
+
+{full_results}
+
+═══ YOUR TASK ═══
+
+Read the numbers above carefully. Then answer three questions:
+
+1. HIDDEN PATTERN: What pattern, threshold, regime change, or distributional feature
+   in these numbers does the headline test NOT capture? Look for: variance changes
+   across eras, saturation/threshold effects in scatter relationships, clustering of
+   outliers in specific conditions, changes in distribution shape even if the mean
+   is stable, decompositions (e.g., counting days above/below a threshold vs
+   testing a continuous mean), or operational thresholds where a relationship
+   changes character (e.g., an outcome variable flattening above a predictor threshold).
+
+2. ALTERNATIVE FRAMING: What specific metric, decomposition, or analytical approach
+   would produce a sharper or more operationally useful finding than what the
+   standard tests captured? Define the metric precisely enough that a code generator
+   can implement it (e.g., "count the number of days per season where [metric] exceeds
+   [threshold] and test this count as a predictor of [outcome]").
+
+3. NEXT QUESTION: Write one specific analytical question that the code generator
+   should tackle, using your alternative framing.
+
+If the null result is genuine and no alternative framing is warranted, say NONE for
+all three fields. Do not force a finding.
+
+═══ RESPONSE FORMAT ═══
+
+HIDDEN_PATTERN: [what you noticed in the raw numbers, or NONE]
+ALTERNATIVE_FRAMING: [the specific metric/approach, or NONE]
+REFRAMING_DIRECTION: [the analytical question to pursue, or NONE]"""
 
 
     # ══════════════════════════════════════════════════
@@ -400,9 +616,9 @@ ANY finding, apply these checks:
   Examples: timing confounds, aggregation artifacts, mediation tests, confound controls.
 
 UNIT VERIFICATION:
-Cross-check all numbers against the data profile in Section A. Snow Pack and Snow Depth
-Change are in centimetres (cm). Do not write "mm" for values that come from cm-scale data.
-When citing thresholds or coefficients, include the unit from the source analysis.
+Cross-check all numbers against the data profile in Section A. When citing thresholds
+or coefficients, include the unit from the source analysis. Do not change units from
+what was reported in the original analysis (e.g., do not write "mm" for cm-scale data).
 
 CITATION RULES:
 - Every quantitative claim must include [[chain_id]] from the analysis's Reference field.
@@ -464,6 +680,9 @@ RULES:
 - Use vectorized pandas operations — not row-level loops.
 - Handle nulls: check for NaN before calculations, verify column existence.
 - Keep code complete and self-contained. Target 60-120 lines.
+- Write direct, linear code. Do NOT build elaborate reusable functions or
+  classes. The code runs once. Inline the computation and print results
+  as you go. This keeps the code short and avoids output truncation.
 
 DATA QUALITY CHECKS:
 - SPARSE COLUMNS: If >90% of non-null values share the same sign, the column likely
@@ -482,10 +701,22 @@ OUTPUT RULES:
   print("###RESULTS_END###")
 - No intermediate prints, no decorative formatting, no plot descriptions.
 - Results block: ONLY computed numbers. No interpretation, no "this suggests".
-- Target 8-15 lines in the results block. Print only headline results.
+- Target 15-25 lines in the results block.
 - INSUFFICIENT DATA threshold: if the dataset has <50 analytical units (e.g. years),
   flag only n<2. Otherwise flag n<5. Always report actual n for small groups.
 - If a result is NaN or insufficient, print it explicitly — do NOT skip or interpret around it.
+
+DISTRIBUTIONAL DETAIL (important for downstream analysis):
+- For every group mean, also report std and range (min, max).
+  GOOD: "decade_1990: mean=253, std=113, range=30-397, n=10"
+  BAD:  "decade_1990: mean=253"
+- When testing a linear trend, also test for VARIANCE CHANGE between the first
+  and second half of the series (Levene test or F-test for equality of variances).
+  Report both the trend slope/p and the variance-change p-value.
+- When comparing groups, report the full distribution (mean, std, min, max, n)
+  for each group, not just means or effect sizes.
+- When testing a relationship (correlation, regression), also report
+  top-3 and bottom-3 values with their identifiers (year, season, condition).
 
 Return ONLY code within ```python``` blocks."""
 
@@ -553,7 +784,7 @@ ANALYSIS DIMENSIONS (adapt to dataset — skip sections that don't apply):
    → For each sparse column, state: what downstream analyses should assume about NaN rows.
 
 2. OUTCOME LANDSCAPE: Likely target variable(s), distribution, where outcomes concentrate.
-   → State required filters (e.g., "restrict to in-season rows for snow/visitor analysis").
+   → State required filters (e.g., "restrict to rows where [condition] for [domain] analysis").
 
 3. GROUP SIZES: How groups break down. Cross-tabulate main groupings. Name thin cells.
    → Name specific infeasible comparisons and any empty cells in cross-tabulations.

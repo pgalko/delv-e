@@ -224,7 +224,7 @@ class ExplorationEngine:
         Streams through the output_manager (which handles silent mode).
         """
         model = model_override or self.models.get_model_name(agent)[0]
-        max_tokens = 24000 if agent == "Synthesis Generator" else 10000
+        max_tokens = 24000 if agent == "Synthesis Generator" else 16000
 
         response = self.llm_client.stream(
             messages=messages,
@@ -264,7 +264,7 @@ class ExplorationEngine:
         try:
             llm_response = self.llm_client.call(
                 messages=messages, model=model,
-                max_tokens=10000, temperature=0, agent=agent,
+                max_tokens=16000, temperature=0, agent=agent,
             )
         except Exception as e:
             logger.warning(f"Code gen LLM call failed ({agent}): {e}")
@@ -287,7 +287,7 @@ class ExplorationEngine:
         try:
             llm_response = self.llm_client.call(
                 messages=retry_messages, model=model,
-                max_tokens=10000, temperature=0, agent=agent,
+                max_tokens=16000, temperature=0, agent=agent,
             )
         except Exception as e:
             logger.warning(f"Code gen retry failed ({agent}): {e}")
@@ -308,7 +308,7 @@ class ExplorationEngine:
             try:
                 llm_response = self.llm_client.call(
                     messages=messages, model=fallback_model,
-                    max_tokens=10000, temperature=0, agent=agent,
+                    max_tokens=16000, temperature=0, agent=agent,
                 )
             except Exception as e:
                 logger.warning(f"Code gen fallback failed ({agent}): {e}")
@@ -408,7 +408,7 @@ class ExplorationEngine:
                 llm_response = self.llm_client.call(
                     messages=messages,
                     model=model,
-                    max_tokens=10000,
+                    max_tokens=16000,
                     temperature=0,
                     agent="Error Corrector",
                 )
@@ -555,7 +555,7 @@ class ExplorationEngine:
                     llm_response = self.llm_client.call(
                         messages=messages,
                         model=model,
-                        max_tokens=10000,
+                        max_tokens=16000,
                         temperature=0,
                         agent="Error Corrector",
                     )
