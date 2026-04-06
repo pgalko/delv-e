@@ -1,0 +1,24 @@
+# pitfalls.txt — static hints for the code generator
+# One hint per line. Lines starting with # are comments.
+# These are injected into every code generation prompt.
+#
+# Add entries when a model repeatedly makes the same mistake
+# despite the error being corrected at runtime.
+
+# --- scipy API changes ---
+scipy.stats.theilslopes returns (slope, intercept, low_slope, high_slope), NOT .lower/.upper
+pymannkendall is not installed — use scipy.stats.kendalltau(x, y) for Mann-Kendall test
+scipy.stats.pearsonr returns (statistic, pvalue) — access as r, p = pearsonr(x, y), not result.statistic
+
+# --- pandas deprecations ---
+DataFrame.append() is removed — use pd.concat([df1, df2]) instead
+Use df.groupby(col, observed=True) for categorical columns to avoid FutureWarning
+
+# --- common statistical mistakes ---
+scipy.stats.levene and scipy.stats.bartlett require array-like inputs, not DataFrames — use .values
+When using scipy.stats.f_oneway, drop NaN first — it does not handle NaN gracefully
+mannwhitneyu alternative defaults to 'two-sided' in recent scipy — specify explicitly if needed
+
+# --- numpy/type traps ---
+np.float64 values in f-strings print as "np.float64(3.14)" — cast with float() for clean output
+When comparing pandas Timestamps, use pd.Timestamp() not datetime.datetime()

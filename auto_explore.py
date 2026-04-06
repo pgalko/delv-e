@@ -13,6 +13,10 @@ Key mechanisms:
     patterns the headline tests missed: distributional shifts on null results,
     threshold effects on positive findings, or derived metrics that would
     sharpen the operational value of existing discoveries
+  - Perspective Rotation: when an original arc completes, premium model generates
+    2-3 ranked alternative analytical lenses on the same phenomenon. The top-ranked
+    perspective is automatically pursued for 1-2 iterations before the next planned
+    arc. Perspective arcs do not trigger further rotations.
 """
 
 import json
@@ -34,33 +38,17 @@ class AutoExplorer:
     self.engine.* interface).
     """
 
-    PHASE_INSTRUCTIONS = {
-        "MAPPING": (
-            "We are in MAPPING phase — survey broadly. Prioritise coverage: "
-            "open new angles, examine unexplored variables, screen many features at once."
-        ),
-        "PURSUING": (
-            "We are in PURSUING phase — all 5 questions must advance THE SAME finding. "
-            "Consult Finding Maturity: pick the least-mature finding and generate 5 "
-            "different ways to advance it to its next stage. Do not split across topics."
-        ),
-    }
-
     def __init__(self, engine_instance):
         self.engine = engine_instance
 
-        # Tree-based exploration state
+        # Exploration state
         self.insight_tree = {}
-        self.active_branch_id = None
-        self.dormant_branches = []
         self.question_pool = []
-        self.root_node_id = None
 
         # Research model state
         self.research_model = ""
         self.seed_question = ""
-        self.current_phase = "MAPPING"
-        self.phase_history = []
+        self.commitment_history = []  # [(iteration, action)] for dashboard
         self.model_impact_history = []
         self.evaluator_score_history = []
         self.biggest_gap_history = []
@@ -71,16 +59,17 @@ class AutoExplorer:
 
         # ── Strategic review state ──
         self.last_review_iteration = 0
-        self.strategic_commitment = None     # {phase, reason, next_direction}
         self.strategic_next_direction = ""   # set by premium model on PIVOT/ABANDON
+        self.current_arc_direction = ""      # the arc currently being pursued
         self._initial_trajectory = ""        # set by seed decomposition, consumed on iteration 0
         self.last_probe_iteration = 0        # tracks when last probe ran (observability)
         self.probe_history = []              # [(iteration, brief_result)] for dashboard
+        self.completed_original_arcs = set() # arc directions that have been rotated (no recursion)
+        self.rotation_history = []           # [(iteration, parent_arc, [{name, question}])] for dashboard
+        self.arc_history = []                # [(start_iter, label)] for dashboard heatmap
 
         # Model override for orientation, strategic review, and synthesis
         self.premium_model = None
-
-        self.engine.branch_endpoints = []
 
     @property
     def kill_signal(self):
@@ -148,22 +137,11 @@ class AutoExplorer:
     def _evaluate_results_comparative(self, solutions_data, remaining_iterations=0, max_iterations=10):
         """Compare multiple solution results and select the most analytically valuable one."""
         if self.kill_signal:
-            return 0, [5] * len(solutions_data), [], False, "Interrupted", None, [''] * len(solutions_data), None
+            return 0, [5] * len(solutions_data), [], False, "Interrupted", None, [''] * len(solutions_data)
 
         # Build context
-        dormant_info = "None"
-        if self.dormant_branches:
-            dormant_scores = [
-                self.insight_tree[nid]['quality_score']
-                for nid in self.dormant_branches
-                if nid in self.insight_tree
-            ]
-            if dormant_scores:
-                dormant_info = f"{len(self.dormant_branches)} branch(es), best score: {max(dormant_scores)}"
-
         exploration_state = (
             f"**Current Exploration State:**\n"
-            f"- Dormant branches: {dormant_info}\n"
             f"- Remaining iterations: {remaining_iterations} of {max_iterations}\n\n"
             f"{self._get_exploration_history()}"
         )
@@ -220,36 +198,18 @@ class AutoExplorer:
                 if 0 <= idx < len(solutions_data):
                     selected_index = idx
 
-        keep_dormant_indices = []
-        if 'KEEP_DORMANT:' in response.upper():
-            dormant_line = response.upper().split('KEEP_DORMANT:')[1].split('\n')[0]
-            if 'NONE' not in dormant_line.upper():
-                for match in re.findall(r'\d+', dormant_line):
-                    idx = int(match) - 1
-                    if 0 <= idx < len(solutions_data) and idx != selected_index:
-                        keep_dormant_indices.append(idx)
-
-        # Parse PHASE recommendation
-        phase_recommendation = None
-        if 'PHASE:' in response.upper():
-            phase_line = response.upper().split('PHASE:')[1].split('\n')[0].strip()
-            for candidate in ['MAPPING', 'PURSUING']:
-                if candidate in phase_line:
-                    phase_recommendation = candidate
-                    break
-
         # Parse SUMMARIES
         summaries = [''] * len(solutions_data)
         if 'SUMMARIES:' in response:
             summary_text = response.split('SUMMARIES:')[1]
-            for end in ['SELECTED:', 'KEEP_DORMANT:', 'REASON:', 'PHASE:', '\n\n']:
+            for end in ['SELECTED:', 'REASON:', '\n\n']:
                 idx = summary_text.find(end)
                 if idx > 0:
                     summary_text = summary_text[:idx]
                     break
             for i, part in enumerate([s.strip() for s in summary_text.split('|')][:len(solutions_data)]):
                 if part and len(part) > 5:
-                    summaries[i] = part[:200]
+                    summaries[i] = part
 
         reason = "No reason provided"
         if 'REASON:' in response:
@@ -261,15 +221,15 @@ class AutoExplorer:
             if angle_text and angle_text.lower() not in ['', 'none', 'n/a']:
                 follow_up_angle = angle_text
 
-        return (selected_index, scores, keep_dormant_indices, False,
-                reason, follow_up_angle, summaries, phase_recommendation)
+        return (selected_index, scores, [], False,
+                reason, follow_up_angle, summaries)
 
     # ══════════════════════════════════════════════
     # QUESTION GENERATION & SELECTION
     # ══════════════════════════════════════════════
 
     def _generate_branching_questions(self, use_chain_id=None, follow_up_hint=None, model_override=None):
-        """Generate 5 branching questions. Phase-driven."""
+        """Generate 5 branching questions. Commitment-driven."""
         if self.kill_signal:
             return [], ""
 
@@ -285,28 +245,26 @@ class AutoExplorer:
         if follow_up_hint:
             hint_section = f"\n**Promising direction:** {follow_up_hint}\n"
 
-        phase_instruction = self.PHASE_INSTRUCTIONS.get(
-            self.current_phase,
-            "Generate exploratory questions.",
-        )
-
         model_context = self.research_model if self.research_model else "(No model yet — first iteration)"
 
-        # Build strategic direction block — binding constraint from premium model
-        strategic_direction = ""
+        # Build commitment instruction from strategic state
         if self.strategic_next_direction:
-            strategic_direction = (
+            commitment_instruction = (
                 f"**STRATEGIC DIRECTION (from strategic review — this is a binding constraint):**\n"
                 f"{self.strategic_next_direction}\n"
                 f"All 5 questions must align with this direction. Do not generate questions "
-                f"on the previous thread."
+                f"on the previous arc. Explore this new direction broadly — cover multiple "
+                f"angles and variables."
+            )
+        else:
+            commitment_instruction = (
+                "The strategic review is holding commitment on the current arc. "
+                "Focus all questions on advancing the current investigation."
             )
 
         phase_prompt = self.engine.prompts.ideas_explorer_auto.format(
-            current_phase=self.current_phase,
-            phase_instruction=phase_instruction,
+            commitment_instruction=commitment_instruction,
             research_model=model_context,
-            strategic_direction=strategic_direction,
         )
 
         all_questions_log = self.engine.message_manager.format_all_questions()
@@ -362,13 +320,22 @@ class AutoExplorer:
 
         research_model_context = self.research_model if self.research_model else "(No model yet)"
 
+        # Build commitment context for selector
+        if self.strategic_next_direction:
+            commitment_ctx = f"**Current commitment:** Pivoting to new territory — prefer breadth and diversity."
+        elif self.current_arc_direction:
+            arc_short = self.current_arc_direction[:80]
+            commitment_ctx = f"**Current commitment:** Holding on current arc — {arc_short}"
+        else:
+            commitment_ctx = "**Current commitment:** Early exploration — prefer breadth."
+
         selection_prompt = self.engine.prompts.question_selector.format(
             exploration_history=exploration_history,
             questions=chr(10).join(formatted_questions) + pool_section,
             context_hint=context_section,
             num_to_select=num_to_select,
             research_model=research_model_context,
-            current_phase=self.current_phase,
+            commitment_context=commitment_ctx,
         )
 
         select_messages = [{"role": "user", "content": selection_prompt}]
@@ -415,7 +382,6 @@ class AutoExplorer:
             if i not in selected_indices:
                 self.question_pool.append({
                     'question': q,
-                    'source_branch_id': self.active_branch_id,
                     'iteration_added': getattr(self, '_current_iteration', 0),
                 })
         self._trim_question_pool()
@@ -469,7 +435,7 @@ class AutoExplorer:
         """Interpret the latest result and update the research model.
 
         Returns:
-            (updated_model, model_impact, contradiction, thread_completed, result_digest, method_used)
+            (updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used)
         """
         if self.kill_signal:
             return self.research_model, "LOW", False, False, "", ""
@@ -477,8 +443,8 @@ class AutoExplorer:
         result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
         current_model = self.research_model if self.research_model else "(No model yet — this is the first result. Initialize the model from scratch.)"
 
-        if self.data_profile and not self.research_model:
-            current_model += f"\n\n**Analytical Profile (reference only):**\n{self.data_profile}"
+        # Column list for Exploration Health cross-reference (always available)
+        column_list = self.engine._get_column_list() if hasattr(self.engine, '_get_column_list') else "(columns not available)"
 
         parallel_context = ""
         if solutions_data and len(solutions_data) > 1 and scores:
@@ -500,6 +466,7 @@ class AutoExplorer:
             score=quality_score,
             result_summary=result_summary,
             parallel_results=parallel_context,
+            column_list=column_list,
         )
 
         interpret_messages = [{"role": "user", "content": interpret_prompt}]
@@ -509,7 +476,7 @@ class AutoExplorer:
         model_impact = self._parse_field(response, 'MODEL_IMPACT', default='MEDIUM',
                                           valid={'HIGH', 'MEDIUM', 'LOW'})
         contradiction = 'YES' in self._parse_field(response, 'CONTRADICTION', default='NO')
-        thread_completed = 'YES' in self._parse_field(response, 'THREAD_COMPLETED', default='NO')
+        arc_exhausted = 'YES' in self._parse_field(response, 'ARC_EXHAUSTED', default='NO')
 
         # ── NEW: Parse MATURITY_ADVANCE (logged for observability) ──
         maturity_advance = self._parse_field(response, 'MATURITY_ADVANCE', default='NONE')
@@ -525,15 +492,13 @@ class AutoExplorer:
                     digest_text = digest_text.split(end_marker)[0]
                     break
             result_digest = digest_text.strip()
-            if len(result_digest) > 1000:
-                result_digest = result_digest[:997] + "..."
 
         # Parse METHOD_USED
         method_used = ""
         if 'METHOD_USED:' in response:
             method_text = response.split('METHOD_USED:')[1].split('\n')[0].strip()
             if method_text and method_text.upper() not in ('', 'NONE', 'N/A'):
-                method_used = method_text[:150]
+                method_used = method_text
 
         # Extract updated model
         updated_model = self.research_model
@@ -545,7 +510,7 @@ class AutoExplorer:
             if model_text:
                 updated_model = model_text
 
-        return updated_model, model_impact, contradiction, thread_completed, result_digest, method_used
+        return updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used
 
     @staticmethod
     def _parse_field(response, field_name, default='', valid=None):
@@ -601,8 +566,8 @@ class AutoExplorer:
                 entry += f"\n  Finding: {digest}"
             if method:
                 entry += f"\n  Method: {method}"
-            if status in ('dormant', 'runner_up'):
-                entry += f" [{status.upper()}]"
+            if status == 'runner_up':
+                entry += f" [RUNNER_UP]"
             parts.append(entry)
 
         return '\n'.join(parts)
@@ -647,17 +612,18 @@ class AutoExplorer:
         # ── Parse COMMITMENT ──
         commitment_action = self._parse_field(response, 'COMMITMENT', default='HOLD',
                                                valid={'HOLD', 'PIVOT', 'ABANDON'})
-
-        # ── Parse PHASE ──
-        review_phase = self._parse_field(response, 'PHASE', default=None,
-                                          valid={'MAPPING', 'PURSUING'})
+        # Extract the reason text after the action (e.g., "ABANDON — Arc is complete...")
+        commitment_reason = ""
+        if 'COMMITMENT:' in response:
+            reason_line = response.split('COMMITMENT:')[1].split('\n')[0]
+            commitment_reason = reason_line.strip()
 
         # ── Parse NEXT_DIRECTION ──
         next_direction = ""
         if 'NEXT_DIRECTION:' in response:
             nd_text = response.split('NEXT_DIRECTION:')[1]
             # Take until next field marker
-            for end_marker in ['PROBE_NEEDED:', 'MISSED:', 'UPDATED_TRAJECTORY:']:
+            for end_marker in ['PROBE_NEEDED:', 'ARC_COMPLETE:', 'MISSED:', 'UPDATED_TRAJECTORY:']:
                 if end_marker in nd_text:
                     nd_text = nd_text.split(end_marker)[0]
                     break
@@ -670,6 +636,13 @@ class AutoExplorer:
         if 'PROBE_NEEDED:' in response.upper():
             probe_line = response.upper().split('PROBE_NEEDED:')[1].split('\n')[0].strip()
             probe_needed = 'YES' in probe_line
+
+        # ── Parse ARC_COMPLETE ──
+        arc_complete = False
+        if 'ARC_COMPLETE:' in response.upper():
+            ac_line = response.upper().split('ARC_COMPLETE:')[1].split('\n')[0].strip()
+            arc_complete = 'YES' in ac_line
+        self._last_arc_complete = arc_complete
 
         # ── Parse MISSED ──
         missed = ""
@@ -690,10 +663,11 @@ class AutoExplorer:
             updated_trajectory = traj_text.strip()
 
         # ── Apply commitment ──
+        completing_arc = self.current_arc_direction  # save before overwrite
         if commitment_action in ('PIVOT', 'ABANDON'):
-            self.strategic_commitment = None
             if next_direction:
                 self.strategic_next_direction = next_direction
+                self.current_arc_direction = next_direction  # track what arc we're on
                 logger.info(f"Strategic review: {commitment_action} → next direction: {next_direction[:100]}")
             else:
                 self.strategic_next_direction = ""
@@ -704,25 +678,58 @@ class AutoExplorer:
             logger.info("Strategic review: HOLD commitment")
 
         # ── REFRAMING PROBE: fires on any commitment when strategic review requests it ──
+        reframing_override = False
         if probe_needed and self._should_run_reframing_probe(iteration):
             with style.spinner("Reframing probe"):
                 reframing = self._run_reframing_probe(iteration)
             if reframing:
                 self.strategic_next_direction = reframing
+                self.current_arc_direction = reframing  # reframing starts a new arc
+                reframing_override = True
                 logger.info("Reframing probe override: setting next direction")
-                print(style.branch_event(
-                    f"Reframing: {reframing[:120]}"))
+                self._review_events.append(f"Reframing: {reframing[:120]}")
                 self.probe_history.append((iteration, reframing[:150]))
             else:
-                print(style.branch_event("Reframing probe: no alternative framing found"))
+                self._review_events.append("Reframing probe: no alternative framing found")
                 self.probe_history.append((iteration, "No reframing found"))
 
-        # Apply phase from strategic review (overrides evaluator)
-        if review_phase:
-            self.strategic_commitment = {
-                'phase': review_phase,
-                'reason': commitment_action,
-            }
+        # ── PERSPECTIVE ROTATION: fires on ABANDON when arc genuinely completed ──
+        # Uses completing_arc (the arc that just finished), not current_arc_direction
+        # (which was already updated to the next planned arc above).
+        # Skip if reframing probe already overrode the direction — reframing takes priority.
+        if commitment_action == 'ABANDON' and arc_complete and not reframing_override:
+            if completing_arc and completing_arc not in self.completed_original_arcs:
+                with style.spinner("Perspective rotation"):
+                    perspectives = self._run_perspective_rotation(iteration, completing_arc=completing_arc)
+                if perspectives:
+                    # Mark the completing arc as rotated
+                    self.completed_original_arcs.add(completing_arc)
+                    # Force-select top-ranked perspective as next direction
+                    selected = perspectives[0]
+                    self.strategic_next_direction = selected['question']
+                    self.current_arc_direction = selected['question']
+                    # Prevent this perspective arc from triggering its own rotation
+                    self.completed_original_arcs.add(selected['question'])
+                    # Record for dashboard
+                    parent = selected.get('parent_arc', '')[:60]
+                    self.rotation_history.append((
+                        iteration,
+                        parent,
+                        [{'name': p['name'], 'question': p['question'][:120]} for p in perspectives]
+                    ))
+                    self._review_events.append(
+                        f"Perspective selected: {selected['name']} — {selected['differs'][:80]}")
+                    for p in perspectives[1:]:
+                        self._review_events.append(
+                            f"Perspective (deferred): {p['name']}")
+
+        # ── Record arc change for dashboard heatmap ──
+        if self.strategic_next_direction:
+            label = self._extract_arc_label(self.strategic_next_direction)
+            self.arc_history.append((iteration + 1, label))
+
+        # ── Record commitment for dashboard timeline ──
+        self.commitment_history.append((iteration, commitment_action))
 
         # ── Splice updated trajectory into research model ──
         if updated_trajectory:
@@ -770,24 +777,24 @@ class AutoExplorer:
 
     def _build_probe_context(self):
         """Build full-results context for the reframing probe.
-        Returns (thread_summary, why_it_matters, full_results) or None."""
-        # Thread summary from current commitment in trajectory
+        Returns (arc_summary, why_it_matters, full_results) or None."""
+        # Arc summary from current commitment in trajectory
         trajectory = self._extract_model_section('Strategic Trajectory')
-        thread_summary = ""
+        arc_summary = ""
         if trajectory:
             for line in trajectory.split('\n'):
                 if 'CURRENT COMMITMENT' in line.upper():
-                    thread_summary = line.strip()
+                    arc_summary = line.strip()
                     break
-        if not thread_summary:
-            thread_summary = "(Current thread not identified)"
+        if not arc_summary:
+            arc_summary = "(Current arc not identified)"
 
         # Why it matters: try recent findings first, then biggest gap, then seed
         why_it_matters = ""
         # Recent established findings give context for positive-finding probes
         findings = self._extract_model_section('Established Findings')
         if findings:
-            # Last 3 findings are most relevant to current thread
+            # Last 3 findings are most relevant to current arc
             finding_lines = [l.strip() for l in findings.split('\n') if l.strip().startswith('-')]
             if finding_lines:
                 why_it_matters = "Recent findings:\n" + "\n".join(finding_lines[-3:])
@@ -796,7 +803,7 @@ class AutoExplorer:
             if gap and len(gap) > 10:
                 why_it_matters = gap
         if not why_it_matters or len(why_it_matters) < 10:
-            why_it_matters = self.seed_question[:500]
+            why_it_matters = self.seed_question
 
         # Full results from last 3 analyses (most recent by chain_id)
         if not self.insight_tree:
@@ -815,7 +822,7 @@ class AutoExplorer:
             if not full_result or len(full_result.strip()) < 20:
                 continue
             results_parts.append(
-                f"**Analysis: {node['question'][:150]}**\n"
+                f"**Analysis: {node['question']}**\n"
                 f"Score: {node['quality_score']}/10\n"
                 f"Full output:\n{full_result}\n"
                 f"{'─' * 40}"
@@ -825,7 +832,7 @@ class AutoExplorer:
             return None
 
         full_results = '\n\n'.join(results_parts)
-        return thread_summary, why_it_matters, full_results
+        return arc_summary, why_it_matters, full_results
 
     def _run_reframing_probe(self, iteration):
         """Run the reframing probe: premium model reads full analytical output
@@ -841,12 +848,12 @@ class AutoExplorer:
             logger.info("Reframing probe: insufficient context, skipping")
             return ""
 
-        thread_summary, why_it_matters, full_results = context
+        arc_summary, why_it_matters, full_results = context
         self.last_probe_iteration = iteration
 
         prompt = self.engine.prompts.reframing_probe.format(
             seed_question=self.seed_question,
-            thread_summary=thread_summary,
+            arc_summary=arc_summary,
             why_it_matters=why_it_matters,
             full_results=full_results,
         )
@@ -879,7 +886,7 @@ class AutoExplorer:
                 hp = response.split('HIDDEN_PATTERN:')[1]
                 if 'ALTERNATIVE_FRAMING:' in hp:
                     hp = hp.split('ALTERNATIVE_FRAMING:')[0]
-                hidden = hp.strip()[:200]
+                hidden = hp.strip()
             logger.info(f"Reframing probe found: {hidden}")
             logger.info(f"Reframing direction: {direction[:150]}")
         else:
@@ -888,37 +895,140 @@ class AutoExplorer:
         return direction
 
     # ══════════════════════════════════════════════
-    # PHASE DETERMINATION
+    # PERSPECTIVE ROTATION (premium model)
+    # Fires when an original arc completes (ABANDON
+    # with arc COMPLETE). Generates alternative
+    # analytical lenses. Does NOT fire on perspective
+    # arcs spawned by previous rotations.
     # ══════════════════════════════════════════════
 
-    def _determine_phase(self, model_impact, contradiction, thread_completed,
-                         phase_recommendation=None):
-        """Phase determination with strategic commitment override.
+    ROTATION_MIN_ITERATION = 8  # don't rotate in early exploration
 
-        Priority:
-        1. thread_completed always forces MAPPING
-        2. Strategic commitment (from premium model review) overrides evaluator
-        3. Evaluator recommendation used when no active commitment
+    def _run_perspective_rotation(self, iteration, completing_arc=None):
+        """Generate alternative analytical perspectives on a completed arc.
+
+        Args:
+            completing_arc: the arc direction that just finished (not the next planned arc).
+
+        Returns a list of perspective dicts [{name, differs, question}] or empty list.
         """
-        if thread_completed:
-            logger.info("Phase → MAPPING (thread completed)")
-            return "MAPPING"
+        if self.kill_signal:
+            return []
 
-        # Strategic commitment takes priority over evaluator
-        if self.strategic_commitment:
-            committed_phase = self.strategic_commitment['phase']
-            if committed_phase != self.current_phase:
-                logger.info("Phase → %s (strategic commitment: %s)",
-                            committed_phase, self.strategic_commitment.get('reason', ''))
-            return committed_phase
+        arc_name = completing_arc or self.current_arc_direction
+        if not arc_name:
+            return []
 
-        if phase_recommendation in ("MAPPING", "PURSUING"):
-            if phase_recommendation != self.current_phase:
-                logger.info("Phase → %s (evaluator recommendation)", phase_recommendation)
-            return phase_recommendation
+        if iteration < self.ROTATION_MIN_ITERATION:
+            return []
 
-        logger.info(f"Phase → {self.current_phase} (maintained)")
-        return self.current_phase
+        # Determine arc start iteration from arc_history
+        arc_start = 0
+        for start_iter, _label in self.arc_history:
+            if start_iter <= iteration:
+                arc_start = start_iter
+
+        # Filter nodes to this arc's iteration range
+        arc_nodes = [
+            node for node in sorted(self.insight_tree.values(), key=lambda n: n['chain_id'])
+            if node.get('iteration_added', 0) >= arc_start
+            and node.get('iteration_added', 0) <= iteration
+            and node['status'] == 'active'
+        ]
+
+        # Arc-specific methods (only from this arc's analyses)
+        methods = []
+        for node in arc_nodes:
+            m = node.get('method_used', '')
+            if m and m not in methods:
+                methods.append(m)
+        arc_methods = '; '.join(methods) if methods else "(not recorded)"
+
+        # Arc-specific findings (result digests from arc nodes, not global Established Findings)
+        findings_parts = []
+        for node in arc_nodes:
+            digest = node.get('result_digest', '')
+            if digest:
+                findings_parts.append(
+                    f"[{node['quality_score']}/10] {node['question'][:80]}\n  {digest}"
+                )
+        arc_findings = '\n'.join(findings_parts) if findings_parts else "(No findings)"
+        if len(arc_findings) > 2500:
+            arc_findings = arc_findings[:2500]
+
+        # Build column list from data profile (compact)
+        columns = ""
+        if hasattr(self.engine, 'df') and self.engine.df is not None:
+            columns = ', '.join(self.engine.df.columns.tolist())
+        if not columns:
+            columns = "(columns not available)"
+
+        # Build list of previously selected perspective names
+        prior_perspectives = []
+        for _, _, perspectives in self.rotation_history:
+            if perspectives:
+                prior_perspectives.append(perspectives[0]['name'])
+        prior_perspectives_text = ', '.join(prior_perspectives) if prior_perspectives else "(none yet)"
+
+        prompt = self.engine.prompts.perspective_rotation.format(
+            seed_question=self.seed_question,
+            arc_name=arc_name,
+            arc_methods=arc_methods,
+            arc_findings=arc_findings,
+            available_columns=columns,
+            previously_selected=prior_perspectives_text,
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        response = self._call_agent_with_retry(
+            messages, 'Perspective Rotation', model_override=self.premium_model)
+
+        if not response or not response.strip():
+            logger.info("Perspective rotation: empty response")
+            return []
+
+        if response.strip().upper() == 'NONE':
+            logger.info("Perspective rotation: no alternative perspectives warranted")
+            return []
+
+        # Parse perspectives
+        perspectives = []
+        for i in range(1, 4):
+            marker = f'PERSPECTIVE_{i}:'
+            if marker not in response:
+                continue
+            block = response.split(marker)[1]
+            # Take until next PERSPECTIVE_ or end
+            for end in [f'PERSPECTIVE_{i+1}:', 'NONE']:
+                if end in block:
+                    block = block.split(end)[0]
+                    break
+
+            name = block.split('\n')[0].strip()
+            differs = ""
+            question = ""
+            for line in block.split('\n'):
+                if line.strip().startswith('DIFFERS:'):
+                    differs = line.strip()[len('DIFFERS:'):].strip()
+                elif line.strip().startswith('QUESTION:'):
+                    question = line.strip()[len('QUESTION:'):].strip()
+
+            if name and question:
+                perspectives.append({
+                    'name': name[:80],
+                    'differs': differs[:200],
+                    'question': question[:500],
+                    'parent_arc': arc_name,
+                    'spawned_at': iteration,
+                })
+
+        if perspectives:
+            logger.info(f"Perspective rotation produced {len(perspectives)} perspectives: "
+                       f"{', '.join(p['name'] for p in perspectives)}")
+        else:
+            logger.info("Perspective rotation: no valid perspectives parsed")
+
+        return perspectives
 
     # ══════════════════════════════════════════════
     # SEED DECOMPOSITION (premium model)
@@ -1013,24 +1123,23 @@ class AutoExplorer:
                 last_follow_up_angle = None
 
                 self.insight_tree = {}
-                self.active_branch_id = None
-                self.dormant_branches = []
                 self.question_pool = []
-                self.root_node_id = None
                 self.research_model = ""
                 self.seed_question = seed_question
-                self.current_phase = "MAPPING"
-                self.phase_history = []
+                self.commitment_history = []
                 self.model_impact_history = []
                 self.evaluator_score_history = []
                 self.biggest_gap_history = []
                 self.stagnation_count = 0
                 self.data_profile = ""
                 self.last_review_iteration = 0
-                self.strategic_commitment = None
                 self.strategic_next_direction = ""
+                self.current_arc_direction = ""
                 self.last_probe_iteration = 0
                 self.probe_history = []
+                self.completed_original_arcs = set()
+                self.rotation_history = []
+                self.arc_history = []
 
                 start_iteration = 0
 
@@ -1082,6 +1191,8 @@ class AutoExplorer:
                 if initial_trajectory:
                     self._initial_trajectory = initial_trajectory
                     logger.info(f"Initial trajectory: {len(initial_trajectory)} chars")
+                self.arc_history.append((1, self._extract_arc_label(focused_question)))
+                self.current_arc_direction = focused_question
 
             # ══════════════════════════════════════════════
             # MAIN ITERATION LOOP
@@ -1096,7 +1207,6 @@ class AutoExplorer:
 
                 self.engine._iteration = iteration + 1
                 self.engine._max_iterations = max_iterations
-                self.engine._phase = self.current_phase
 
                 # Determine questions to process
                 if iteration == 0:
@@ -1106,7 +1216,13 @@ class AutoExplorer:
                 else:
                     questions_to_process = current_questions[:num_parallel_solutions]
 
-                print(style.iteration_bar(iteration + 1, max_iterations, self.current_phase))
+                # Commitment posture for iteration bar
+                if self.commitment_history:
+                    last_action = self.commitment_history[-1][1]
+                    posture = last_action if last_action in ('HOLD', 'PIVOT', 'ABANDON') else 'EXPLORING'
+                else:
+                    posture = 'EXPLORING'
+                print(style.iteration_bar(iteration + 1, max_iterations, posture))
 
                 # ── PROCESS QUESTIONS ──
                 solutions_data = []
@@ -1114,12 +1230,6 @@ class AutoExplorer:
                 for q_idx, question in enumerate(questions_to_process):
                     if self.kill_signal:
                         break
-
-                    if len(questions_to_process) > 1 and last_solution_chain is not None:
-                        self.engine.message_manager.restore_interaction(
-                            self.engine.thread_id,
-                            last_solution_chain,
-                        )
 
                     self.chain_id = int(time.time()) + q_idx
                     solution_chain_id = self.chain_id
@@ -1154,16 +1264,14 @@ class AutoExplorer:
                 if len(solutions_data) == 1:
                     selected_index = 0
                     scores = [7]
-                    keep_dormant_indices = []
                     reason = "Seed question — establishing baseline"
                     follow_up_angle = None
                     summaries = ['']
-                    phase_recommendation = None
                     _is_seed = True
                 else:
                     with style.spinner("Evaluating results"):
-                        (selected_index, scores, keep_dormant_indices, _,
-                         reason, follow_up_angle, summaries, phase_recommendation) = \
+                        (selected_index, scores, _, _,
+                         reason, follow_up_angle, summaries) = \
                             self._evaluate_results_comparative(
                                 solutions_data,
                                 remaining_iterations=max_iterations - iteration,
@@ -1175,22 +1283,27 @@ class AutoExplorer:
                 if len(self.evaluator_score_history) > 15:
                     self.evaluator_score_history = self.evaluator_score_history[-15:]
 
+                # ── ENRICH QA PAIRS WITH FINDING SUMMARIES ──
+                # Attach evaluator-generated summaries to qa_pairs so the code
+                # generator gets high-quality context via format_qa_pairs.
+                for i, sol in enumerate(solutions_data):
+                    if i < len(summaries) and summaries[i]:
+                        self.engine.message_manager.update_finding_summary(
+                            sol['chain_id'], summaries[i])
+
                 # ── UPDATE TREE ──
                 winning_solution = solutions_data[selected_index]
                 result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
-                common_parent_id = self.active_branch_id
 
                 new_node_id = self._add_node_to_tree(
                     question=winning_solution['question'],
                     result_summary=result_summary,
                     quality_score=scores[selected_index],
                     chain_id=winning_solution['chain_id'],
-                    parent_id=common_parent_id,
                 )
                 if selected_index < len(summaries) and summaries[selected_index]:
                     self.insight_tree[new_node_id]['finding_summary'] = summaries[selected_index]
 
-                self.active_branch_id = new_node_id
                 last_solution_chain = winning_solution['chain_id']
                 last_follow_up_angle = follow_up_angle
 
@@ -1201,7 +1314,7 @@ class AutoExplorer:
                     _saved_trajectory = ""  # placeholder, not real content yet
 
                 with style.spinner("Updating research model"):
-                    updated_model, model_impact, contradiction, thread_completed, result_digest, method_used = \
+                    updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used = \
                         self._interpret_and_update_model(
                             winning_solution,
                             scores[selected_index],
@@ -1240,21 +1353,11 @@ class AutoExplorer:
 
                 # ── STRATEGIC REVIEW (premium model) ──
                 if iteration > 0 and not self.kill_signal:
+                    self._review_events = []
                     with style.spinner("Strategic review"):
                         self._run_strategic_review(iteration)
-
-                # ── DETERMINE PHASE ──
-                old_phase = self.current_phase
-                new_phase = self._determine_phase(
-                    model_impact, contradiction, thread_completed,
-                    phase_recommendation=phase_recommendation,
-                )
-                if iteration == 0:
-                    new_phase = "MAPPING"
-
-                if new_phase != self.current_phase:
-                    self.phase_history.append((iteration, self.current_phase, new_phase))
-                self.current_phase = new_phase
+                    for event in self._review_events:
+                        print(style.branch_event(event))
 
                 # ── ADD NON-WINNING SOLUTIONS TO TREE ──
                 for idx in range(len(solutions_data)):
@@ -1266,33 +1369,20 @@ class AutoExplorer:
                         result_summary=str(sol['results']) if sol['results'] else "No results",
                         quality_score=scores[idx] if idx < len(scores) else 0,
                         chain_id=sol['chain_id'],
-                        parent_id=common_parent_id,
                     )
                     if idx < len(summaries) and summaries[idx]:
                         self.insight_tree[node_id]['finding_summary'] = summaries[idx]
-
-                    if idx in keep_dormant_indices:
-                        summary = self.insight_tree[node_id].get('finding_summary', '')
-                        label = sol['question'][:120]
-                        if summary:
-                            label += f" — Found: {summary[:150]}"
-                        self.insight_tree[node_id]['hypothesis_label'] = label
-                        self._add_to_dormant(node_id)
-                    else:
-                        self.insight_tree[node_id]['status'] = 'runner_up'
+                    self.insight_tree[node_id]['status'] = 'runner_up'
 
                 # ── WRITE ITERATION SUMMARY ──
                 self.engine.write_iteration_summary(
                     iteration=iteration + 1,
-                    phase=old_phase,
                     solutions_data=solutions_data,
                     scores=scores,
                     selected_index=selected_index,
                     model_impact=model_impact,
                     contradiction=contradiction,
-                    thread_completed=thread_completed,
-                    new_phase=new_phase,
-                    old_phase=old_phase,
+                    arc_exhausted=arc_exhausted,
                 )
 
                 iteration += 1
@@ -1305,10 +1395,7 @@ class AutoExplorer:
                         selected_score=scores[selected_index],
                         reason=reason,
                         model_impact=model_impact,
-                        old_phase=old_phase,
-                        new_phase=new_phase,
                         n_questions=0,
-                        phase_mode="—",
                         n_selected=0,
                         is_seed=_is_seed,
                     ))
@@ -1316,22 +1403,10 @@ class AutoExplorer:
                 if self.kill_signal:
                     break
 
-                # ── BRANCH DECISION ──
-                if new_phase == "MAPPING" and thread_completed:
-                    self.engine.branch_endpoints.append(last_solution_chain)
-                    print(style.branch_event("Thread complete — new territory"))
-
-                    if self.dormant_branches:
-                        new_branch_id = self._pop_best_dormant_branch()
-                        new_branch = self.insight_tree[new_branch_id]
-                        self.engine.message_manager.restore_interaction(
-                            self.engine.thread_id,
-                            new_branch['chain_id'],
-                        )
-                        self.active_branch_id = new_branch_id
-                        last_solution_chain = new_branch['chain_id']
-                        last_follow_up_angle = new_branch.get('hypothesis_label') or new_branch['question'][:150]
-                        print(style.branch_event(f"Switched to dormant branch (score: {style.score(new_branch['quality_score'])})"))
+                # ── ARC TRANSITION ──
+                if getattr(self, '_last_arc_complete', False):
+                    print(style.branch_event("Arc complete, new territory"))
+                    self._last_arc_complete = False
 
                 # ── GENERATE NEW QUESTIONS ──
                 # Use strategic next_direction as the primary hint when set (after PIVOT/ABANDON)
@@ -1375,10 +1450,7 @@ class AutoExplorer:
                     selected_score=scores[selected_index],
                     reason=reason,
                     model_impact=model_impact,
-                    old_phase=old_phase,
-                    new_phase=new_phase,
                     n_questions=len(new_questions),
-                    phase_mode=self.current_phase,
                     n_selected=len(selected_questions),
                     is_seed=_is_seed,
                 ))
@@ -1387,11 +1459,6 @@ class AutoExplorer:
                 current_image = None
 
             # ── POST-LOOP ──
-            if last_solution_chain:
-                self.engine.branch_endpoints.append(last_solution_chain)
-
-            self.engine.exploration_trajectory = self._build_exploration_trajectory()
-
             with style.spinner("Generating synthesis report"):
                 synthesis_text = self._generate_synthesis(seed_question)
 
@@ -1399,26 +1466,23 @@ class AutoExplorer:
                 print(f"  {style.YELLOW}✗ Synthesis failed{style.RESET}")
                 synthesis_text = ""
 
-            print(style.exploration_tree(self.insight_tree, self.root_node_id,
-                                         phase_history=self.phase_history,
+            print(style.exploration_tree(self.insight_tree,
+                                         arc_history=self.arc_history,
                                          total_iterations=iteration))
 
-            dormant_count = len(self.dormant_branches)
             avg_score = sum(n['quality_score'] for n in self.insight_tree.values()) / len(self.insight_tree) if self.insight_tree else 0
 
             print(style.final_box(
                 iterations=iteration,
                 analyses=len(self.insight_tree),
                 avg=avg_score,
-                dormant=dormant_count,
-                phase_hist=self.phase_history,
+                n_arcs=len(self.arc_history),
                 cost_str=self.engine.cost_tracker.report(),
                 output_dir=self.engine.output_dir,
             ))
 
             self.engine.write_final_outputs(
                 research_model=self.research_model,
-                phase_history=self.phase_history,
                 synthesis_text=synthesis_text,
             )
             print()
@@ -1475,6 +1539,21 @@ class AutoExplorer:
     # HELPER METHODS
     # ══════════════════════════════════════════════
 
+    @staticmethod
+    def _extract_arc_label(direction_text):
+        """Extract a short label from a strategic direction for the dashboard heatmap."""
+        label = direction_text.strip()
+        # Take up to first sentence boundary
+        for sep in ['. ', '? ', '.\n', '?\n', '\n']:
+            idx = label.find(sep)
+            if idx > 0:
+                label = label[:idx]
+                break
+        label = label[:40].strip()
+        if not label:
+            label = 'New arc'
+        return label
+
     _node_counter = 0
 
     def _generate_node_id(self):
@@ -1506,7 +1585,7 @@ class AutoExplorer:
         overlap = len(prev_words & curr_words) / max(len(prev_words | curr_words), 1)
         return overlap > 0.70
 
-    def _add_node_to_tree(self, question, result_summary, quality_score, chain_id, parent_id=None):
+    def _add_node_to_tree(self, question, result_summary, quality_score, chain_id):
         node_id = self._generate_node_id()
         if result_summary:
             start_marker = "###RESULTS_START###"
@@ -1515,26 +1594,17 @@ class AutoExplorer:
             e_idx = result_summary.find(end_marker)
             if s_idx >= 0 and e_idx > s_idx:
                 result_summary = result_summary[s_idx + len(start_marker):e_idx].strip()
-            elif len(result_summary) > 800:
-                result_summary = result_summary[:800] + "\n[...truncated]"
         self.insight_tree[node_id] = {
             'question': question,
             'result_summary': result_summary,
             'quality_score': quality_score,
-            'parent_id': parent_id,
-            'children_ids': [],
             'status': 'active',
-            'depth': 0 if parent_id is None else self.insight_tree[parent_id]['depth'] + 1,
             'chain_id': chain_id,
             'finding_summary': '',
             'result_digest': '',
             'method_used': '',
-            'hypothesis_label': '',
+            'iteration_added': getattr(self, '_current_iteration', 0),
         }
-        if parent_id and parent_id in self.insight_tree:
-            self.insight_tree[parent_id]['children_ids'].append(node_id)
-        if self.root_node_id is None:
-            self.root_node_id = node_id
         return node_id
 
     def _get_exploration_history(self, max_entries=40, full_detail_count=15):
@@ -1551,20 +1621,19 @@ class AutoExplorer:
             compact_nodes = []
             full_nodes = recent
 
-        history_parts = ["**Exploration History (all branches):**"]
+        history_parts = ["**Exploration History:**"]
 
         if compact_nodes:
             history_parts.append(f"\n*Earlier analyses ({len(compact_nodes)} entries):*")
             for node in compact_nodes:
                 score = node['quality_score']
                 question = node['question']
-                status_marker = " [DORMANT]" if node['status'] == 'dormant' else ""
                 summary = node.get('finding_summary', '')
                 if not summary:
                     finding = node['result_summary'] if node['result_summary'] else "No results"
                     summary = finding.split('\n')[0][:200]
                 history_parts.append(
-                    f"- [{score}/10]{status_marker} Q: {question}\n  → {summary}"
+                    f"- [{score}/10] Q: {question}\n  → {summary}"
                 )
 
         if full_nodes:
@@ -1573,12 +1642,11 @@ class AutoExplorer:
             for node in full_nodes:
                 score = node['quality_score']
                 question = node['question']
-                status_marker = " [DORMANT]" if node['status'] == 'dormant' else ""
 
                 digest = node.get('result_digest', '')
                 if digest and node['status'] == 'active':
                     history_parts.append(
-                        f"- [{score}/10]{status_marker} Q: {question}\n  Finding: {digest}"
+                        f"- [{score}/10] Q: {question}\n  Finding: {digest}"
                     )
                 else:
                     summary = node.get('finding_summary', '')
@@ -1586,12 +1654,9 @@ class AutoExplorer:
                         finding = node['result_summary'] if node['result_summary'] else "No results"
                         summary = finding.split('\n')[0][:200]
                     history_parts.append(
-                        f"- [{score}/10]{status_marker} Q: {question}\n  → {summary}"
+                        f"- [{score}/10] Q: {question}\n  → {summary}"
                     )
 
-        if self.phase_history:
-            transitions = [f"{old}→{new} (iter {i})" for i, old, new in self.phase_history]
-            history_parts.append(f"\n**Phase transitions:** {' | '.join(transitions)}")
         return '\n'.join(history_parts)
 
     def _get_dataset_schema(self):
@@ -1608,39 +1673,6 @@ class AutoExplorer:
             logger.warning(f"Could not get slim schema: {e}")
             return self._get_dataset_schema()
 
-    def _add_to_dormant(self, node_id):
-        if node_id not in self.insight_tree:
-            return False
-        node = self.insight_tree[node_id]
-        if node['depth'] < 2:
-            return False
-        if node['quality_score'] < 6:
-            node['status'] = 'abandoned'
-            return False
-        if len(self.dormant_branches) >= 2:
-            dormant_scores = [(nid, self.insight_tree[nid]['quality_score'])
-                              for nid in self.dormant_branches]
-            min_dormant = min(dormant_scores, key=lambda x: x[1])
-            if node['quality_score'] > min_dormant[1]:
-                old_id = min_dormant[0]
-                self.dormant_branches.remove(old_id)
-                self.insight_tree[old_id]['status'] = 'abandoned'
-            else:
-                node['status'] = 'abandoned'
-                return False
-        self.dormant_branches.append(node_id)
-        node['status'] = 'dormant'
-        return True
-
-    def _pop_best_dormant_branch(self):
-        if not self.dormant_branches:
-            return None
-        best_id = max(self.dormant_branches,
-                      key=lambda nid: self.insight_tree[nid]['quality_score'])
-        self.dormant_branches.remove(best_id)
-        self.insight_tree[best_id]['status'] = 'active'
-        return best_id
-
     def _get_fallback_model(self, agent):
         return self.engine._get_fallback_model(agent)
 
@@ -1655,18 +1687,14 @@ class AutoExplorer:
     def _save_checkpoint(self, iteration, last_solution_chain, last_follow_up_angle):
         """Save complete exploration state to disk."""
         state = {
-            "version": 3,  # bumped: strategic review replaces connection explorer
+            "version": 5,
             "iterations_completed": iteration,
             "explorer": {
                 "insight_tree": self.insight_tree,
-                "active_branch_id": self.active_branch_id,
-                "dormant_branches": self.dormant_branches,
                 "question_pool": self.question_pool,
-                "root_node_id": self.root_node_id,
                 "research_model": self.research_model,
                 "seed_question": self.seed_question,
-                "current_phase": self.current_phase,
-                "phase_history": self.phase_history,
+                "commitment_history": self.commitment_history,
                 "model_impact_history": self.model_impact_history,
                 "evaluator_score_history": self.evaluator_score_history,
                 "biggest_gap_history": self.biggest_gap_history,
@@ -1674,17 +1702,20 @@ class AutoExplorer:
                 "node_counter": AutoExplorer._node_counter,
                 "data_profile": self.data_profile,
                 "last_review_iteration": self.last_review_iteration,
-                "strategic_commitment": self.strategic_commitment,
                 "strategic_next_direction": self.strategic_next_direction,
+                "current_arc_direction": self.current_arc_direction,
                 "last_probe_iteration": self.last_probe_iteration,
                 "probe_history": self.probe_history,
+                "completed_original_arcs": list(self.completed_original_arcs),
+                "rotation_history": self.rotation_history,
+                "arc_history": self.arc_history,
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
                 "all_questions": self.engine.message_manager.all_questions,
                 "full_results_store": self.engine.message_manager.full_results_store,
+                "error_patterns": self.engine.message_manager.error_patterns,
             },
-            "branch_endpoints": list(self.engine.branch_endpoints),
             "last_solution_chain": last_solution_chain,
             "last_follow_up_angle": last_follow_up_angle,
         }
@@ -1708,14 +1739,10 @@ class AutoExplorer:
         """Restore exploration state from a loaded checkpoint dict."""
         ex = state['explorer']
         self.insight_tree = ex['insight_tree']
-        self.active_branch_id = ex['active_branch_id']
-        self.dormant_branches = ex['dormant_branches']
         self.question_pool = ex['question_pool']
-        self.root_node_id = ex['root_node_id']
         self.research_model = ex['research_model']
         self.seed_question = ex.get('seed_question', '')
-        self.current_phase = ex['current_phase']
-        self.phase_history = [tuple(t) for t in ex['phase_history']]
+        self.commitment_history = ex.get('commitment_history', [])
         self.model_impact_history = ex['model_impact_history']
         self.evaluator_score_history = ex.get('evaluator_score_history', [])
         self.biggest_gap_history = ex.get('biggest_gap_history', [])
@@ -1724,152 +1751,25 @@ class AutoExplorer:
         self.data_profile = ex.get('data_profile', '')
         self.last_review_iteration = ex.get('last_review_iteration',
                                              ex.get('last_connection_iteration', 0))
-        self.strategic_commitment = ex.get('strategic_commitment', None)
         self.strategic_next_direction = ex.get('strategic_next_direction', '')
+        self.current_arc_direction = ex.get('current_arc_direction', '')
         self.last_probe_iteration = ex.get('last_probe_iteration', 0)
         self.probe_history = ex.get('probe_history', [])
+        self.completed_original_arcs = set(ex.get('completed_original_arcs', []))
+        self.rotation_history = ex.get('rotation_history', [])
+        self.arc_history = ex.get('arc_history', [])
         self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']
         self.engine.message_manager.qa_pairs = mm['qa_pairs']
         self.engine.message_manager.all_questions = mm['all_questions']
         self.engine.message_manager.full_results_store = mm['full_results_store']
-
-        self.engine.branch_endpoints = state.get('branch_endpoints', [])
-
-    def _build_exploration_trajectory(self):
-        """Build trajectory for synthesis."""
-        if not self.insight_tree:
-            return None
-
-        explored_nodes = sorted(
-            [
-                {
-                    'node_id': nid,
-                    'question': node['question'],
-                    'chain_id': node['chain_id'],
-                    'quality_score': node['quality_score'],
-                    'parent_id': node['parent_id'],
-                    'depth': node['depth'],
-                    'status': node['status'],
-                    'result_summary': node.get('result_summary', 'Results not available'),
-                }
-                for nid, node in self.insight_tree.items()
-                if node['status'] != 'abandoned'
-            ],
-            key=lambda n: n['chain_id'],
-        )
-
-        branches = []
-        for endpoint_chain in self.engine.branch_endpoints:
-            endpoint_node = None
-            for nid, node in self.insight_tree.items():
-                if node['chain_id'] == endpoint_chain:
-                    endpoint_node = nid
-                    break
-            if endpoint_node is None:
-                continue
-            path = []
-            current = endpoint_node
-            while current is not None:
-                if current in self.insight_tree:
-                    path.append(current)
-                    current = self.insight_tree[current]['parent_id']
-                else:
-                    break
-            path.reverse()
-            branches.append({
-                'endpoint_chain_id': endpoint_chain,
-                'node_ids': path,
-            })
-
-        return {
-            'nodes': explored_nodes,
-            'branches': branches,
-            'branch_endpoints': list(self.engine.branch_endpoints),
-            'research_model': self.research_model,
-            'phase_history': self.phase_history,
-        }
+        self.engine.message_manager.error_patterns = mm.get('error_patterns', [])
 
 
 # ══════════════════════════════════════════════════
 # MODULE-LEVEL FUNCTIONS
 # ══════════════════════════════════════════════════
-
-def format_trajectory_for_synthesis(trajectory, full_results_store=None,
-                                    selected_chain_id=None, max_nodes=40):
-    """Format exploration trajectory for synthesis. Score-weighted node selection."""
-    if not trajectory or not trajectory['nodes']:
-        return "No exploration data available."
-
-    nodes = trajectory['nodes']
-    if selected_chain_id:
-        nodes = [n for n in nodes if n['chain_id'] <= int(selected_chain_id)]
-
-    if not nodes:
-        return "No exploration data available for this point."
-
-    # Score-weighted selection: blend top-scoring with recent
-    if len(nodes) > max_nodes:
-        recent_count = min(15, max_nodes // 3)
-        recent_nodes = nodes[-recent_count:]
-        recent_chain_ids = {n['chain_id'] for n in recent_nodes}
-
-        remaining = [n for n in nodes if n['chain_id'] not in recent_chain_ids]
-        remaining.sort(key=lambda n: n['quality_score'], reverse=True)
-        top_scoring = remaining[:max_nodes - recent_count]
-
-        nodes = sorted(recent_nodes + top_scoring, key=lambda n: n['chain_id'])
-
-    full_results_store = full_results_store or {}
-    parts = []
-
-    filtered_node_ids = {n['node_id'] for n in nodes}
-    relevant_branches = [
-        b for b in trajectory['branches']
-        if any(nid in filtered_node_ids for nid in b['node_ids'])
-    ]
-    parts.append(f"**Exploration Overview:** {len(nodes)} analyses across {len(relevant_branches)} branch(es)\n")
-
-    if trajectory['phase_history']:
-        transitions = [f"{old}→{new} (iter {i})" for i, old, new in trajectory['phase_history']]
-        parts.append(f"**Phase transitions:** {' | '.join(transitions)}\n")
-
-    node_branches = {}
-    for b_idx, branch in enumerate(relevant_branches, 1):
-        for nid in branch['node_ids']:
-            if nid not in node_branches:
-                node_branches[nid] = []
-            node_branches[nid].append(b_idx)
-    node_to_branch = {}
-    for nid, branches in node_branches.items():
-        node_to_branch[nid] = "Shared" if len(branches) > 1 else f"Branch {branches[0]}"
-
-    parts.append("**Complete Analysis History:**\n")
-
-    for i, node in enumerate(nodes, 1):
-        branch_label = node_to_branch.get(node['node_id'], "Shared")
-        status_label = f" [{node['status'].upper()}]" if node['status'] in ('dormant', 'runner_up') else ""
-
-        chain_key = str(node['chain_id'])
-        result_text = full_results_store.get(chain_key, node.get('result_summary', 'Results not available'))
-
-        if len(result_text) > 3000:
-            result_text = result_text[:1500] + "\n[...]\n" + result_text[-1500:]
-
-        parts.append(
-            f"{i}. [{branch_label}]{status_label} Task: {node['question']}\n"
-            f"   Reference: [[{node['chain_id']}]]\n"
-            f"   Score: {node['quality_score']}/10\n"
-            f"   Result:\n{result_text}\n"
-            f"{'─' * 5}"
-        )
-
-    if trajectory['research_model']:
-        parts.append(f"\n**Final Research Model:**\n{trajectory['research_model']}")
-
-    return '\n'.join(parts)
-
 
 def format_synthesis_input(insight_tree, full_results_store, research_model,
                            seed_question, data_profile=''):

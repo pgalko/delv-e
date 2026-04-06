@@ -228,6 +228,7 @@ class OllamaProvider:
             max_tokens=max_tokens,
             temperature=temperature,
             stream=True,
+            stream_options={"include_usage": True},
         )
         for chunk in stream:
             if chunk.usage:

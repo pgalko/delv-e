@@ -145,9 +145,10 @@ class CodeExecutor:
             filtered_parts.append(line)
         
         result = '\n'.join(filtered_parts)
-        # Truncate very long tracebacks
+        # Truncate very long tracebacks, but always preserve the final exception line
         if len(result) > 1500:
-            result = result[:1500] + "\n[...truncated]"
+            last_line = result.rstrip().rsplit('\n', 1)[-1]
+            result = result[:1400] + "\n[...truncated]\n" + last_line
         return result
 
 

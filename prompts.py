@@ -3,7 +3,7 @@ Prompt templates for delv-e.
 
 Architecture:
   - Lean, task-specific agent prompts (no repeated preamble)
-  - Finding Completeness: maturity tracking in Research Model guides PURSUING depth
+  - Finding Completeness: maturity tracking in Research Model guides investigation depth
   - Strategic Review: premium model runs every iteration to maintain strategic coherence,
     enforce commitments, detect missed opportunities, and surface untested connections
   - Code prompts: rules in system prompt only; user/error inherit
@@ -15,7 +15,8 @@ Templates accessed by auto_explore.py:
   - research_model_updater
   - seed_decomposition            ← premium model: focused first question + initial trajectory
   - strategic_review              ← premium model: commitment, trajectory, missed opportunities
-  - reframing_probe               ← premium model: full-results review on thread abandonment
+  - reframing_probe               ← premium model: full-results review when arc needs fresh angle
+  - perspective_rotation           ← premium model: alternative lenses on completed arcs
   - exploration_synthesis
 
 Templates used by the engine:
@@ -33,7 +34,7 @@ class PromptManager:
     # ══════════════════════════════════════════════════
     # FINDING MATURITY TEMPLATE
     # Referenced by research_model_updater, evaluator,
-    # and question generator during PURSUING phase.
+    # and question generator.
     # ══════════════════════════════════════════════════
 
     _MATURITY_STAGES = """Finding maturity stages (each finding progresses through these):
@@ -53,26 +54,26 @@ contradicted at any stage, drop or downgrade it rather than forcing it through r
 
     ideas_explorer_auto = """You are generating analytical questions for a data exploration system.
 
-**CURRENT PHASE: {current_phase}**
-{phase_instruction}
-
-{strategic_direction}
+{commitment_instruction}
 
 Consult the **Strategic Trajectory** section in the Research Model for the current
 commitment and planned investigation sequence. All questions should align with the
 CURRENT COMMITMENT stated there.
 
 If the Exploration Health section shows breadth as LOW, at least 3 of your 5 questions
-MUST target unexplored territory — regardless of phase.
+MUST target unexplored territory.
 
-**When PURSUING:** All 5 questions must target THE SAME finding. Consult Finding Maturity
-to identify the least-mature significant finding, then generate 5 different ways to
-advance it to its next stage:
+**When the commitment is HOLD on a specific finding:** All 5 questions must target
+THE SAME finding. Consult Finding Maturity to identify the least-mature significant
+finding, then generate 5 different ways to advance it to its next stage:
   DETECTED → quantify (rate, magnitude, significance)
   QUANTIFIED → decompose (subgroups, percentiles, distribution cuts)
   DECOMPOSED → regime-test (split at temporal breakpoints, rolling windows)
   REGIME-TESTED → connect (test interaction with other established findings)
-Do NOT split questions across different findings during PURSUING.
+Do NOT split questions across different findings when holding.
+
+**When pivoting to new territory:** Generate diverse questions that survey different
+aspects of the new direction. Cover multiple angles and variables.
 
 **Requirements:**
 1. Answerable by executing code against the available data
@@ -111,7 +112,7 @@ Score results, select the best, and guide the exploration's direction.
 
 {solutions_block}
 
-═══ TASK 1: SCORE AND SELECT ═══
+═══ TASK: SCORE AND SELECT ═══
 
 Rate each solution 1-10:
 - 8-10: Genuine discovery — changes understanding, opens new territory
@@ -120,38 +121,17 @@ Rate each solution 1-10:
 - 1-2: Failed or no new information
 
 Confirming what the research model already states is 3-4 at best.
-
-═══ TASK 2: RECOMMEND PHASE ═══
-
-**MAPPING** when:
-- Exploration Health shows LOW breadth
-- Current thread is confirmed with no open questions
-- Recent scores declining (5-6) — thread exhausted
-- Large dataset territory untouched
-
-**PURSUING** when:
-- Latest result genuinely changed understanding (not just added precision)
-- A surprising finding needs verification
-- Thread producing 8+ scores and still changing the narrative
-- A finding in the Finding Maturity section has not yet reached DECOMPOSED —
-  it needs more depth before the system moves on
-
-Key test: would the thread's conclusions change if the last 3 analyses hadn't
-been done? If not, the thread is exhausted — recommend MAPPING.
-Exception: if the Finding Maturity section shows an active finding below
-DECOMPOSED, recommend PURSUING even if recent scores are moderate — the
-finding needs its analytical arc completed.
+Diminishing returns: if the Research Model already has high confidence on
+the topic and Finding Maturity shows DECOMPOSED or beyond, score for
+novelty — precision refinements on exhausted arcs are LOW value.
 
 ═══ RESPONSE FORMAT (strict) ═══
 
 SCORES: [comma-separated scores 1-10 for each solution]
-SUMMARIES: [one-sentence summary per solution, separated by |, max 150 chars each]
+SUMMARIES: [one-to-two sentence summary per solution, separated by |]
 SELECTED: [solution number with highest analytical value]
-KEEP_DORMANT: [solution number(s) worth revisiting later (score 6+), or NONE]
 REASON: [One sentence — why the selected solution is most valuable]
-FOLLOW_UP_ANGLE: [Most promising specific direction for next iteration]
-PHASE: [MAPPING / PURSUING]
-PHASE_REASONING: [One sentence — why this phase fits breadth, trajectory, AND finding maturity]"""
+FOLLOW_UP_ANGLE: [Most promising specific direction for next iteration]"""
 
 
     research_model_updater = """You are the Research Interpreter for a data exploration system.
@@ -160,6 +140,9 @@ Maintain a living research model and monitor the exploration's health.
 ═══ CONTEXT ═══
 
 **Original question:** {seed_question}
+
+**Available columns (for Exploration Health cross-reference):**
+{column_list}
 
 **Current Research Model:**
 {current_model}
@@ -183,10 +166,12 @@ If score ≤5, impact should be LOW unless it contradicts an existing finding.
 Back-to-back refinements of the same claim are LOW regardless of score.
 
 CONTRADICTION: [YES / NO]
-YES only if the result DIRECTLY REVERSES a claimed relationship direction.
+YES if the result DIRECTLY REVERSES a claimed relationship direction, OR if the
+proposed explanation for a finding invokes a mechanism that Established Findings
+show to be non-significant or absent. Check before accepting any causal claim.
 
-THREAD_COMPLETED: [YES / NO]
-YES if further investigation would yield diminishing returns.
+ARC_EXHAUSTED: [YES / NO]
+YES if further investigation of the current arc would yield diminishing returns.
 A finding is NOT complete until checked against alternative outcome measures
 (if available) and tested for confounding by group membership.
 
@@ -198,7 +183,7 @@ if the evidence covers them (e.g., a subgroup analysis that also reveals a break
 RESULT_DIGEST: [3-5 lines — the key numbers that matter for ongoing analysis]
 
 METHOD_USED: [One phrase describing the analytical technique — e.g. "rolling correlation
-by decade", "logistic regression with interaction term", "binned comparison pre/post 2000".
+by decade", "logistic regression with interaction term", "binned comparison pre/post breakpoint".
 This helps the strategic reviewer detect methodological monoculture.]
 
 ═══ TASK 2: UPDATE THE RESEARCH MODEL ═══
@@ -213,7 +198,7 @@ Format: - [H#] claim | Confidence: low/medium/high | Evidence: brief
 ## Established Findings
 Confirmed discoveries. Max 10 bullet points, each with at least one key number.
 When near the limit, consolidate related findings. Do not drop findings that
-active hypotheses, threads, or maturity tracking depend on.
+active hypotheses or maturity tracking depend on.
 Do not duplicate facts already in the data profile.
 
 ## Finding Maturity
@@ -234,11 +219,7 @@ Rules:
 - If contradicted, remove the finding from tracking (note in Attention Flags).
 - Max 5 tracked findings. Graduate COMPLETE findings out of tracking.
 - The "Next" field must be a SPECIFIC analytical step, not vague (e.g.,
-  "test across pre/post 2000 split" not "investigate further").
-
-## Threads
-Active lines of inquiry. Max 3, each with max 2 open questions.
-Format: - thread name | Completeness: low/medium/high | Open: question 1; question 2
+  "test across pre/post breakpoint split" not "investigate further").
 
 ## Cross-Finding Connections
 Record tested and untested connections between established findings.
@@ -262,9 +243,9 @@ If unchanged from last update: "NOTE: This gap has persisted — consider pivoti
 ## Exploration Health
 - Topics investigated: [count + 10 most recent. Variations on same variable = ONE topic.]
 - Recent focus: [Last 5-8 analyses. Count how many of last 8 share a theme.]
-- Unexplored territory: [Name specific COLUMNS or VARIABLE GROUPS from the data profile
-  that have not been analysed. Do not list data that doesn't exist in the dataset.
-  Cross-reference against the data profile to identify untouched columns.]
+- Unexplored territory: [Name specific COLUMNS or VARIABLE GROUPS from the Available
+  columns list above that have not been analysed. Do not list data that doesn't exist
+  in the dataset. Cross-reference against the column list to identify untouched columns.]
 - Breadth: [LOW / MEDIUM / HIGH]
   LOW = 5+ of last 8 share a theme AND scores declining or territory untouched.
   MEDIUM = 3-4 themes in last 8, moderate unexplored territory.
@@ -293,7 +274,7 @@ Rules:
 **Research Model:**
 {research_model}
 
-**Current Phase: {current_phase}**
+{commitment_context}
 
 **Available questions:**
 {questions}
@@ -302,10 +283,9 @@ Rules:
 **Selection principles:**
 1. If Exploration Health shows LOW breadth, prioritise new territory over refinement.
 2. Prefer questions where a surprising answer would most change the research model.
-3. Phase alignment: MAPPING → new dimensions; PURSUING → deepen the strongest lead.
-4. If Finding Maturity shows a finding below DECOMPOSED, prefer questions that advance it.
-5. During PURSUING, all selected questions must target the same finding — do not split
-   parallel slots across unrelated threads.
+3. If pivoting to new territory, prefer breadth and diversity across selected questions.
+4. If holding on a finding, prefer depth — all selected questions should target that finding.
+5. If Finding Maturity shows a finding below DECOMPOSED, prefer questions that advance it.
 6. Avoid questions similar to low-scoring past attempts.
 
 Select exactly {num_to_select} questions. Respond with ONLY the question numbers,
@@ -330,8 +310,8 @@ is to decompose it into a focused first analysis and a strategic plan.
 
 **Iteration Budget:** {max_iterations} iterations available.
 Each iteration produces 2 parallel analyses, so plan for ~{max_iterations} analytical steps total.
-Scale the plan accordingly — a 10-iteration run should focus on 2-3 core threads,
-a 50+ iteration run can afford deeper investigation and more threads.
+Scale the plan accordingly — a 10-iteration run should focus on 2-3 core arcs,
+a 50+ iteration run can afford deeper investigation and more arcs.
 
 ═══ TASK 1: FIRST ANALYSIS ═══
 
@@ -351,17 +331,21 @@ Rules:
 
 Decompose the full research agenda into a logical sequence of investigation arcs.
 Order them by dependency — what needs to be established before what can be tested.
+After 1-2 baseline iterations at the aggregate level, prioritise fine-grained
+analysis (e.g., daily rows, individual records) over aggregate-level index or
+category analyses — fine-grained data typically has 50-100x more statistical power
+and reveals mechanisms invisible at the aggregate level.
 
-IMPORTANT: Plan a brief initial MAPPING phase (5-8 iterations) to establish core
-baselines, then expect the strategic review to INTERLEAVE mapping and pursuing.
-Each arc should take 3-5 iterations of mapping followed by 2-3 iterations of
-pursuing the best discovery from that arc. Do NOT plan all mapping upfront
+IMPORTANT: Plan a brief initial survey (5-8 iterations) to establish core
+baselines, then expect the strategic review to interleave survey and deep pursuit.
+Each arc should take 3-5 iterations of survey followed by 2-3 iterations of
+pursuing the best discovery from that arc. Do NOT plan all survey iterations upfront
 as one long block. The strategic review will adapt the plan based on what the
 exploration actually discovers.
 
 Structure:
-- FULL AGENDA: [one-line summary of each thread in the research agenda]
-- CURRENT COMMITMENT: MAPPING — [what the first 5-8 iterations should establish]
+- FULL AGENDA: [one-line summary of each topic in the research agenda]
+- CURRENT COMMITMENT: HOLD — initial survey of [what the first 5-8 iterations should establish]
 - NEXT AFTER COMMITMENT: [what to pursue once initial baselines are established]
 
 ═══ RESPONSE FORMAT (strict) ═══
@@ -417,6 +401,12 @@ Instead:
 Do NOT spend remaining iterations on report writing, summary tables, or narrative
 synthesis. These are handled by a dedicated synthesis agent after exploration ends.
 
+BUDGET PLANNING: When you set ARC_COMPLETE: YES, the system automatically pursues
+one alternative analytical perspective for 1-2 iterations before moving to the next
+arc. Budget accordingly: each arc completion adds ~2 perspective iterations.
+Plan your trajectory with {remaining_iterations} iterations left and N arcs remaining,
+budget roughly N × (arc iterations + 2 perspective) to ensure coverage.
+
 HOLD when:
 - The pursued finding is advancing in maturity (scores stable or improving)
 - The finding has not yet reached DECOMPOSED — it needs more depth
@@ -424,47 +414,37 @@ HOLD when:
   (moderate scores during deep pursuit are EXPECTED — this is NOT exhaustion)
 
 PIVOT when:
-- A clearly higher-value thread has emerged from recent results
-- The current thread has stalled: 3+ iterations with no maturity advance AND
+- A clearly higher-value arc has emerged from recent results
+- The current arc has stalled: 3+ iterations with no maturity advance AND
   the finding is already at DECOMPOSED or beyond
 - A surprise finding (score 8+) opens a more important direction
+- An analysis required subgroups with n<5 and produced a null — one null is
+  enough when the data cannot support the test. Check the data profile
 
 ABANDON when:
 - The pursued finding has been directly contradicted
-- Results show the data cannot support further investigation of this thread
-- The thread has reached COMPLETE
+- Results show the data cannot support further investigation of this arc
+- The arc has reached COMPLETE
 
 On PIVOT or ABANDON, you MUST provide a NEXT_DIRECTION — a specific framing for the
-next thread of exploration. Name the variables, the analytical question, and WHY this
+next arc of exploration. Name the variables, the analytical question, and WHY this
 direction has high expected value. The question generator will use this as its primary
 constraint.
 
-PHASE rule:
-- PURSUING = go deep on a specific finding (all questions target the same thread)
-- MAPPING = go broad across unexplored territory
-
 TRAJECTORY AWARENESS:
-The initial trajectory is a PLAN, not a binding contract. When a MAPPING iteration
+The initial trajectory is a PLAN, not a binding contract. When a HOLD iteration
 produces a high-value discovery (score 8+ with clear operational significance), you
-should switch to PURSUING for 2-3 iterations to deepen it before returning to the
-next incomplete arc. The trajectory records which arcs are complete and which remain.
-After a brief PURSUING detour, return to the next incomplete arc in the trajectory.
+should maintain HOLD for 2-3 iterations to deepen it before moving on.
 
-Do NOT stay in MAPPING for 15+ consecutive iterations just because the trajectory
-planned a long mapping phase. Interleave: map a topic, pursue its best finding for
-2-3 iterations, return to mapping. This produces findings at DECOMPOSED maturity
-rather than leaving every topic at DETECTED.
-
-Conversely, do NOT abandon the trajectory for extended PURSUING. If a PURSUING
-detour exceeds 4 iterations without the finding reaching DECOMPOSED, return to
-MAPPING. The trajectory's incomplete arcs represent genuine analytical territory
-that must eventually be covered.
+When holding on a finding, do NOT hold for more than 4 iterations without the finding
+reaching DECOMPOSED. The trajectory's incomplete arcs represent genuine analytical
+territory that must eventually be covered.
 
 ═══ TASK 2: MISSED OPPORTUNITIES ═══
 
 Scan the Exploration Health section and the data profile. Name any specific
 unexplored angles the smaller models appear to be overlooking — columns,
-variable groups, or analytical techniques not yet tried on promising threads.
+variable groups, or analytical techniques not yet tried on promising arcs.
 If the recent iterations show methodological monoculture (same technique
 repeated), name a specific alternative technique.
 
@@ -478,7 +458,7 @@ memory — it records WHY pivots happened and WHAT the current commitment is.
 Structure:
 - 1-2 lines per completed arc (iterations N-M: what was pursued, what was found,
   why the system moved on)
-- CURRENT COMMITMENT: [phase] on [thread] because [reason]
+- CURRENT COMMITMENT: [HOLD/PIVOT/ABANDON] on [arc] because [reason]
 - NEXT AFTER COMMITMENT: [direction with highest expected value]
   If untested cross-finding connections exist and would have high analytical value,
   name the most important one here. Connection testing is a valid next direction.
@@ -486,21 +466,26 @@ Structure:
 ═══ RESPONSE FORMAT (strict) ═══
 
 COMMITMENT: [HOLD / PIVOT / ABANDON] — [one sentence reason]
-PHASE: [MAPPING / PURSUING]
-NEXT_DIRECTION: [specific framing for next thread, or UNCHANGED if HOLD]
+NEXT_DIRECTION: [specific framing for next arc, or UNCHANGED if HOLD]
 PROBE_NEEDED: [YES / NO] — YES when the raw analytical output deserves a second
   look from a different angle. This includes:
   (a) A null result that seems suspicious given the broader investigation narrative
   (b) A positive finding where you can name a SPECIFIC distributional feature,
       threshold, or decomposition that the current analysis likely missed
       (e.g., "the outcome-predictor scatter probably saturates above a threshold"
-      or "the seasonal variance likely differs between eras")
-  (c) A thread completing where you can identify a SPECIFIC derived metric that
+      or "the variance likely differs between the first and second half of the series")
+  (c) An arc completing where you can identify a SPECIFIC derived metric that
       would be more operationally useful than what was tested
   Say NO for routine completions where the finding is clean and fully captured,
   and NO when you have only a vague sense that "this could be sharper" without
   a concrete alternative in mind. Most iterations should be NO.
   Expect YES roughly 5-8 times per 100 iterations.
+ARC_COMPLETE: [YES / NO] — Only on ABANDON. YES when this arc produced established
+  findings and reached a genuine conclusion. NO when abandoning due to contradiction,
+  insufficient data, or failure. When YES, the system will automatically generate and
+  pursue an alternative analytical perspective for 1-2 iterations before moving to the
+  next arc. Account for this in your budget planning: each arc completion adds ~2
+  perspective iterations.
 MISSED: [specific missed opportunities or untested connections, or NONE]
 UPDATED_TRAJECTORY:
 [full rewrite of Strategic Trajectory section]
@@ -520,13 +505,13 @@ numbers could reveal something the standard analysis missed.
 
 Your job is NOT to rerun the analyses. It is to READ THE ACTUAL NUMBERS below and
 notice what the headline statistics missed: distributional shifts, variance changes,
-threshold effects, saturation patterns, era differences, outlier clustering, or any
+threshold effects, saturation patterns, period-to-period differences, outlier clustering, or any
 pattern that suggests an alternative framing would produce a sharper or more
 operationally useful finding.
 
 **Original research agenda:** {seed_question}
 
-**Current thread:** {thread_summary}
+**Current arc:** {arc_summary}
 
 **Why a fresh look matters here:** {why_it_matters}
 
@@ -540,16 +525,16 @@ Read the numbers above carefully. Then answer three questions:
 
 1. HIDDEN PATTERN: What pattern, threshold, regime change, or distributional feature
    in these numbers does the headline test NOT capture? Look for: variance changes
-   across eras, saturation/threshold effects in scatter relationships, clustering of
+   across time periods, saturation/threshold effects in scatter relationships, clustering of
    outliers in specific conditions, changes in distribution shape even if the mean
-   is stable, decompositions (e.g., counting days above/below a threshold vs
+   is stable, decompositions (e.g., counting observations above/below a threshold vs
    testing a continuous mean), or operational thresholds where a relationship
    changes character (e.g., an outcome variable flattening above a predictor threshold).
 
 2. ALTERNATIVE FRAMING: What specific metric, decomposition, or analytical approach
    would produce a sharper or more operationally useful finding than what the
    standard tests captured? Define the metric precisely enough that a code generator
-   can implement it (e.g., "count the number of days per season where [metric] exceeds
+   can implement it (e.g., "count the number of observations per period where [metric] exceeds
    [threshold] and test this count as a predictor of [outcome]").
 
 3. NEXT QUESTION: Write one specific analytical question that the code generator
@@ -563,6 +548,90 @@ all three fields. Do not force a finding.
 HIDDEN_PATTERN: [what you noticed in the raw numbers, or NONE]
 ALTERNATIVE_FRAMING: [the specific metric/approach, or NONE]
 REFRAMING_DIRECTION: [the analytical question to pursue, or NONE]"""
+
+
+    # ══════════════════════════════════════════════════
+    # PERSPECTIVE ROTATION (premium model)
+    # Fires when an original arc completes. Generates
+    # alternative analytical lenses on the same phenomenon.
+    # Does NOT fire on perspective arcs (no recursion).
+    # ══════════════════════════════════════════════════
+
+    perspective_rotation = """You are reviewing a completed investigation arc from an autonomous
+data exploration. The arc approached its topic through one analytical lens and reached
+a conclusion. Your job is to identify fundamentally DIFFERENT analytical perspectives
+on the same phenomenon that the original approach did not take.
+
+This is NOT about going deeper with the same approach. It is about asking different
+KINDS of questions about the same subject.
+
+Example of what this means:
+- Original arc investigated "what factors cause outcome Y to decline" (mechanistic perspective)
+- A different perspective: "how frequently do positive vs negative outcome events occur,
+  regardless of cause?" (event counting perspective)
+- Another: "has the system's capacity to convert input X into outcome Y changed?"
+  (efficiency perspective)
+- Another: "what distinguishes cases where identical inputs produced very different
+  outcomes?" (residual analysis perspective)
+
+Each perspective leads to different metrics, different analytical questions, and
+potentially different conclusions about the same underlying phenomenon.
+
+**Original research agenda:** {seed_question}
+
+**Completed arc:** {arc_name}
+**Methods used in this arc:** {arc_methods}
+**Key findings from this arc (these define the frame you must ESCAPE, not extend):** {arc_findings}
+
+**Dataset columns available:** {available_columns}
+
+**Previously selected perspectives (DO NOT regenerate these):** {previously_selected}
+
+═══ YOUR TASK ═══
+
+Propose 2-3 fundamentally different analytical perspectives on the same phenomenon
+this arc investigated. For each:
+
+1. Name the perspective in 2-4 words
+2. Explain in one sentence how it differs from the original approach
+3. Propose one specific analytical question a code generator could tackle
+
+DIFFERENTIATION TEST — apply to each perspective before including it:
+Describe the completed arc as "[OUTCOME] measured as a function of [PREDICTORS]
+using [METHOD]." Your perspective must change the OUTCOME or the METHOD. Changing
+only the predictors while keeping the same outcome and method is NOT a different
+perspective. Examples of genuine changes:
+- Continuous outcome → count events above/below a threshold
+- Regression on predictors → ratio between opposing event types
+- Individual observations → classify into types, track type frequency over time
+- Complex model → simple derived metric (a count, a ratio, a rate)
+
+Rules:
+- Each perspective must use columns available in the dataset
+- Prefer perspectives that produce simple, trackable metrics
+  (counts, ratios, thresholds) over complex model-based approaches
+- Do NOT regenerate perspectives listed in "Previously selected" above,
+  or close variants with different names but the same analytical approach
+- Rank from most to least promising — PERSPECTIVE_1 should be the one
+  most likely to produce a finding the original arc missed
+- If the arc's findings are self-contained and no meaningful alternative
+  perspective exists (or all good perspectives have already been used), say NONE
+
+═══ RESPONSE FORMAT ═══
+
+PERSPECTIVE_1: [2-4 word name]
+DIFFERS: [one sentence]
+QUESTION: [specific analytical question]
+
+PERSPECTIVE_2: [2-4 word name]
+DIFFERS: [one sentence]
+QUESTION: [specific analytical question]
+
+PERSPECTIVE_3: [2-4 word name]
+DIFFERS: [one sentence]
+QUESTION: [specific analytical question]
+
+Or: NONE"""
 
 
     # ══════════════════════════════════════════════════
@@ -716,7 +785,7 @@ DISTRIBUTIONAL DETAIL (important for downstream analysis):
 - When comparing groups, report the full distribution (mean, std, min, max, n)
   for each group, not just means or effect sizes.
 - When testing a relationship (correlation, regression), also report
-  top-3 and bottom-3 values with their identifiers (year, season, condition).
+  top-3 and bottom-3 values with their identifiers (e.g., row index, date, group label).
 
 Return ONLY code within ```python``` blocks."""
 
@@ -725,6 +794,8 @@ Return ONLY code within ```python``` blocks."""
 
 Previous findings from this exploration:
 {qa_pairs}
+
+{error_patterns}
 
 Task: {question}
 
@@ -803,8 +874,8 @@ ANALYSIS DIMENSIONS (adapt to dataset — skip sections that don't apply):
    → Identify DERIVABLE variables not present in the data but computable: day-over-day
    differences, ratios, rolling averages, cumulative sums. Name the source columns and
    what the derived variable would represent analytically.
-   → Flag circular variables (e.g., wind direction in degrees) that need special handling:
-   "bin by quadrant, do not use linear regression or Pearson correlation."
+   → Flag circular variables (e.g., compass bearings in degrees, time of day) that need
+   special handling: "bin into categories, do not use linear regression or Pearson correlation."
 
 6. POWER BOUNDARIES: Based on the group sizes above, state what depth of analysis is
    feasible. Name specific feasible comparisons and specific infeasible ones.

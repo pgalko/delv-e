@@ -50,53 +50,64 @@ def _extract_data(explorer, engine, iteration, max_iterations):
             'score': node.get('quality_score', 0),
             'status': node.get('status', ''),
             'summary': node.get('finding_summary', ''),
-            'iteration': node.get('iteration_added', 0),
+            'iteration': node.get('iteration_added'),
         })
     nodes.sort(key=lambda x: x['counter'])
 
-    # Group by actual iteration (handles variable node counts)
+    # Group by actual iteration if available, otherwise fall back to pairs
     from collections import defaultdict
-    iter_groups = defaultdict(list)
-    for n in nodes:
-        iter_groups[n['iteration']].append(n)
+    has_iteration_data = any(n['iteration'] is not None for n in nodes)
 
     iter_data = []
-    for it_num in sorted(iter_groups.keys()):
-        group = iter_groups[it_num]
-        winner = max(group, key=lambda x: x['score'])
-        loser = min(group, key=lambda x: x['score']) if len(group) > 1 else winner
-        iter_data.append({
-            'winner_score': winner['score'],
-            'loser_score': loser['score'],
-            'summary': winner['summary'][:140],
-        })
+    if has_iteration_data:
+        iter_groups = defaultdict(list)
+        for n in nodes:
+            iter_groups[n['iteration'] or 0].append(n)
+        for it_num in sorted(iter_groups.keys()):
+            group = iter_groups[it_num]
+            winner = max(group, key=lambda x: x['score'])
+            loser = min(group, key=lambda x: x['score']) if len(group) > 1 else winner
+            iter_data.append({
+                'winner_score': winner['score'],
+                'loser_score': loser['score'],
+                'summary': winner['summary'][:140],
+            })
+    else:
+        # Fallback: pair by counter order
+        num_parallel = 2
+        for i in range(0, len(nodes), num_parallel):
+            pair = nodes[i:i + num_parallel]
+            winner = max(pair, key=lambda x: x['score'])
+            loser = min(pair, key=lambda x: x['score']) if len(pair) > 1 else winner
+            iter_data.append({
+                'winner_score': winner['score'],
+                'loser_score': loser['score'],
+                'summary': winner['summary'][:140],
+            })
 
     winner_scores = [d['winner_score'] for d in iter_data]
     loser_scores = [d['loser_score'] for d in iter_data]
 
-    # --- Phase map ---
-    phase_at = {}
-    current_phase = 'MAPPING'
-    transitions = {p[0]: p[2] for p in explorer.phase_history}
-    for i in range(1, iteration + 1):
-        if i in transitions:
-            current_phase = transitions[i]
-        phase_at[i] = current_phase
+    # --- Commitment map (from strategic review history) ---
+    commitment_at = {}
+    commitment_history = getattr(explorer, 'commitment_history', [])
+    for it, action in commitment_history:
+        commitment_at[it + 1] = action  # commitment at iteration N governs iteration N+1
 
-    # Pursuing bands
-    pursuing_bands = []
+    # Hold bands (contiguous HOLD sequences — analogous to old PURSUING bands)
+    hold_bands = []
     band_start = None
     for i in range(1, iteration + 1):
-        if phase_at.get(i) == 'PURSUING' and band_start is None:
+        if commitment_at.get(i) == 'HOLD' and band_start is None:
             band_start = i
-        if phase_at.get(i) != 'PURSUING' and band_start is not None:
-            pursuing_bands.append([band_start, i - 1])
+        if commitment_at.get(i) != 'HOLD' and band_start is not None:
+            hold_bands.append([band_start, i - 1])
             band_start = None
     if band_start is not None:
-        pursuing_bands.append([band_start, iteration])
+        hold_bands.append([band_start, iteration])
 
-    # --- Phase transition iterations (strategic inflection points) ---
-    transition_iters = [t[0] + 1 for t in explorer.phase_history] if explorer.phase_history else []
+    # --- Pivot/abandon iterations (strategic inflection points) ---
+    pivot_iters = [it + 1 for it, action in commitment_history if action in ('PIVOT', 'ABANDON')]
 
     # --- Parse research model ---
     rm = explorer.research_model or ''
@@ -150,6 +161,21 @@ def _extract_data(explorer, engine, iteration, max_iterations):
     # --- Status ---
     is_complete = iteration >= max_iterations
 
+    # --- Heatmap: derive arc spans from arc_history ---
+    arc_history = getattr(explorer, 'arc_history', [])
+    heatmap_arcs = []
+    for idx, (start_iter, label) in enumerate(arc_history):
+        end_iter = arc_history[idx + 1][0] - 1 if idx + 1 < len(arc_history) else iteration
+        iters = list(range(start_iter, end_iter + 1))
+        if iters:
+            heatmap_arcs.append({'name': label, 'iters': iters})
+
+    # Probe iterations
+    probe_iters = {pit: pr[:80] for pit, pr in getattr(explorer, 'probe_history', [])}
+
+    # Rotation iterations
+    rot_iters = {it for it, _, _ in getattr(explorer, 'rotation_history', [])}
+
     return {
         'iteration': iteration,
         'max_iterations': max_iterations,
@@ -157,9 +183,9 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'winner_scores': winner_scores,
         'loser_scores': loser_scores,
         'iter_data': iter_data,
-        'phase_at': phase_at,
-        'pursuing_bands': pursuing_bands,
-        'transition_iters': transition_iters,
+        'commitment_at': commitment_at,
+        'hold_bands': hold_bands,
+        'pivot_iters': pivot_iters,
         'established': established,
         'connections': connections,
         'confirmed_connections': confirmed,
@@ -167,9 +193,7 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'breadth': breadth,
         'topics': topics,
         'biggest_gap': biggest_gap,
-        'current_phase': explorer.current_phase,
-        'phase_transitions': len(explorer.phase_history),
-        'stagnation_count': explorer.stagnation_count,
+        'n_arcs': len(heatmap_arcs),
         'agent_counts': agent_counts,
         'total_cost': total_cost,
         'total_calls': total_calls,
@@ -181,6 +205,10 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'mean_score': mean_score,
         'significant': significant,
         'probe_history': getattr(explorer, 'probe_history', []),
+        'rotation_history': getattr(explorer, 'rotation_history', []),
+        'heatmap_arcs': heatmap_arcs,
+        'probe_iters': probe_iters,
+        'rot_iters': rot_iters,
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -271,7 +299,7 @@ def _render_html(d):
     agent_order = [
         'Code Generator', 'Question Generator', 'Research Interpreter',
         'Result Evaluator', 'Question Selector', 'Error Corrector',
-        'Strategic Review', 'Reframing Probe', 'Seed Decomposition', 'Synthesis Generator'
+        'Strategic Review', 'Reframing Probe', 'Perspective Rotation', 'Seed Decomposition', 'Synthesis Generator'
     ]
     max_calls = max(d['agent_counts'].values()) if d['agent_counts'] else 1
     agent_html = ''
@@ -281,7 +309,7 @@ def _render_html(d):
             continue
         pct = round(count / max_calls * 100)
         label = agent.lower().replace('_', ' ')
-        is_premium = agent in ('Strategic Review', 'Reframing Probe', 'Seed Decomposition', 'Synthesis Generator')
+        is_premium = agent in ('Strategic Review', 'Reframing Probe', 'Perspective Rotation', 'Seed Decomposition', 'Synthesis Generator')
         bar_color = 'var(--purple)' if is_premium else ('var(--amber)' if agent == 'Error Corrector' else 'var(--blue)')
         premium_tag = ' <span style="font-weight: 400; color: var(--fg3);">premium</span>' if is_premium else ''
         agent_html += f'''
@@ -320,8 +348,85 @@ def _render_html(d):
     </div>
   </div>'''
 
-    # Phase pill
-    phase_class = 'phase-pursuing' if d['current_phase'] == 'PURSUING' else 'phase-mapping'
+    # Rotation history HTML
+    rotation_html = ''
+    if d['rotation_history']:
+        rotation_items = ''
+        for it, parent, perspectives in d['rotation_history']:
+            parent_short = _escape(parent[:50])
+            persp_names = ', '.join(_escape(p['name']) for p in perspectives)
+            rotation_items += f'''
+            <div class="finding-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+              <div>
+                <span class="finding-badge badge-complete">ROT</span>
+                <span style="color: var(--fg2);">iter {it}</span>
+                <span style="margin-left: 4px; font-weight: 500;">{parent_short}</span>
+              </div>
+              <div style="margin-left: 28px; font-size: 12px; color: var(--fg2);">'''
+            for p in perspectives:
+                rotation_items += f'''
+                <div style="margin-top: 2px;">&#8627; <strong>{_escape(p["name"])}</strong>: {_escape(p.get("question","")[:100])}</div>'''
+            rotation_items += '''
+              </div>
+            </div>'''
+        rotation_html = f'''
+  <div style="margin-top: 16px;">
+    <div class="section-title">Perspective rotations ({len(d['rotation_history'])})</div>
+    <div class="card">{rotation_items}
+    </div>
+  </div>'''
+
+    # --- Heatmap HTML ---
+    heatmap_html = ''
+    cell_h = 18
+    if d['heatmap_arcs']:
+        max_iter = d['iteration']
+        probe_iters = d['probe_iters']
+        rot_iters = d['rot_iters']
+        winner_scores = d['winner_scores']
+        score_colors = {1:'#F09595',2:'#F09595',3:'#F09595',4:'#F09595',
+                        5:'#FAC775',6:'#FAC775',
+                        7:'#C0DD97',8:'#5DCAA5',9:'#5DCAA5',10:'#5DCAA5'}
+
+        arc_rows = ''
+        for arc in d['heatmap_arcs']:
+            cells = ''
+            for i in range(1, max_iter + 1):
+                if i in arc['iters'] and i - 1 < len(winner_scores):
+                    sc = winner_scores[i - 1]
+                    fill = score_colors.get(sc, '#C0DD97')
+                    dot = ''
+                    if i in probe_iters:
+                        dot = '<div class="hm-ldot" style="background:#D85A30;"></div>'
+                    elif i in rot_iters:
+                        dot = '<div class="hm-ldot" style="background:#378ADD;"></div>'
+                    tip = f'Iter {i} &middot; {_escape(arc["name"])} &middot; Score {sc}'
+                    cells += (f'<div class="hm-c" style="background:{fill};" '
+                              f'data-hmtip="{tip}">{dot}</div>')
+                else:
+                    cells += '<div class="hm-c hm-empty"></div>'
+            arc_rows += f'<div class="hm-row"><div class="hm-label" title="{_escape(arc["name"])}">{_escape(arc["name"])}</div><div class="hm-cells">{cells}</div></div>\n'
+
+        num_step = 5 if max_iter <= 50 else 10
+        iter_nums = ''.join(f'<div class="hm-n">{i if i % num_step == 0 else ""}</div>' for i in range(1, max_iter + 1))
+
+        heatmap_html = f'''
+  <div class="chart-section">
+    <div class="section-title">Exploration trajectory</div>
+    <div class="card" style="background: var(--bg2); border-radius: var(--radius-lg); padding: 12px 16px;">
+      {arc_rows}
+      <div class="hm-nums">{iter_nums}</div>
+      <div class="hm-legend">
+        <span><span class="hm-lsw" style="background:#F09595;"></span>1-4</span>
+        <span><span class="hm-lsw" style="background:#FAC775;"></span>5-6</span>
+        <span><span class="hm-lsw" style="background:#C0DD97;"></span>7</span>
+        <span><span class="hm-lsw" style="background:#5DCAA5;"></span>8-10</span>
+        <span style="margin-left:8px;"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:#D85A30;vertical-align:middle;margin-right:4px;"></span>probe</span>
+        <span><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:#378ADD;vertical-align:middle;margin-right:4px;"></span>rotation</span>
+      </div>
+    </div>
+  </div>
+<div id="hmTip" class="hm-tip"></div>'''
 
     # Premium model display
     premium_meta = ''
@@ -331,9 +436,9 @@ def _render_html(d):
     # JSON data for charts
     winners_json = json.dumps(d['winner_scores'])
     losers_json = json.dumps(d['loser_scores'])
-    pursuing_json = json.dumps(d['pursuing_bands'])
-    conn_json = json.dumps(d['transition_iters'])
-    phases_json = json.dumps(d['phase_at'])
+    hold_json = json.dumps(d['hold_bands'])
+    pivot_json = json.dumps(d['pivot_iters'])
+    commitments_json = json.dumps(d['commitment_at'])
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -423,10 +528,20 @@ def _render_html(d):
   .bar-green {{ background: var(--green); }}
   .bar-amber {{ background: var(--amber); }}
   .bar-red {{ background: var(--red); }}
-  .phase-pill {{ font-size: 11px; font-weight: 500; padding: 2px 10px; border-radius: 10px; font-family: var(--mono); }}
-  .phase-mapping {{ background: var(--blue-bg); color: var(--blue-fg); }}
-  .phase-pursuing {{ background: var(--purple-bg); color: var(--purple-fg); }}
   .footer {{ padding: 12px 24px; border-top: 1px solid var(--border); font-size: 11px; color: var(--fg3); text-align: center; }}
+  .hm-row {{ display: flex; align-items: center; }}
+  .hm-label {{ width: 140px; min-width: 140px; box-sizing: border-box; font-size: 11px; color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 8px; text-align: right; height: {cell_h}px; line-height: {cell_h}px; }}
+  .hm-cells {{ display: flex; flex: 1; }}
+  .hm-c {{ flex: 1 1 0; min-width: 0; height: {cell_h}px; border-radius: 1px; cursor: default; position: relative; border-right: 1px solid var(--bg2); }}
+  .hm-c:last-child {{ border-right: none; }}
+  .hm-c:hover {{ outline: 1.5px solid var(--fg); outline-offset: 0; z-index: 2; }}
+  .hm-empty {{ background: var(--bg3); opacity: 0.2; }}
+  .hm-nums {{ display: flex; flex: 1; margin-left: 140px; }}
+  .hm-n {{ flex: 1 1 0; min-width: 0; font-size: 8px; color: var(--fg3); text-align: center; }}
+  .hm-legend {{ display: flex; gap: 14px; align-items: center; margin-top: 10px; font-size: 11px; color: var(--fg2); flex-wrap: wrap; }}
+  .hm-lsw {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 3px; }}
+  .hm-ldot {{ display: inline-block; width: 4px; height: 4px; border-radius: 50%; position: absolute; bottom: 1px; right: 1px; }}
+  .hm-tip {{ position: fixed; background: var(--bg); border: 1px solid var(--border2); border-radius: var(--radius); padding: 8px 12px; font-size: 11px; color: var(--fg); pointer-events: none; z-index: 200; display: none; max-width: 300px; line-height: 1.4; font-family: var(--mono); }}
 </style>
 </head>
 <body>
@@ -487,8 +602,8 @@ def _render_html(d):
         <span><span class="legend-dot" style="background: #D97706;"></span> Score 5-6</span>
         <span><span class="legend-dot" style="background: #DC2626;"></span> Score 1-4</span>
         <span><span class="legend-dot" style="background: #D1D5DB;"></span> Runner-up</span>
-        <span><span class="legend-dot" style="background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.25);"></span> PURSUING</span>
-        <span><span class="legend-line" style="background: #7C3AED; border-top: 1px dashed #7C3AED; height: 0;"></span> Phase transition</span>
+        <span><span class="legend-dot" style="background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.25);"></span> HOLD (depth)</span>
+        <span><span class="legend-line" style="background: #7C3AED; border-top: 1px dashed #7C3AED; height: 0;"></span> Pivot / abandon</span>
       </div>
       <div class="chart-wrap">
         <canvas id="scoreChart"></canvas>
@@ -501,14 +616,16 @@ def _render_html(d):
     <div class="chart-card">
       <div class="chart-legend">
         <span><span class="legend-dot" style="background: #16A34A;"></span> Cumulative (scores 7+ only)</span>
-        <span><span class="legend-dot" style="background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.25);"></span> PURSUING</span>
-        <span><span class="legend-line" style="background: #7C3AED; border-top: 1px dashed #7C3AED; height: 0;"></span> Phase transition</span>
+        <span><span class="legend-dot" style="background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.25);"></span> HOLD (depth)</span>
+        <span><span class="legend-line" style="background: #7C3AED; border-top: 1px dashed #7C3AED; height: 0;"></span> Pivot / abandon</span>
       </div>
       <div class="chart-wrap">
         <canvas id="cumChart"></canvas>
       </div>
     </div>
   </div>
+
+{heatmap_html}
 
   <div class="two-col">
     <div>
@@ -533,8 +650,8 @@ def _render_html(d):
       <div class="section-title">Exploration health</div>
       <div class="health-card">
         <div class="health-row">
-          <span class="health-label">Current phase</span>
-          <span class="phase-pill {phase_class}">{d['current_phase']}</span>
+          <span class="health-label">Arcs explored</span>
+          <span class="health-val">{d['n_arcs']}</span>
         </div>
         <div class="health-row">
           <span class="health-label">Breadth</span>
@@ -546,14 +663,6 @@ def _render_html(d):
         <div class="health-row">
           <span class="health-label">Topics investigated</span>
           <span class="health-val">{d['topics']}</span>
-        </div>
-        <div class="health-row">
-          <span class="health-label">Phase transitions</span>
-          <span class="health-val">{d['phase_transitions']}</span>
-        </div>
-        <div class="health-row">
-          <span class="health-label">Stagnation count</span>
-          <span class="health-val">{d['stagnation_count']}</span>
         </div>
         <div class="health-row">
           <span class="health-label">Biggest gap</span>
@@ -571,6 +680,8 @@ def _render_html(d):
 
 {probe_html}
 
+{rotation_html}
+
 </div>
 
 <div class="footer">
@@ -581,20 +692,20 @@ def _render_html(d):
 <script>
 const winners = {winners_json};
 const losers = {losers_json};
-const pursuingBands = {pursuing_json};
-const connIters = {conn_json};
-const phases = {phases_json};
+const holdBands = {hold_json};
+const pivotIters = {pivot_json};
+const commitments = {commitments_json};
 const isDark = matchMedia('(prefers-color-scheme: dark)').matches;
 const labels = Array.from({{length: winners.length}}, (_, i) => i + 1);
 
-function makePhasePlugin(id) {{
+function makeHoldPlugin(id) {{
   return {{
     id: id,
     beforeDraw(chart) {{
       const {{ctx, chartArea: {{left,right,top,bottom}}, scales: {{x}}}} = chart;
       ctx.save();
       ctx.fillStyle = isDark ? 'rgba(124,58,237,0.10)' : 'rgba(124,58,237,0.06)';
-      pursuingBands.forEach(([s,e]) => {{
+      holdBands.forEach(([s,e]) => {{
         const x1 = x.getPixelForValue(s - 1.5);
         const x2 = x.getPixelForValue(e - 0.5);
         ctx.fillRect(x1, top, x2 - x1, bottom - top);
@@ -604,7 +715,7 @@ function makePhasePlugin(id) {{
   }};
 }}
 
-function makeConnPlugin(id) {{
+function makePivotPlugin(id) {{
   return {{
     id: id,
     afterDraw(chart) {{
@@ -613,7 +724,7 @@ function makeConnPlugin(id) {{
       ctx.setLineDash([4,4]);
       ctx.strokeStyle = isDark ? '#A78BFA' : '#7C3AED';
       ctx.lineWidth = 0.8;
-      connIters.forEach(i => {{
+      pivotIters.forEach(i => {{
         const px = x.getPixelForValue(i - 1);
         ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
       }});
@@ -677,7 +788,7 @@ new Chart(document.getElementById('scoreChart'), {{
         callbacks: {{
           title: (items) => {{
             const i = items[0].dataIndex + 1;
-            return 'Iteration ' + i + ' \\u00b7 ' + (phases[i] || 'MAPPING');
+            return 'Iteration ' + i + (commitments[i] ? ' \\u00b7 ' + commitments[i] : '');
           }},
           label: (item) => item.dataset.label + ': ' + item.raw
         }}
@@ -693,7 +804,7 @@ new Chart(document.getElementById('scoreChart'), {{
       }}
     }}
   }},
-  plugins: [makePhasePlugin('p1'), makeConnPlugin('c1')]
+  plugins: [makeHoldPlugin('h1'), makePivotPlugin('p1')]
 }});
 
 const cumScores = [];
@@ -723,7 +834,7 @@ new Chart(document.getElementById('cumChart'), {{
         callbacks: {{
           title: (items) => {{
             const i = items[0].dataIndex + 1;
-            return 'Iteration ' + i + ' \\u00b7 ' + (phases[i] || 'MAPPING');
+            return 'Iteration ' + i + (commitments[i] ? ' \\u00b7 ' + commitments[i] : '');
           }},
           label: (item) => {{
             const i = item.dataIndex;
@@ -743,8 +854,22 @@ new Chart(document.getElementById('cumChart'), {{
       }}
     }}
   }},
-  plugins: [makePhasePlugin('p2'), makeConnPlugin('c2')]
+  plugins: [makeHoldPlugin('h2'), makePivotPlugin('p2')]
 }});
+
+(function() {{
+  const tip = document.getElementById('hmTip');
+  if (!tip) return;
+  document.addEventListener('mousemove', function(e) {{
+    const cell = e.target.closest('[data-hmtip]');
+    if (!cell) {{ tip.style.display = 'none'; return; }}
+    tip.textContent = cell.getAttribute('data-hmtip');
+    tip.style.display = 'block';
+    tip.style.left = Math.min(e.clientX + 12, window.innerWidth - 320) + 'px';
+    tip.style.top = (e.clientY - 36) + 'px';
+  }});
+}})();
+
 </script>
 </body>
 </html>'''

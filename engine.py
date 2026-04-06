@@ -53,26 +53,21 @@ class SimpleMessageManager:
         self.last_code = None
         self.last_plan = None
         self.qa_pairs = []
-        # Complete log of ALL questions ever asked (never truncated).
-        # Cheap in tokens (~50 per question) and prevents circular exploration.
+        # Complete log of ALL questions ever asked.
+        # Older questions are summarised to 120-char snippets to control context growth.
         self.all_questions = []
         # Full stdout per chain_id — used ONLY by synthesis (never truncated).
         # Loop agents use the capped tree node result_summary instead.
         self.full_results_store = {}
         # auto_explore saves/restores this in run() setup/teardown
         self.select_analyst_messages = [{"content": ""}]
+        # Error patterns from successfully-corrected code — prevents repeat failures
+        self.error_patterns = []
 
     def reset_non_cumul_messages(self):
         self.code_exec_results = None
         self.last_code = None
         self.last_plan = None
-
-    def restore_interaction(self, thread_id, chain_id):
-        """No-op — context comes from QA pairs + research model."""
-        pass
-
-    def store_interaction(self, *args, **kwargs):
-        pass
 
     def append_qa_pair(self, question, result, chain_id=None):
         self.qa_pairs.append({
@@ -85,37 +80,147 @@ class SimpleMessageManager:
         if chain_id and result:
             self.full_results_store[str(chain_id)] = result
 
-    def format_qa_pairs(self, max_qa_pairs=20, include_chain_id=False):
+    def update_finding_summary(self, chain_id, summary):
+        """Enrich a qa_pair with its evaluator-generated finding summary.
+
+        Called after evaluation, before the next iteration's code generation.
+        The summary is used by format_qa_pairs for compact context.
+        """
+        if not summary or not chain_id:
+            return
+        chain_key = str(chain_id)
+        # Scan recent pairs (most likely near the end)
+        for qa in reversed(self.qa_pairs):
+            if str(qa.get('chain_id')) == chain_key:
+                qa['finding_summary'] = summary
+                return
+
+    def format_qa_pairs(self, max_qa_pairs=40, include_chain_id=False):
+        """Format QA pairs for code generator context.
+
+        Uses evaluator-generated finding_summary for compact, high-quality
+        context. Falls back to first 2 result lines if no summary available
+        (e.g. seed iteration which bypasses the evaluator).
+        """
         if not self.qa_pairs:
             return "(No previous analyses)"
         pairs = self.qa_pairs[-max_qa_pairs:]
         parts = []
         for qa in pairs:
             ref = f" [[{qa['chain_id']}]]" if include_chain_id and qa.get('chain_id') else ""
-            result = str(qa['result'] or 'No results')
-
-            # Try to extract the delimited summary block
-            start_marker = "###RESULTS_START###"
-            end_marker = "###RESULTS_END###"
-            start_idx = result.find(start_marker)
-            end_idx = result.find(end_marker)
-
-            if start_idx >= 0 and end_idx > start_idx:
-                # Extract just the summary block (most information-dense)
-                result = result[start_idx + len(start_marker):end_idx].strip()
-            elif len(result) > 1500:
-                # No markers found — keep first + last
-                result = result[:750] + "\n[...]\n" + result[-750:]
-
-            parts.append(f"Q: {qa['question']}{ref}\nResult:\n{result}")
+            summary = qa.get('finding_summary', '')
+            if summary:
+                parts.append(f"Q: {qa['question']}{ref}\n→ {summary}")
+            else:
+                # Fallback: extract headline from raw results
+                result = str(qa.get('result') or 'No results')
+                headline = self._extract_headline(result)
+                parts.append(f"Q: {qa['question']}{ref}\n→ {headline}")
         return "\n\n---\n\n".join(parts)
 
-    def format_all_questions(self):
-        """Complete list of every question asked. Cheap in tokens, prevents circular exploration."""
+    @staticmethod
+    def _extract_headline(result):
+        """Extract a compact headline from raw results (fallback when no finding_summary)."""
+        start_marker = "###RESULTS_START###"
+        end_marker = "###RESULTS_END###"
+        s = result.find(start_marker)
+        e = result.find(end_marker)
+        if s >= 0 and e > s:
+            block = result[s + len(start_marker):e].strip()
+        else:
+            block = result.strip()
+        lines = [l.strip() for l in block.split('\n') if l.strip()]
+        return ' | '.join(lines[:2])[:300] if lines else 'No results'
+
+    # Generic types whose AttributeErrors are context-dependent, not systematic
+    _GENERIC_TYPES = {
+        'numpy.ndarray', 'str', 'list', 'dict', 'int', 'float', 'tuple',
+        'set', 'NoneType', 'bool', 'Series', 'DataFrame', 'ndarray',
+    }
+
+    def record_error_pattern(self, error_text):
+        """Record a successfully-corrected error for future CG context.
+
+        Only records errors with clear, non-ambiguous lessons:
+        - ModuleNotFoundError / ImportError (module not available)
+        - AttributeError on library-specific classes (API changes)
+
+        Skips context-dependent errors (wrong type passed to a method,
+        KeyError on column names, generic type mismatches) — these would
+        confuse the CG in later iterations where the context differs.
+        """
+        if not error_text:
+            return
+        lines = [l.strip() for l in error_text.strip().split('\n')
+                 if l.strip() and '[...truncated]' not in l]
+        if not lines:
+            return
+        error_line = lines[-1][:200]
+        if len(error_line) < 15:
+            return
+
+        # Always record: missing modules
+        is_module_error = any(k in error_line for k in
+                              ('ModuleNotFoundError', 'ImportError'))
+
+        # Record AttributeError only for library-specific classes (not generic types)
+        is_useful_attr_error = False
+        if 'AttributeError' in error_line:
+            is_useful_attr_error = not any(
+                f"'{t}'" in error_line for t in self._GENERIC_TYPES)
+
+        if not (is_module_error or is_useful_attr_error):
+            return
+
+        # Deduplicate
+        for existing in self.error_patterns:
+            if existing == error_line:
+                return
+        self.error_patterns.append(error_line)
+        if len(self.error_patterns) > 15:
+            self.error_patterns = self.error_patterns[-15:]
+
+    def format_error_patterns(self, static_hints=None):
+        """Format known pitfalls for CG context.
+
+        Combines static hints (from pitfalls.txt) with runtime-discovered
+        error patterns into a single section.
+        """
+        all_pitfalls = list(static_hints or []) + self.error_patterns
+        if not all_pitfalls:
+            return ""
+        lines = [f"  - {p}" for p in all_pitfalls]
+        return ("**Known pitfalls (avoid these):**\n"
+                + "\n".join(lines))
+
+    def format_all_questions(self, recent_full=30):
+        """Question log with two-tier summarization.
+
+        Last `recent_full` questions in full text for exact deduplication.
+        Older questions as 120-char snippets (captures target variable + method).
+        """
         if not self.all_questions:
             return ""
-        lines = [f"  {i+1}. {q}" for i, q in enumerate(self.all_questions)]
-        return "**All questions investigated so far (do NOT repeat these):**\n" + "\n".join(lines)
+
+        total = len(self.all_questions)
+        if total <= recent_full:
+            lines = [f"  {i+1}. {q}" for i, q in enumerate(self.all_questions)]
+            return ("**All questions investigated so far (do NOT repeat these):**\n"
+                    + "\n".join(lines))
+
+        older = self.all_questions[:-recent_full]
+        recent = self.all_questions[-recent_full:]
+
+        parts = [f"**All questions investigated ({total} total — do NOT repeat):**"]
+        parts.append(f"  *Earlier questions ({len(older)}, summarised):*")
+        for i, q in enumerate(older):
+            snippet = q[:120].rstrip()
+            parts.append(f"    {i+1}. {snippet}{'...' if len(q) > 120 else ''}")
+        parts.append(f"  *Recent questions (full text):*")
+        for i, q in enumerate(recent):
+            parts.append(f"  {len(older)+i+1}. {q}")
+
+        return "\n".join(parts)
 
 
 class SimpleLogManager:
@@ -173,8 +278,6 @@ class ExplorationEngine:
         self.thread_id = int(time.time())
         self.kill_signal = False
         self._stop_event = threading.Event()
-        self.branch_endpoints = []
-        self.exploration_trajectory = None
 
         # Settings saved/restored by auto_explore run()
         self.user_feedback = False
@@ -188,7 +291,6 @@ class ExplorationEngine:
         # Iteration context — set by auto_explore before each _process_question
         self._iteration = 0
         self._max_iterations = 0
-        self._phase = "MAPPING"
         self._question = ""
         self.data_profile = ""  # Set by auto_explore after orientation
 
@@ -334,6 +436,8 @@ class ExplorationEngine:
         user_msg = self.prompts.code_generator_user.format(
             schema=schema,
             qa_pairs=qa_context,
+            error_patterns=self.message_manager.format_error_patterns(
+                static_hints=self._load_pitfalls()),
             question=question,
         )
         # Inject analytical profile from orientation (if available)
@@ -379,6 +483,7 @@ class ExplorationEngine:
         results, error, plots = self.executor.execute(code, self.df, analysis_dir)
 
         # ── Error Correction Loop (silent) ──
+        initial_error = error  # preserve for error pattern recording
         retries = 0
         while error and retries < self.MAX_ERROR_CORRECTIONS:
             retries += 1
@@ -418,6 +523,10 @@ class ExplorationEngine:
                 results, error, plots = self.executor.execute(code, self.df, analysis_dir)
             else:
                 break
+
+        # Record successfully-corrected error patterns for future CG context
+        if retries > 0 and results and initial_error:
+            self.message_manager.record_error_pattern(initial_error)
 
         # ── Status line ──
         if results:
@@ -526,6 +635,7 @@ class ExplorationEngine:
         results, error, plots = self.executor.execute(code, self.df, analysis_dir)
 
         # Error correction loop (same pattern as _process_question)
+        initial_error = error
         retries = 0
         while error and retries < self.MAX_ERROR_CORRECTIONS:
             retries += 1
@@ -567,6 +677,10 @@ class ExplorationEngine:
                 results, error, plots = self.executor.execute(code, self.df, analysis_dir)
             else:
                 break
+
+        # Record successfully-corrected error patterns
+        if retries > 0 and results and initial_error:
+            self.message_manager.record_error_pattern(initial_error)
 
         if not results:
             self.output_manager.print_wrapper(
@@ -624,7 +738,7 @@ class ExplorationEngine:
 
     def _analysis_dir_for_chain(self, chain_id):
         """Build the analysis directory path for a given chain_id."""
-        iter_dir = f"{self._iteration:02d}_{self._phase}"
+        iter_dir = f"{self._iteration:02d}"
         return os.path.join(self.output_dir, "exploration", iter_dir, str(chain_id))
 
     def _write_analysis_md(self, analysis_dir, question, code, results, error, plots):
@@ -633,7 +747,6 @@ class ExplorationEngine:
         md_parts.append(
             f"| Field | Value |\n|-------|-------|\n"
             f"| Iteration | {self._iteration} of {self._max_iterations} |\n"
-            f"| Phase | {self._phase} |\n"
             f"| Chain ID | {self.chain_id} |\n"
         )
 
@@ -658,16 +771,16 @@ class ExplorationEngine:
         with open(md_path, "w") as f:
             f.write("\n".join(md_parts))
 
-    def write_iteration_summary(self, iteration, phase, solutions_data, scores,
+    def write_iteration_summary(self, iteration, solutions_data, scores,
                                  selected_index, model_impact, contradiction,
-                                 thread_completed, new_phase, old_phase,
+                                 arc_exhausted,
                                  new_questions=None, selected_questions=None):
         """Write _summary.md for an iteration. Called from auto_explore.run()."""
-        iter_dir = f"{iteration:02d}_{phase}"
+        iter_dir = f"{iteration:02d}"
         summary_dir = os.path.join(self.output_dir, "exploration", iter_dir)
         os.makedirs(summary_dir, exist_ok=True)
 
-        parts = [f"# Iteration {iteration} — {phase}\n"]
+        parts = [f"# Iteration {iteration}\n"]
 
         # Solutions table
         parts.append("## Solutions Evaluated\n")
@@ -684,14 +797,8 @@ class ExplorationEngine:
         parts.append("## Research Model Update\n")
         parts.append(f"- **Model Impact:** {model_impact}")
         parts.append(f"- **Contradiction:** {'Yes' if contradiction else 'No'}")
-        parts.append(f"- **Thread Completed:** {'Yes' if thread_completed else 'No'}")
+        parts.append(f"- **Arc Exhausted:** {'Yes' if arc_exhausted else 'No'}")
         parts.append("")
-
-        # Phase
-        if new_phase != old_phase:
-            parts.append(f"## Phase Transition\n\n{old_phase} → {new_phase}\n")
-        else:
-            parts.append(f"## Phase: {new_phase} (maintained)\n")
 
         # Questions
         if new_questions:
@@ -709,17 +816,13 @@ class ExplorationEngine:
         with open(path, "w") as f:
             f.write("\n".join(parts))
 
-    def write_final_outputs(self, research_model, phase_history, synthesis_text=None):
+    def write_final_outputs(self, research_model, synthesis_text=None):
         """Write final research model, synthesis report, and cost summary."""
         # Research model
         model_path = os.path.join(self.output_dir, "research_model.md")
         with open(model_path, "w") as f:
             f.write("# Final Research Model\n\n")
             f.write(research_model or "(empty)")
-            if phase_history:
-                f.write("\n\n## Phase History\n\n")
-                for iteration, old, new in phase_history:
-                    f.write(f"- Iteration {iteration}: {old} → {new}\n")
 
         # Synthesis report
         if synthesis_text:
@@ -798,6 +901,40 @@ class ExplorationEngine:
             else:
                 parts.append(f"  - {col} ({dtype}, {nunique} unique{null_pct})")
         return "\n".join(parts)
+
+    def _get_column_list(self):
+        """Compact column list for Research Interpreter context.
+
+        For narrow datasets (≤50 cols): comma-separated names.
+        For wide datasets: split by coverage tier so the RI can distinguish
+        usable columns from sparse ones without a wall of text.
+        """
+        cols = self.df.columns.tolist()
+        if len(cols) <= 50:
+            return ', '.join(cols)
+        # Wide dataset — group by coverage tier
+        high = [c for c in cols if self.df[c].notna().mean() >= 0.5]
+        low = [c for c in cols if self.df[c].notna().mean() < 0.5]
+        parts = [f"Columns with ≥50% coverage ({len(high)}): {', '.join(high)}"]
+        if low:
+            parts.append(f"Sparse columns <50% coverage ({len(low)}): {', '.join(low)}")
+        return '\n'.join(parts)
+
+    @staticmethod
+    def _load_pitfalls(filename='pitfalls.txt'):
+        """Load static code hints from pitfalls.txt.
+
+        User-maintained file with one hint per line. Lines starting with #
+        are comments. Re-read on each code generation call so edits during
+        a run take effect on the next iteration.
+        """
+        if not os.path.exists(filename):
+            return []
+        try:
+            with open(filename) as f:
+                return [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+        except Exception:
+            return []
 
     def store_dataset_details_in_db(self):
         """No-op — no database in minimal version."""
