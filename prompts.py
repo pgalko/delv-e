@@ -697,27 +697,58 @@ CITATION RULES:
 
 REPORT STRUCTURE:
 
-## Executive Summary
-2-3 sentences: scope, central question, most important conclusion.
+The report must read as a narrative, not a numbered list. Follow these principles:
 
-## Key Findings
-Synthesise the most significant discoveries. Group related analyses into coherent
-findings ordered by practical importance. For each:
-- State the conclusion with key numbers and [[chain_id]] citations
-- Note strength of evidence (how many analyses, score range)
+**1. TITLE:** A single sentence that captures the central tension or paradox.
+Not a topic ("Winter Climate Analysis") but a finding ("The Same Snow Falls, but
+Less of It Stays"). The reader should understand the core discovery from the title.
 
-## Cross-Cutting Patterns
-2-3 patterns that emerged across multiple themes [[chain_id1]], [[chain_id2]].
-Draw especially from confirmed Cross-Finding Connections.
+**2. OPENING PARAGRAPH (before any ## section):**
+Lead with the contradiction or surprise. State what the data shows that is
+counterintuitive — the thing that doesn't fit conventional expectations. Then
+state, in one sentence, what the investigation discovered as the resolution.
+This is the hook that makes the reader care.
 
-## Limitations & Caveats
-Methodological limitations, data gaps, small samples, unresolved confounding.
+**3. ## Tested and Rejected**
+Immediately after the opening, list the alternative explanations that were
+systematically tested and eliminated. This shows rigour and pre-empts the reader's
+objections. For each: state the hypothesis, cite the evidence that refutes it,
+give the key statistic.
 
-## Recommended Next Steps
-2-3 specific directions. Address the Biggest Gap first if one is identified.
+**4. KEY FINDING SECTIONS (multiple ## sections):**
+Each major finding gets its own ## section. Order them by CAUSAL LOGIC, not by
+importance — each section should motivate the question that the next section
+answers. Use DECLARATIVE section titles that state the conclusion:
+  GOOD: "NE Continental Air Quadrupled — and Explains Most of the Change"
+  BAD:  "Wind Direction Analysis"
+  GOOD: "More Melt Days, Not Worse Melt Days"
+  BAD:  "Pure Melt Day Trends"
 
-## Conclusion
-Integrated narrative tying together key discoveries and implications.
+**5. ## Cross-Cutting Patterns**
+2-3 higher-order principles that UNIFY multiple findings. Not "Finding A and
+Finding B are related" but "A single structural change (X) explains why A, B,
+and C all shifted simultaneously." These should be genuinely synthetic insights,
+not summaries of individual findings.
+
+**6. ## The Open Question**
+Separate from methodological caveats. This is the most important thing the data
+CANNOT answer — the gap that matters for future work. Frame it as a question,
+explain why the available data can't answer it, and suggest what data would.
+
+**7. ## Methodological Caveats**
+Short, factual list of limitations: sample sizes, method-dependent significance,
+data reliability issues. No interpretation — just the facts the reader needs
+to assess confidence.
+
+**8. ## What Is Stable, What Is Changing**
+A scannable summary in three categories:
+- **Stable:** variables that show no significant trend
+- **Increasing/changing:** variables with significant upward trends or structural shifts
+- **Declining:** variables with significant downward trends or loss
+
+**9. ## Conclusion**
+3-5 sentences tying together the key discoveries. Restate the central finding,
+the mechanism, and the single most important implication or open question.
 
 ---
 
@@ -732,6 +763,52 @@ Scan the Findings Index for any score-8+ analysis not yet cited. If it represent
 distinct finding not covered in your draft, add it. If it refines a finding you already
 reported, incorporate the refinement. Prioritise findings that are OPERATIONALLY
 ACTIONABLE (implications for decisions) over those that are purely descriptive."""
+
+
+    # ══════════════════════════════════════════════════
+    # SYNTHESIS CHART GENERATOR (premium model)
+    # Generates one publication-quality chart per key finding.
+    # ══════════════════════════════════════════════════
+
+    synthesis_chart = """You are adapting analysis code into a publication-quality chart for a report.
+
+**Finding to visualise:**
+{finding_text}
+
+**Original code that produced this finding:**
+```python
+{original_code}
+```
+
+**DataFrame info:**
+{schema}
+
+Adapt the original code above to produce ONE clear matplotlib chart that makes the
+statistical claim visually obvious. REUSE the same filters, groupings, column names,
+thresholds, and calculations from the original code — do NOT reinvent the analysis.
+Strip out the print/results block and replace it with a chart.
+
+REQUIREMENTS:
+- One chart only. Pick the single most effective visualization for this finding.
+- The numbers on the chart MUST match the numbers in the finding text.
+- Clean, minimal style: white background, no gridlines, muted colors, large labels.
+- If the finding is about a trend: show the time series with the trend line.
+- If the finding is about a breakpoint: shade or annotate pre/post periods.
+- If the finding is about a comparison: use side-by-side bars or box plots.
+- If the finding is about a correlation: use scatter with regression line and r/p.
+- Annotate the key statistic on the chart (e.g., "p = 0.003", "slope = −2.64").
+- Use fig, ax = plt.subplots(figsize=(10, 6)) for consistent sizing.
+- Use plt.tight_layout() before plt.show().
+
+STYLE:
+- Title: bold, 13pt, stating the conclusion (not the topic).
+- Axis labels: 11pt.
+- Use color purposefully: red for decline, blue/green for increase, grey for baselines.
+- For breakpoints, use a vertical dashed line with a label.
+- For regime comparisons, use semi-transparent shading.
+
+`df` is pre-loaded. Include all imports at the top.
+Return ONLY code within ```python``` blocks. Do NOT print anything — chart only."""
 
 
     # ══════════════════════════════════════════════════

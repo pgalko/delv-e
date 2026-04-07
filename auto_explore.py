@@ -1375,7 +1375,7 @@ class AutoExplorer:
                     self.insight_tree[node_id]['status'] = 'runner_up'
 
                 # ── WRITE ITERATION SUMMARY ──
-                self.engine.write_iteration_summary(
+                self.engine.output_manager.write_iteration_summary(
                     iteration=iteration + 1,
                     solutions_data=solutions_data,
                     scores=scores,
@@ -1466,6 +1466,10 @@ class AutoExplorer:
                 print(f"  {style.YELLOW}✗ Synthesis failed{style.RESET}")
                 synthesis_text = ""
 
+            # Generate charts for key findings (premium model)
+            if synthesis_text and self.premium_model:
+                synthesis_text = self._generate_synthesis_charts(synthesis_text)
+
             print(style.exploration_tree(self.insight_tree,
                                          arc_history=self.arc_history,
                                          total_iterations=iteration))
@@ -1481,10 +1485,15 @@ class AutoExplorer:
                 output_dir=self.engine.output_dir,
             ))
 
-            self.engine.write_final_outputs(
+            self.engine.output_manager.write_final_outputs(
                 research_model=self.research_model,
                 synthesis_text=synthesis_text,
+                cost_tracker=self.engine.cost_tracker,
+                run_logger=self.engine.run_logger,
             )
+
+            # Final dashboard write — captures synthesis and charting costs
+            self._write_dashboard(iteration, max_iterations)
             print()
 
         finally:
@@ -1534,6 +1543,203 @@ class AutoExplorer:
             print(f"  {style.YELLOW}⟳ Synthesis attempt {attempt} failed — retrying in {backoff}s...{style.RESET}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 80)
+
+    def _generate_synthesis_charts(self, synthesis_text):
+        """Generate one publication-quality chart per key finding section.
+
+        For each finding section, extracts the chain_id citations, retrieves
+        the original analysis code that produced those numbers, and passes it
+        to the premium model to adapt into a publication chart. This ensures
+        charts use the exact same methodology as the original analysis.
+
+        Returns updated synthesis text with embedded chart references.
+        """
+        if not synthesis_text or not self.premium_model:
+            return synthesis_text
+
+        # Sections that should NOT get charts
+        skip_keywords = [
+            'rejected', 'tested and rejected', 'caveats', 'caveat',
+            'limitation', 'methodology', 'conclusion', 'next step',
+            'recommended', 'open question', 'what is stable',
+            'stable, what', 'executive summary', 'cross-cutting',
+        ]
+
+        # Parse sections
+        lines = synthesis_text.split('\n')
+        sections = []
+        current_title = None
+        current_lines = []
+
+        for line in lines:
+            if line.startswith('## ') and not line.startswith('### '):
+                if current_title is not None:
+                    sections.append((current_title, '\n'.join(current_lines)))
+                current_title = line[3:].strip()
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+        if current_title is not None:
+            sections.append((current_title, '\n'.join(current_lines)))
+
+        if not sections:
+            return synthesis_text
+
+        # Filter to chart-worthy sections
+        chart_sections = []
+        for title, text in sections:
+            if any(kw in title.lower() for kw in skip_keywords):
+                continue
+            if len(text) < 200:
+                continue
+            chart_sections.append((title, text))
+
+        if not chart_sections:
+            return synthesis_text
+
+        # Create charts directory
+        charts_dir = os.path.join(self.engine.output_dir, "synthesis_charts")
+        os.makedirs(charts_dir, exist_ok=True)
+
+        schema = self.engine._get_df_schema()
+        chart_map = {}  # title → relative image path
+
+        for idx, (title, section_text) in enumerate(chart_sections):
+            slug = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')[:40]
+            chart_filename = f"{idx+1:02d}_{slug}.png"
+            chart_path = os.path.join(charts_dir, chart_filename)
+
+            # Extract chain_ids cited in this section [[chain_id]]
+            cited_ids = re.findall(r'\[\[(\d+)\]\]', section_text)
+
+            # Retrieve original code from the primary cited analysis
+            original_code = self._get_analysis_code(cited_ids)
+
+            if not original_code:
+                logger.info(f"Synthesis chart: no source code found for '{title[:40]}'")
+                continue
+
+            # Build prompt with original code
+            error_hints = self.engine.message_manager.format_error_patterns(
+                static_hints=self.engine._load_pitfalls())
+            prompt = self.engine.prompts.synthesis_chart.format(
+                finding_text=section_text[:2000],
+                original_code=original_code[:4000],
+                schema=schema,
+            )
+            if error_hints:
+                prompt = prompt + "\n\n" + error_hints
+            messages = [
+                {"role": "system", "content": self.engine.prompts.code_generator_system},
+                {"role": "user", "content": prompt},
+            ]
+
+            try:
+                with style.spinner(f"Charting: {title[:40]}"):
+                    code, llm_response = self.engine._call_llm_for_code(
+                        messages, self.premium_model, agent="Synthesis Chart")
+                    if not code:
+                        logger.info(f"Synthesis chart: no code for '{title[:40]}'")
+                        continue
+
+                    results, error, plots = self.engine.executor.execute(
+                        code, self.engine.df, charts_dir)
+
+                    # Error correction: up to 2 retries
+                    retries = 0
+                    while error and retries < 2:
+                        retries += 1
+                        logger.info(f"Synthesis chart retry {retries} for '{title[:40]}': "
+                                     f"{error.strip().split(chr(10))[-1][:100]}")
+                        fix_msg = (
+                            f"The chart code produced an error:\n{error}\n\n"
+                            f"Fix the code. Return the COMPLETE corrected code "
+                            f"within ```python``` blocks. Chart only, no prints."
+                        )
+                        messages.append({"role": "assistant", "content": llm_response or ""})
+                        messages.append({"role": "user", "content": fix_msg})
+                        llm_response = self._call_agent_with_retry(
+                            messages, 'Synthesis Chart', model_override=self.premium_model)
+                        from executor import extract_code
+                        code = extract_code(llm_response or "")
+                        if code:
+                            results, error, plots = self.engine.executor.execute(
+                                code, self.engine.df, charts_dir)
+                        else:
+                            break
+
+                    if error:
+                        logger.info(f"Synthesis chart failed for '{title[:40]}' after "
+                                     f"{retries + 1} attempts")
+                        continue
+
+                    if plots:
+                        import shutil
+                        shutil.move(plots[0], chart_path)
+                        chart_map[title] = f"synthesis_charts/{chart_filename}"
+                        logger.info(f"Synthesis chart saved: {chart_filename}")
+
+            except Exception as e:
+                logger.info(f"Synthesis chart failed for '{title[:40]}': {e}")
+                continue
+
+        if not chart_map:
+            return synthesis_text
+
+        # Embed chart references into synthesis text
+        updated = synthesis_text
+        for title, img_path in chart_map.items():
+            header = f"## {title}"
+            img_md = f"\n\n![{title}]({img_path})\n"
+            header_pos = updated.find(header)
+            if header_pos < 0:
+                continue
+            para_end = updated.find('\n\n', header_pos + len(header))
+            if para_end < 0:
+                para_end = header_pos + len(header)
+            updated = updated[:para_end] + img_md + updated[para_end:]
+
+        print(f"  {style.GREEN}✓{style.RESET} {len(chart_map)} synthesis charts generated")
+        return updated
+
+    def _get_analysis_code(self, chain_ids):
+        """Retrieve original Python code from analysis.md files for given chain_ids.
+
+        Searches the exploration directory for analysis files matching the cited
+        chain_ids and extracts the code block. Returns the code from the first
+        (primary) citation found.
+        """
+        if not chain_ids:
+            return ""
+
+        import glob
+        exploration_dir = os.path.join(self.engine.output_dir, "exploration")
+
+        for cid in chain_ids[:3]:  # try first 3 cited chain_ids
+            # Glob for the analysis.md containing this chain_id
+            pattern = os.path.join(exploration_dir, "*", str(cid), "analysis.md")
+            matches = glob.glob(pattern)
+            if not matches:
+                continue
+
+            try:
+                with open(matches[0]) as f:
+                    content = f.read()
+                # Extract code block between ```python and ```
+                code_start = content.find('```python')
+                if code_start < 0:
+                    continue
+                code_start += len('```python\n')
+                code_end = content.find('```', code_start)
+                if code_end < 0:
+                    continue
+                code = content[code_start:code_end].strip()
+                if code and len(code) > 30:
+                    return code
+            except Exception:
+                continue
+
+        return ""
 
     # ══════════════════════════════════════════════
     # HELPER METHODS

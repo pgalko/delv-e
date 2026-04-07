@@ -261,7 +261,7 @@ class ExplorationEngine:
 
         # Output
         self.output_dir = output_dir
-        self.output_manager = OutputManager()
+        self.output_manager = OutputManager(output_dir)
         self.webui = False
 
         # Models & LLM
@@ -469,7 +469,7 @@ class ExplorationEngine:
             # Still write an analysis.md marking the failure
             analysis_dir = self._analysis_dir_for_chain(self.chain_id)
             os.makedirs(analysis_dir, exist_ok=True)
-            self._write_analysis_md(analysis_dir, question, "(none)", None, "No code generated", [])
+            self.output_manager.write_analysis_md(analysis_dir, question, "(none)", None, "No code generated", [], self._iteration, self._max_iterations, self.chain_id)
             self.message_manager.append_qa_pair(question, "Code generation failed — no executable code produced.", chain_id=self.chain_id)
             return
 
@@ -577,7 +577,7 @@ class ExplorationEngine:
 
         # ── Write analysis.md ──
         plot_note = f"{len(plots)} plot{'s' if len(plots) != 1 else ''}" if plots else ""
-        self._write_analysis_md(analysis_dir, question, code, results, error, plots)
+        self.output_manager.write_analysis_md(analysis_dir, question, code, results, error, plots, self._iteration, self._max_iterations, self.chain_id)
         rel_path = os.path.relpath(analysis_dir, ".")
         self.output_manager.print_wrapper(
             style.file_ref(f"{rel_path}/analysis.md", plot_note),
@@ -728,7 +728,7 @@ class ExplorationEngine:
         self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
 
         # Write analysis.md for the orientation
-        self._write_analysis_md(analysis_dir, "ORIENTATION: Dataset analytical profile", code, results, error, plots)
+        self.output_manager.write_analysis_md(analysis_dir, "ORIENTATION: Dataset analytical profile", code, results, error, plots, self._iteration, self._max_iterations, self.chain_id)
 
         return profile
 
@@ -740,104 +740,6 @@ class ExplorationEngine:
         """Build the analysis directory path for a given chain_id."""
         iter_dir = f"{self._iteration:02d}"
         return os.path.join(self.output_dir, "exploration", iter_dir, str(chain_id))
-
-    def _write_analysis_md(self, analysis_dir, question, code, results, error, plots):
-        """Write analysis.md with code, output, and embedded plots."""
-        md_parts = [f"# {question}\n"]
-        md_parts.append(
-            f"| Field | Value |\n|-------|-------|\n"
-            f"| Iteration | {self._iteration} of {self._max_iterations} |\n"
-            f"| Chain ID | {self.chain_id} |\n"
-        )
-
-        md_parts.append("\n## Code\n")
-        md_parts.append(f"```python\n{code}\n```\n")
-
-        md_parts.append("\n## Output\n")
-        if results:
-            md_parts.append(f"```\n{results}\n```\n")
-        elif error:
-            md_parts.append(f"```\nEXECUTION ERROR:\n{error}\n```\n")
-        else:
-            md_parts.append("```\nNo output produced.\n```\n")
-
-        if plots:
-            md_parts.append("\n## Plots\n")
-            for plot_path in plots:
-                fname = os.path.basename(plot_path)
-                md_parts.append(f"![{fname}]({fname})\n")
-
-        md_path = os.path.join(analysis_dir, "analysis.md")
-        with open(md_path, "w") as f:
-            f.write("\n".join(md_parts))
-
-    def write_iteration_summary(self, iteration, solutions_data, scores,
-                                 selected_index, model_impact, contradiction,
-                                 arc_exhausted,
-                                 new_questions=None, selected_questions=None):
-        """Write _summary.md for an iteration. Called from auto_explore.run()."""
-        iter_dir = f"{iteration:02d}"
-        summary_dir = os.path.join(self.output_dir, "exploration", iter_dir)
-        os.makedirs(summary_dir, exist_ok=True)
-
-        parts = [f"# Iteration {iteration}\n"]
-
-        # Solutions table
-        parts.append("## Solutions Evaluated\n")
-        parts.append("| # | Chain ID | Question | Score |")
-        parts.append("|---|----------|----------|-------|")
-        for i, sol in enumerate(solutions_data):
-            s = scores[i] if i < len(scores) else "?"
-            marker = " ✓" if i == selected_index else ""
-            cid = sol.get('chain_id', '?')
-            parts.append(f"| {i+1}{marker} | [{cid}]({cid}/analysis.md) | {sol['question'][:80]} | {s}/10 |")
-        parts.append("")
-
-        # Model update
-        parts.append("## Research Model Update\n")
-        parts.append(f"- **Model Impact:** {model_impact}")
-        parts.append(f"- **Contradiction:** {'Yes' if contradiction else 'No'}")
-        parts.append(f"- **Arc Exhausted:** {'Yes' if arc_exhausted else 'No'}")
-        parts.append("")
-
-        # Questions
-        if new_questions:
-            parts.append("## Questions Generated\n")
-            for i, q in enumerate(new_questions, 1):
-                parts.append(f"{i}. {q[:120]}")
-            parts.append("")
-
-        if selected_questions:
-            parts.append("**Selected for next iteration:** " + ", ".join(
-                q[:60] + "..." for q in selected_questions
-            ))
-
-        path = os.path.join(summary_dir, "_summary.md")
-        with open(path, "w") as f:
-            f.write("\n".join(parts))
-
-    def write_final_outputs(self, research_model, synthesis_text=None):
-        """Write final research model, synthesis report, and cost summary."""
-        # Research model
-        model_path = os.path.join(self.output_dir, "research_model.md")
-        with open(model_path, "w") as f:
-            f.write("# Final Research Model\n\n")
-            f.write(research_model or "(empty)")
-
-        # Synthesis report
-        if synthesis_text:
-            synth_path = os.path.join(self.output_dir, "synthesis_report.md")
-            with open(synth_path, "w") as f:
-                f.write(synthesis_text)
-
-        # Cost summary
-        cost_path = os.path.join(self.output_dir, "cost.txt")
-        with open(cost_path, "w") as f:
-            f.write(self.cost_tracker.report() + "\n")
-            if self.run_logger:
-                agent_summary = self.run_logger.summary()
-                if agent_summary:
-                    f.write("\n" + agent_summary + "\n")
 
     # ──────────────────────────────────────────────
     # Utilities

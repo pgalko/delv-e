@@ -247,7 +247,10 @@ def _render_html(d):
 
     # Status pill
     if d['is_complete']:
-        status_html = '<span class="status-pill status-complete">Complete</span>'
+        status_html = (
+            '<span class="status-pill status-complete">Complete</span>'
+            ' <a href="synthesis_report.html" class="report-btn">View Report</a>'
+        )
     else:
         status_html = '<span class="status-pill status-running">Running</span>'
 
@@ -484,6 +487,8 @@ def _render_html(d):
   .status-running::before {{ content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }}
   @keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
   .status-complete {{ background: var(--blue-bg); color: var(--blue-fg); }}
+  .report-btn {{ display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 500; padding: 4px 14px; border-radius: 20px; background: var(--green-bg); color: var(--green-fg); text-decoration: none; margin-left: 8px; transition: opacity 0.15s; }}
+  .report-btn:hover {{ opacity: 0.8; }}
   .meta-bar {{ padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; gap: 24px; flex-wrap: wrap; font-size: 12px; color: var(--fg2); }}
   .meta-bar span {{ display: flex; align-items: center; gap: 4px; }}
   .meta-label {{ color: var(--fg3); }}
