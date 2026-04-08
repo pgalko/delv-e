@@ -22,3 +22,11 @@ mannwhitneyu alternative defaults to 'two-sided' in recent scipy — specify exp
 # --- numpy/type traps ---
 np.float64 values in f-strings print as "np.float64(3.14)" — cast with float() for clean output
 When comparing pandas Timestamps, use pd.Timestamp() not datetime.datetime()
+
+# --- financial / time-series libraries ---
+prophet: use `from prophet import Prophet`, not `from fbprophet import Prophet` (package renamed)
+arch: GARCH fitting uses `arch_model(returns, vol='Garch', p=1, q=1)` — pass returns not prices
+hmmlearn: GaussianHMM requires 2D input — reshape with `.reshape(-1, 1)` for single-feature series
+ta: indicators expect DataFrame columns named 'high', 'low', 'close', 'volume' (lowercase)
+ruptures: use `rpt.Pelt(model="rbf").fit(signal)` — signal must be a numpy array, not a Series
+pmdarima: use `import pmdarima as pm; model = pm.auto_arima(series)` — not `from pyramid.arima`

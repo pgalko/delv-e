@@ -644,6 +644,14 @@ class AutoExplorer:
             arc_complete = 'YES' in ac_line
         self._last_arc_complete = arc_complete
 
+        # ── Parse EARLY_STOP ──
+        self._early_stop_requested = False
+        if 'EARLY_STOP:' in response.upper():
+            es_line = response.upper().split('EARLY_STOP:')[1].split('\n')[0].strip()
+            self._early_stop_requested = 'YES' in es_line
+            if self._early_stop_requested:
+                logger.info("Strategic review requested EARLY_STOP")
+
         # ── Parse MISSED ──
         missed = ""
         if 'MISSED:' in response:
@@ -1031,6 +1039,57 @@ class AutoExplorer:
         return perspectives
 
     # ══════════════════════════════════════════════
+    # AUTO-STOP DETECTION
+    # ══════════════════════════════════════════════
+
+    _MIN_ITERATIONS_BEFORE_STOP = 15  # don't stop before the investigation has matured
+    _ABANDON_STREAK_THRESHOLD = 8     # consecutive ABANDONs to trigger mechanical backstop
+    _SCORE_THRESHOLD = 6.0            # mean score below this during streak triggers stop
+
+    def _should_stop(self, iteration):
+        """Determine whether the investigation should stop early.
+
+        Two independent triggers (either is sufficient):
+        1. Strategic review explicitly requested EARLY_STOP: YES
+        2. Mechanical backstop: last N consecutive commitments are ABANDON
+           and the mean score during that streak is below threshold
+
+        Returns True if auto-stop should trigger.
+        """
+        if iteration < self._MIN_ITERATIONS_BEFORE_STOP:
+            return False
+
+        # Signal 1: Strategic review explicit request
+        if getattr(self, '_early_stop_requested', False):
+            return True
+
+        # Signal 2: Mechanical backstop — sustained ABANDON streak with low scores
+        if len(self.commitment_history) < self._ABANDON_STREAK_THRESHOLD:
+            return False
+
+        recent = self.commitment_history[-self._ABANDON_STREAK_THRESHOLD:]
+        if not all(action == 'ABANDON' for _, action in recent):
+            return False
+
+        # Check scores during the streak
+        active = sorted(
+            [n for n in self.insight_tree.values() if n['status'] == 'active'],
+            key=lambda n: n['chain_id']
+        )
+        if len(active) < self._ABANDON_STREAK_THRESHOLD:
+            return False
+
+        streak_scores = [n['quality_score'] for n in active[-self._ABANDON_STREAK_THRESHOLD:]]
+        mean_score = sum(streak_scores) / len(streak_scores)
+
+        if mean_score < self._SCORE_THRESHOLD:
+            logger.info(f"Auto-stop mechanical backstop: {self._ABANDON_STREAK_THRESHOLD} "
+                         f"consecutive ABANDONs, mean score {mean_score:.1f}")
+            return True
+
+        return False
+
+    # ══════════════════════════════════════════════
     # SEED DECOMPOSITION (premium model)
     # ══════════════════════════════════════════════
 
@@ -1088,8 +1147,14 @@ class AutoExplorer:
     # ══════════════════════════════════════════════
 
     def run(self, seed_question, initial_image=None, max_iterations=5, num_parallel_solutions=2,
-            interactive=False, resumed_state=None, orientation=True):
-        """Run the autonomous exploration loop."""
+            interactive=False, resumed_state=None, orientation=True, auto_stop=False):
+        """Run the autonomous exploration loop.
+
+        Args:
+            auto_stop: If True, the system may terminate before max_iterations
+                when the strategic review determines the investigation is complete.
+                Default False — the full iteration budget is always used.
+        """
 
         num_parallel_solutions = max(2, min(5, num_parallel_solutions))
 
@@ -1401,6 +1466,13 @@ class AutoExplorer:
                     ))
                     break
                 if self.kill_signal:
+                    break
+
+                # ── AUTO-STOP CHECK ──
+                if auto_stop and self._should_stop(iteration):
+                    print(f"\n  {style.GREEN}●{style.RESET} {style.BOLD}Investigation complete "
+                          f"— proceeding to synthesis{style.RESET} "
+                          f"{style.DIM}(iteration {iteration} of {max_iterations}){style.RESET}")
                     break
 
                 # ── ARC TRANSITION ──

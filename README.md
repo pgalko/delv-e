@@ -40,7 +40,7 @@ On any iteration, the strategic review assesses whether a **reframing probe** is
 
 When an original arc completes, a **perspective rotation** generates 2-3 fundamentally different analytical lenses on the same phenomenon, ranked from most to least promising. An arc that investigated "what factors cause outcome Y to decline" (mechanistic perspective) might spawn perspectives like "how frequently do positive vs negative events occur" (event counting) or "has the system's capacity to convert input into outcome changed" (efficiency analysis). These are not deeper investigations of the same kind but different kinds of questions about the same subject. The top-ranked perspective is automatically pursued for 1-2 iterations under normal commitment rules: if findings are strong, the system keeps pursuing; if weak, it abandons quickly and moves to the next planned arc. Perspective arcs do not spawn further rotations, preventing recursive proliferation. The remaining perspectives are discarded — the next arc completion generates fresh perspectives relevant to that arc. The mechanism addresses a structural blind spot: the system naturally deepens each topic through one analytical lens but never switches lenses unless forced to.
 
-**Rung 3: synthesis.** The premium model generates a final synthesis report that integrates findings across the entire run, resolves contradictions, and draws conclusions about conditions not directly tested. This is the closest approximation to Knuth's proof: asking what the findings mean beyond the specific analyses that produced them.
+**Rung 3: synthesis.** After all exploration iterations complete, the premium model generates a narrative synthesis report that integrates findings across the entire run, resolves contradictions, and draws conclusions about conditions not directly tested. The synthesis follows a tension-first narrative structure: a paradox-driven title, rejected alternative explanations, key findings ordered by causal logic with declarative section titles, cross-cutting patterns that unify multiple findings, open questions separated from methodological caveats, and a scannable stable/changing/declining summary. A post-synthesis visualization pass generates publication-quality charts for each key finding, adapted from the original analysis code that produced those findings to ensure the charts faithfully represent the methodology. The final output is a styled HTML report with clickable citation links to the original analyses, embedded charts, dark mode support, and PDF export.
 
 The key insight from the article: strategic coherence requires a capable model with full context and override authority, while high-throughput exploration is best handled by faster, cheaper models doing what they're good at. The fix for divergence is structural division of labor.
 
@@ -52,27 +52,29 @@ Then a **seed decomposition** step (premium model) converts the user's research 
 
 Each iteration:
 
-1. **Generate questions**: LLM proposes analytical questions guided by the research model and the Strategic Trajectory. During PURSUING, all questions target a single finding's next maturity stage. When the strategic review has issued a pivot, a binding direction constraint focuses all questions on the new arc
-2. **Write & execute code**: code model writes Python, runs it against your DataFrame
-3. **Evaluate results**: LLM scores parallel solutions, selects the best, and recommends the next phase
+1. **Generate questions**: LLM proposes analytical questions guided by the research model and the Strategic Trajectory. When the strategic review has issued a HOLD, questions deepen the current arc. On PIVOT or ABANDON, a binding direction constraint focuses all questions on the new arc
+2. **Write & execute code**: code model writes Python, runs it against your DataFrame. A `pitfalls.txt` file of known API issues (scipy changes, pandas deprecations, type traps) is loaded fresh on every code generation call. Runtime error patterns (library-specific AttributeErrors) are recorded and injected into future prompts to prevent repeated failures
+3. **Evaluate results**: LLM scores parallel solutions, selects the best, and generates finding summaries
 4. **Update research model**: living document of hypotheses, findings, maturity tracking, cross-finding connections, and exploration health
-5. **Strategic review**: premium model reads the full research model, recent results, and data profile. Decides whether to hold, pivot, or abandon the current arc. Identifies missed opportunities and untested cross-finding connections, and rewrites the Strategic Trajectory. Can request a reframing probe on any commitment type; if triggered, the probe reads full analytical output and proposes alternative framings. When an arc completes, a perspective rotation generates ranked alternative analytical lenses and the top-ranked perspective is automatically pursued for 1-2 iterations before the next planned arc
-6. **Determine phase**: the premium model's strategic commitment determines the phase exclusively
+5. **Strategic review**: premium model reads the full research model, recent results, and data profile. Issues a commitment — HOLD, PIVOT, or ABANDON — with the authority to redirect the entire investigation. Can request a reframing probe or trigger a perspective rotation when an arc completes. Can signal EARLY_STOP when the investigation is genuinely complete (see Auto-Stop below)
 
 A live dashboard (`output/dashboard.html`) updates after each iteration. Open it in a browser to monitor progress, scores, findings, and exploration health in real time.
 
 ![delv-e dashboard](assets/dashboard.png)
 
-### Phase System
+### Commitment System
 
-Two phases controlled exclusively by the premium model's strategic review. Every iteration, the strategic review specifies `PHASE: MAPPING` or `PHASE: PURSUING` as part of its commitment decision. This commitment is enforced structurally until the next strategic review changes it. Phase control lives entirely in the premium model, preventing the oscillation that occurs when a cheap model pattern-matches "this looks like it needs breadth" one iteration and "this looks like it needs depth" the next.
+The strategic review issues one of three commitments every iteration. This commitment determines the character of the next iteration's questions and analyses:
 
-| Phase | Mode | When it activates |
+| Commitment | Meaning | Effect |
 |---|---|---|
-| **MAPPING** | Broad survey, screening | Strategic review issues PIVOT or ABANDON; exploration is early-stage |
-| **PURSUING** | Deep dive, validation | Strategic review issues HOLD on a productive arc; finding needs verification; active finding hasn't reached DECOMPOSED maturity |
+| **HOLD** | Current arc is productive | Deepen: questions target the same finding's next maturity stage |
+| **PIVOT** | New direction identified | Redirect: next_direction becomes binding constraint for question generation |
+| **ABANDON** | Current arc exhausted | Move on: system transitions to a new arc or the next planned direction |
 
-During PURSUING, all parallel question slots target the same finding. The system doesn't split attention across topics until it switches back to MAPPING.
+The commitment is enforced structurally until the next strategic review changes it. Commitment control lives entirely in the premium model, preventing the oscillation that occurs when a cheap model pattern-matches "this looks like it needs breadth" one iteration and "this looks like it needs depth" the next.
+
+The dashboard displays the commitment posture as a colored bar on each iteration: cyan for EXPLORING (first iteration of an arc), yellow for HOLD, green for PIVOT, red for ABANDON. Commitment history is recorded in the checkpoint for analysis.
 
 ### Finding Maturity
 
@@ -86,7 +88,7 @@ Significant findings (score 7+) are tracked through an analytical arc:
 | **REGIME-TESTED** | Temporal stability checked | Connect: test interactions with other findings |
 | **COMPLETE** | Operationally interpretable | Graduate; eligible for cross-finding connections |
 
-The maturity tracker prevents premature abandonment. The evaluator keeps the system in PURSUING until the active finding reaches at least DECOMPOSED. A finding that gets contradicted at any stage is dropped rather than forced through remaining stages.
+The maturity tracker prevents premature abandonment. The system stays committed until the active finding reaches maturity or is contradicted.
 
 ### Cross-Finding Connections
 
@@ -96,6 +98,33 @@ The strategic review (premium model) monitors untested interactions between esta
 - **NEXT_DIRECTION** on pivot, making a specific connection test the binding constraint for the next arc
 
 Connection types the system looks for: compounding (do they amplify each other?), mediating (does one explain the other?), conditional (does one modify the other?), and contradicting (do they point in opposite directions?). Results are tracked in the research model and graduated to established findings when confirmed.
+
+### Auto-Stop
+
+When `auto_stop=True`, the system can terminate before `max_iterations` when it determines the investigation is genuinely complete. Two independent signals trigger early termination (either is sufficient):
+
+1. **Strategic review explicit request.** The premium model sets `EARLY_STOP: YES` when all finding maturity items are complete, no unexplored territory remains, and recent iterations have been unproductive. This requires all four conditions: no unexplored territory, all maturity items complete or stalled, 5+ consecutive ABANDONs, and the biggest gap requires external data.
+
+2. **Mechanical backstop.** If the last 8 consecutive commitments are ABANDON and the mean score during that streak is below 6.0, the system stops regardless of the strategic review's recommendation.
+
+Auto-stop never triggers before iteration 15, ensuring the investigation has time to establish findings before assessing completeness. When triggered, the system prints "Investigation complete — proceeding to synthesis" and falls through to the same post-loop sequence: synthesis generation, chart generation, HTML report, and final dashboard write.
+
+```bash
+# Enable auto-stop
+python run.py data.csv "Analyze trends" --iterations 100 --auto-stop
+```
+
+Default is `auto_stop=False` — the full iteration budget is always used unless explicitly opted in.
+
+### Error Patterns and Pitfalls
+
+The code generator benefits from two sources of error prevention:
+
+**Static pitfalls** (`pitfalls.txt`): A user-maintained file of known code generation traps. Loaded fresh on every code generation call, so edits take effect mid-run without restart. Ships with 10 entries covering scipy API changes, pandas deprecations, stats gotchas, and type traps. Add your own as you discover patterns.
+
+**Runtime error patterns**: When code execution fails, the system records library-specific errors (e.g., `AttributeError: module 'scipy.stats' has no attribute 'diptest'`) and injects them into all future code generation prompts. Only meaningful errors are kept — AttributeErrors on library-specific classes, plus all ModuleNotFoundError/ImportError. Generic errors (ndarray, DataFrame, NoneType) are filtered out.
+
+Both sources are combined and appended to the code generator's prompt, preventing the same errors from recurring across iterations.
 
 ## Usage
 
@@ -110,6 +139,7 @@ python run.py <dataset> ["<question>"] [options]
 | `--output DIR` | output/ | Output directory |
 | `--continue` | | Resume from previous run's checkpoint |
 | `--no-orientation` | | Skip the orientation phase (data profiling) |
+| `--auto-stop` | | Allow early termination when investigation is complete |
 | `--agent-model` | anthropic:claude-haiku-4-5-20251001 | Model for agents (evaluator, QG, RI, selector) |
 | `--code-model` | anthropic:claude-haiku-4-5-20251001 | Model for code generation |
 | `--premium-model` | same as code-model | Model for orientation, strategic review, and synthesis |
@@ -136,22 +166,14 @@ python run.py data.csv "Analyze trends" --iterations 15
 # Quick 3-iteration run, skip orientation
 python run.py data.csv "What's the class balance?" --iterations 3 --no-orientation
 
-# OSS models via OpenRouter
-python run.py data.csv "What predicts price?" \
+# 100 iterations with auto-stop
+python run.py data.csv "What drives peak snowpack decline?" \
     --agent-model openrouter:moonshotai/kimi-k2.5 \
-    --code-model openrouter:moonshotai/kimi-k2.5
+    --code-model openrouter:moonshotai/kimi-k2.5 \
+    --premium-model anthropic:claude-opus-4-6 \
+    --iterations 100 --auto-stop
 
-# Mix providers: OSS agents, Anthropic code
-python run.py data.csv "Deep analysis" \
-    --agent-model openrouter:z-ai/glm-5 \
-    --code-model anthropic:claude-haiku-4-5-20251001
-
-# Local Ollama
-python run.py data.csv "Quick look" \
-    --agent-model ollama:qwen3:30b \
-    --code-model ollama:qwen3:30b
-
-# Premium strategic oversight with local agents
+# Local Ollama with premium strategic oversight
 python run.py data.csv "Deep analysis" \
     --agent-model ollama:qwen3:30b \
     --code-model ollama:qwen3:30b \
@@ -170,30 +192,48 @@ python run.py shoes.csv "Analyze shoe efficiency" --iterations 25
 python run.py shoes.csv "Pursue the cardiovascular paradox" --continue --iterations 30
 ```
 
-The seed question on `--continue` becomes the first analysis in the resumed run. The DataFrame, research model, insight tree, phase history, and all context are preserved. You can switch models between runs.
+The seed question on `--continue` becomes the first analysis in the resumed run. The DataFrame, research model, insight tree, commitment history, and all context are preserved. You can switch models between runs.
 
 ## Output
 
 ```
 output/
-├── dashboard.html           # Live dashboard, auto-refreshes
-├── synthesis_report.md      # Final report with citations
-├── research_model.md        # Hypotheses, findings, maturity, connections, gaps
-├── run_log.json             # Full log of every LLM call
-├── state.json               # Checkpoint for --continue
-├── dataframe.parquet        # Preserved DataFrame
-├── cost.txt                 # Cost breakdown
+├── dashboard.html               # Live dashboard with "View Report" button
+├── synthesis_report.md          # Final synthesis in markdown
+├── synthesis_report.html        # Styled HTML report with charts and citation links
+├── synthesis_charts/            # Publication-quality charts for key findings
+│   ├── 01_supply_retention_gap.png
+│   ├── 02_ne_wind_quadrupled.png
+│   └── ...
+├── research_model.md            # Hypotheses, findings, maturity, connections, gaps
+├── run_log.json                 # Full log of every LLM call
+├── state.json                   # Checkpoint for --continue
+├── dataframe.parquet            # Preserved DataFrame
+├── cost.txt                     # Cost breakdown by agent
 ├── orientation/
-│   └── analysis.md          # Dataset analytical profile
+│   └── analysis.md              # Dataset analytical profile
 └── exploration/
-    ├── 01_MAPPING/
-    │   ├── _summary.md      # Iteration evaluation + phase decision
+    ├── 01/
+    │   ├── _summary.md          # Iteration evaluation + commitment decision
     │   └── 1773198695/
-    │       ├── analysis.md  # Question + code + output
+    │       ├── analysis.md      # Question + code + output
+    │       ├── analysis.html    # Styled HTML with "← Back to Report" link
     │       └── plot_001.png
-    ├── 02_PURSUING/
+    ├── 02/
     └── ...
 ```
+
+### Synthesis Report
+
+The synthesis report is generated after all exploration iterations complete (or when auto-stop triggers). It produces three artifacts:
+
+**synthesis_report.md** — The raw markdown synthesis with `[[chain_id]]` citation markers.
+
+**synthesis_report.html** — A self-contained styled HTML report. Citation markers become clickable links to individual analysis pages showing the original code, output, and plots. Each analysis page has a "← Back to Report" link. The report includes a "← Dashboard" link at the top and an "⬇ Export PDF" button at the bottom. Dark mode supported via `prefers-color-scheme`.
+
+**synthesis_charts/** — One publication-quality matplotlib chart per key finding section. Charts are generated by the premium model, which receives the original analysis code that produced the finding and adapts it into a visualization. This ensures charts use the same filters, groupings, and calculations as the original analysis — numbers on the chart match numbers in the text. Charts are embedded inline in the HTML report.
+
+The dashboard shows a green "View Report" button when the run completes, linking directly to the HTML synthesis report.
 
 ## Memory Architecture
 
@@ -213,13 +253,15 @@ LLMs have no memory between calls. delv-e manages context through five layers:
 - *Exploration Health*: honest self-assessment of breadth, recent topic concentration, and unexplored territory. This section informs strategic direction: when the research model reports low breadth, the strategic review pivots to new territory
 - *Strategic Trajectory*: maintained exclusively by the premium model's strategic review. Records why pivots happened, what the current commitment is, and what direction has the highest expected value next. The cheap model updater is structurally prevented from modifying this section. The trajectory is extracted before each model update and re-spliced after, ensuring the premium model's strategic memory is never corrupted by the cheaper model
 
-**Q&A Pairs** where the Code Generator sees the 20 most recent question-result pairs plus the dataset schema. A deliberate sliding window: the code writer needs tactical context, not the full exploration history.
+**Q&A Pairs** where the Code Generator sees a summary-based format: recent pairs (last 40) with finding summaries and chain IDs, providing tactical context without overwhelming the prompt. The dataset column list is injected separately to help the code generator reference correct column names.
 
-**Full Results Store** holding untruncated results from every analysis, never shown to agents during exploration. Used only by the Synthesis Generator, which selects up to 40 analyses via score-weighted selection (top-scoring from the entire run + most recent 15 for continuity). Orientation, seed decomposition, and synthesis use the premium model via `--premium-model`. The strategic review also uses the premium model on every iteration, reading the full research model, the data profile, and recent result digests (including analytical method used) to maintain strategic coherence. In a 100-iteration run the premium model accounts for ~115 calls (100 strategic reviews + orientation + seed decomposition + synthesis + ~5 reframing probes + ~8 perspective rotations) while the remaining ~535 use cheaper models. The per-review cost is low (~3K input tokens, ~600 output tokens) because the review reads structured summaries, not raw results. Reframing probes (~8K input tokens) fire when the strategic review judges a result may benefit from a different analytical angle. Perspective rotations (~3K input tokens) fire when an original arc completes, generating ranked alternative analytical lenses; the top-ranked perspective is automatically pursued for 1-2 iterations.
+**Full Results Store** holding untruncated results from every analysis, never shown to agents during exploration. Used only by the Synthesis Generator, which receives all active findings (score-weighted) plus the full research model. Orientation, seed decomposition, and synthesis use the premium model via `--premium-model`. The strategic review also uses the premium model on every iteration, reading the full research model, the data profile, and recent result digests (including analytical method used) to maintain strategic coherence. In a 100-iteration run the premium model accounts for ~115 calls (100 strategic reviews + orientation + seed decomposition + synthesis + ~5 reframing probes + ~8 perspective rotations + ~8 synthesis charts) while the remaining ~535 use cheaper models. The per-review cost is low (~6K input tokens, ~600 output tokens) because the review reads structured summaries, not raw results.
 
 ### Context Management
 
 The system uses two schema modes: a full schema for the Code Generator, and a slim schema (column names, types, and unique counts only) for all other agents. For datasets with more than 50 columns, `head()` and `describe()` are omitted from the full schema. This reduces code generator input by up to 70% on wide datasets.
+
+The Question Generator uses a two-tier format for historical questions: the 30 most recent in full, older questions compressed to 120-character snippets. This keeps the QG informed of exploration history without unbounded prompt growth.
 
 The evaluator generates one-sentence summaries for all parallel solutions (not just the winner), giving every node in the insight tree an LLM-curated finding_summary. The Research Interpreter generates a 3-5 line result_digest of key numbers for winning nodes only.
 
@@ -233,22 +275,26 @@ The evaluator generates one-sentence summaries for all parallel solutions (not j
 | All Ollama (local) | Free |
 | Ollama + Opus premium | ~$1.00 (orientation + strategic review + synthesis) |
 
-The strategic review (premium model) runs every iteration but is lightweight, roughly 3K input tokens and 600 output tokens per call. Over 100 iterations this adds roughly $3 at Opus pricing, which is small relative to the code generation calls that dominate total cost.
+The strategic review (premium model) runs every iteration but is lightweight, roughly 6K input tokens and 600 output tokens per call. Over 100 iterations this adds roughly $7 at Opus pricing. Synthesis generation adds ~$0.50 and synthesis chart generation adds ~$0.50-0.80 (one premium model call per key finding chart). Total premium model cost for a 100-iteration run is typically $8-10.
 
 Check `output/cost.txt` after each run for exact breakdown by agent.
 
 ## Architecture
 
 ```
-run.py               CLI: dataset loading, --continue handling, --premium-model override
-engine.py            ExplorationEngine: runtime, code execution, orientation, file output
-auto_explore.py      Core loop: phases, strategic review, perspective rotation, research model
-dashboard.py         Live HTML dashboard, written after each iteration, auto-refreshes
+run.py               CLI: dataset loading, --continue handling, --auto-stop flag
+engine.py            ExplorationEngine: LLM pipeline, code execution, orientation
+auto_explore.py      Core loop: commitment system, strategic review, perspective rotation,
+                     auto-stop, synthesis charts, research model management
+output.py            OutputManager: all rendering — terminal display, analysis markdown,
+                     iteration summaries, final outputs, synthesis HTML, PDF export
+dashboard.py         Live HTML dashboard with commitment bands, "View Report" button
 llm.py               Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama)
-executor.py          Local code execution with security guards
-prompts.py           All prompt templates (agents, code generation, orientation, strategic review)
-style.py             Terminal formatting
-output.py            Print routing
+executor.py          Local code execution with security guards and traceback filtering
+prompts.py           All prompt templates (agents, code gen, orientation, strategic review,
+                     synthesis narrative structure, synthesis charts)
+style.py             Terminal formatting: colored commitment bars, exploration tree, spinners
+pitfalls.txt         Static code generation hints (user-editable, live-reloaded)
 logger_config.py     Logging configuration
 ```
 

@@ -486,6 +486,15 @@ ARC_COMPLETE: [YES / NO] — Only on ABANDON. YES when this arc produced establi
   pursue an alternative analytical perspective for 1-2 iterations before moving to the
   next arc. Account for this in your budget planning: each arc completion adds ~2
   perspective iterations.
+EARLY_STOP: [YES / NO] — YES ONLY when ALL of the following are true:
+  (a) Exploration Health shows no unexplored territory
+  (b) All Finding Maturity items are COMPLETE or stalled with no viable next step
+  (c) The last 5+ iterations have been ABANDON with no productive new directions
+  (d) The Biggest Gap requires external data not in the dataset
+  This is IRREVERSIBLE — the system will skip remaining iterations and proceed
+  directly to synthesis. Most runs should NEVER trigger this. Say NO unless you
+  are genuinely certain that further iterations cannot produce new findings.
+  Expect YES at most once per run, typically after 60-80% of budget is used.
 MISSED: [specific missed opportunities or untested connections, or NONE]
 UPDATED_TRAJECTORY:
 [full rewrite of Strategic Trajectory section]
