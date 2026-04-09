@@ -733,6 +733,16 @@ answers. Use DECLARATIVE section titles that state the conclusion:
   GOOD: "More Melt Days, Not Worse Melt Days"
   BAD:  "Pure Melt Day Trends"
 
+After each key finding section's technical content (before the --- separator),
+add a single italic paragraph beginning with "*In plain terms:*" that explains
+the finding for a non-technical audience. Focus on what the finding means in
+practice — who should care and why. Use analogies where helpful. Avoid all
+statistical jargon: no p-values, R², coefficients, standard deviations, or
+confidence intervals. Each summary should be 3-5 sentences. The reader should
+understand the practical implication without having read the technical paragraphs
+above. Do NOT add plain-language summaries to Tested and Rejected, Cross-Cutting
+Patterns, The Open Question, Methodological Caveats, or What Is Stable sections.
+
 **5. ## Cross-Cutting Patterns**
 2-3 higher-order principles that UNIFY multiple findings. Not "Finding A and
 Finding B are related" but "A single structural change (X) explains why A, B,
@@ -805,16 +815,29 @@ REQUIREMENTS:
 - If the finding is about a breakpoint: shade or annotate pre/post periods.
 - If the finding is about a comparison: use side-by-side bars or box plots.
 - If the finding is about a correlation: use scatter with regression line and r/p.
-- Annotate the key statistic on the chart (e.g., "p = 0.003", "slope = −2.64").
 - Use fig, ax = plt.subplots(figsize=(10, 6)) for consistent sizing.
 - Use plt.tight_layout() before plt.show().
 
 STYLE:
-- Title: bold, 13pt, stating the conclusion (not the topic).
+- Title: bold, 13pt, stating the conclusion (not the topic). Single line preferred,
+  two lines maximum. Do NOT add subtitle annotations near the title area.
 - Axis labels: 11pt.
 - Use color purposefully: red for decline, blue/green for increase, grey for baselines.
-- For breakpoints, use a vertical dashed line with a label.
+- For breakpoints, use a vertical dashed line with a small label.
 - For regime comparisons, use semi-transparent shading.
+
+ANNOTATION RULES:
+- Do NOT add text annotations, callouts, arrows, or floating statistics on the
+  chart. The chart is embedded in a report that already contains all numbers
+  and a plain-language explanation — annotations are redundant clutter.
+- Let the visual pattern speak for itself. A well-designed chart needs no
+  annotations — the title states the conclusion, the axes provide scale,
+  and the data tells the story.
+- The ONLY text on the chart should be: the title, axis labels, tick labels,
+  and legend entries (if needed). Nothing else.
+- Embed key identifiers in the data itself: label bars with group names
+  (e.g., "Tier 1", "Tier 3"), use color to distinguish categories, and
+  let the reader see the pattern without being told what to see.
 
 `df` is pre-loaded. Include all imports at the top.
 Return ONLY code within ```python``` blocks. Do NOT print anything — chart only."""
@@ -830,7 +853,8 @@ Return ONLY code within ```python``` blocks. Do NOT print anything — chart onl
 
 RULES:
 - `df` is pre-loaded. Do NOT load, create, or redefine it.
-- Use matplotlib for plots (call plt.show()). Do NOT use plotly.
+- Do NOT generate any plots or visualizations. Focus entirely on computation
+  and the results block. Visualizations are generated separately at synthesis time.
 - Include all imports at the top.
 - Use vectorized pandas operations — not row-level loops.
 - Handle nulls: check for NaN before calculations, verify column existence.

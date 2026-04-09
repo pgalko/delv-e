@@ -27,6 +27,15 @@ When comparing pandas Timestamps, use pd.Timestamp() not datetime.datetime()
 prophet: use `from prophet import Prophet`, not `from fbprophet import Prophet` (package renamed)
 arch: GARCH fitting uses `arch_model(returns, vol='Garch', p=1, q=1)` — pass returns not prices
 hmmlearn: GaussianHMM requires 2D input — reshape with `.reshape(-1, 1)` for single-feature series
-ta: indicators expect DataFrame columns named 'high', 'low', 'close', 'volume' (lowercase)
+ta: indicators expect lowercase columns (high, low, close, volume) — rename or pass columns explicitly
 ruptures: use `rpt.Pelt(model="rbf").fit(signal)` — signal must be a numpy array, not a Series
 pmdarima: use `import pmdarima as pm; model = pm.auto_arima(series)` — not `from pyramid.arima`
+
+# --- data cleaning traps ---
+Dollar-prefixed columns (e.g. "$352.82") are strings — strip '$' and cast: df[col].str.replace('$','').astype(float)
+Date columns in M/D/YYYY format: use pd.to_datetime(df['Date'], format='%m/%d/%Y') — do NOT assume YYYY-MM-DD
+Column names with slashes (e.g. 'Close/Last') — use df['Close/Last'] not df.Close/Last (dot access fails)
+
+# --- matplotlib chart quality ---
+Synthesis charts: do NOT add text annotations, arrows, or floating statistics — the report text provides all numbers
+Keep charts clean: only title, axis labels, tick labels, and legend. No ax.annotate, no ax.text callouts
