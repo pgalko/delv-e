@@ -480,7 +480,8 @@ class ExplorationEngine:
         os.makedirs(analysis_dir, exist_ok=True)
 
         # ── Execute ──
-        results, error, plots = self.executor.execute(code, self.df, analysis_dir)
+        with style.spinner("Executing code"):
+            results, error, plots = self.executor.execute(code, self.df, analysis_dir)
 
         # ── Error Correction Loop (silent) ──
         initial_error = error  # preserve for error pattern recording

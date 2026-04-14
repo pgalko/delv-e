@@ -153,8 +153,6 @@ Quality score: {score}/10
 Findings:
 {result_summary}
 
-{parallel_results}
-
 ═══ TASK 1: ASSESS IMPACT ═══
 
 MODEL_IMPACT: [HIGH / MEDIUM / LOW]
@@ -663,14 +661,18 @@ wants to understand WHAT was found and WHY it matters.
 THE INPUT HAS FOUR SECTIONS:
 - **Section A (Context):** Original question and dataset profile
 - **Section B (Findings Index):** One-line summary of every analysis with scores and IDs
-- **Section C (Full Evidence):** Complete numerical results for every analysis
-- **Section D (Research Model):** Final understanding (may not cover earlier discoveries —
-  cross-reference against the Findings Index)
+- **Section C (Research Model):** Final synthesised understanding — established findings,
+  maturity tracking, cross-finding connections, strategic trajectory. Read this FIRST
+  to understand the investigation's narrative before examining raw evidence.
+- **Section D (Evidence):** Raw numerical results, score-gated: full results for score 8+
+  analyses (the key findings), summaries only for score 6-7, score ≤5 omitted (see
+  Findings Index for completeness). Every quantitative claim must trace to Section D.
 
 YOUR APPROACH:
-1. Scan the Findings Index to identify clusters of related analyses — these are themes.
-2. For each theme, read Full Evidence to extract key numbers.
-3. Use the Research Model for confidence levels, but don't limit to what it mentions.
+1. Read the Research Model (Section C) to understand the investigation's arc and conclusions.
+2. Scan the Findings Index (Section B) to identify themes and any score-8+ analyses
+   not covered by the Research Model.
+3. For each theme, read Full Evidence (Section D) to extract and verify key numbers.
 4. Findings supported by multiple high-scoring analyses (7+) are more reliable.
 5. Pay special attention to Cross-Finding Connections in the Research Model — these
    represent the system's most integrative discoveries.
@@ -718,13 +720,32 @@ counterintuitive — the thing that doesn't fit conventional expectations. Then
 state, in one sentence, what the investigation discovered as the resolution.
 This is the hook that makes the reader care.
 
-**3. ## Tested and Rejected**
+**3. ## Questions Addressed**
+The original research agenda may contain specific questions or sub-questions. Before
+the detailed narrative, provide direct answers grounded in the investigation's findings.
+
+For multi-part questions: answer each identifiable sub-question separately.
+For a single focused question: provide one comprehensive answer that synthesises
+the key findings into a clear, complete response.
+
+For each answer:
+- State the question in bold
+- Answer in 2-3 sentences (single questions may use a short paragraph) using only
+  established findings (cite [[chain_id]])
+- If a question was tested and found null or rejected, say so directly
+- If the answer depends on measurement choice, state the dependency
+- End each answer with an italic parenthetical referencing which ## section(s) below
+  contain the full technical detail, e.g. *(Full detail: "Section Title" below.)*
+Use plain language — no p-values, no coefficients, no statistical jargon. This section
+serves readers who want answers without reading the full report.
+
+**4. ## Tested and Rejected**
 Immediately after the opening, list the alternative explanations that were
 systematically tested and eliminated. This shows rigour and pre-empts the reader's
 objections. For each: state the hypothesis, cite the evidence that refutes it,
 give the key statistic.
 
-**4. KEY FINDING SECTIONS (multiple ## sections):**
+**5. KEY FINDING SECTIONS (multiple ## sections):**
 Each major finding gets its own ## section. Order them by CAUSAL LOGIC, not by
 importance — each section should motivate the question that the next section
 answers. Use DECLARATIVE section titles that state the conclusion:
@@ -740,32 +761,32 @@ practice — who should care and why. Use analogies where helpful. Avoid all
 statistical jargon: no p-values, R², coefficients, standard deviations, or
 confidence intervals. Each summary should be 3-5 sentences. The reader should
 understand the practical implication without having read the technical paragraphs
-above. Do NOT add plain-language summaries to Tested and Rejected, Cross-Cutting
-Patterns, The Open Question, Methodological Caveats, or What Is Stable sections.
+above. Do NOT add plain-language summaries to Questions Addressed, Tested and Rejected,
+Cross-Cutting Patterns, The Open Question, Methodological Caveats, or What Is Stable sections.
 
-**5. ## Cross-Cutting Patterns**
+**6. ## Cross-Cutting Patterns**
 2-3 higher-order principles that UNIFY multiple findings. Not "Finding A and
 Finding B are related" but "A single structural change (X) explains why A, B,
 and C all shifted simultaneously." These should be genuinely synthetic insights,
 not summaries of individual findings.
 
-**6. ## The Open Question**
+**7. ## The Open Question**
 Separate from methodological caveats. This is the most important thing the data
 CANNOT answer — the gap that matters for future work. Frame it as a question,
 explain why the available data can't answer it, and suggest what data would.
 
-**7. ## Methodological Caveats**
+**8. ## Methodological Caveats**
 Short, factual list of limitations: sample sizes, method-dependent significance,
 data reliability issues. No interpretation — just the facts the reader needs
 to assess confidence.
 
-**8. ## What Is Stable, What Is Changing**
+**9. ## What Is Stable, What Is Changing**
 A scannable summary in three categories:
 - **Stable:** variables that show no significant trend
 - **Increasing/changing:** variables with significant upward trends or structural shifts
 - **Declining:** variables with significant downward trends or loss
 
-**9. ## Conclusion**
+**10. ## Conclusion**
 3-5 sentences tying together the key discoveries. Restate the central finding,
 the mechanism, and the single most important implication or open question.
 

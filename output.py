@@ -63,7 +63,15 @@ class OutputManager:
         if self.silent_mode:
             return
 
+    def get_captured_output(self):
+        """Return captured output from silent mode and clear the buffer."""
+        result = ''.join(self._captured_output)
+        self._captured_output.clear()
+        return result
+
     def set_silent(self, silent):
+        if silent:
+            self._captured_output.clear()
         self.silent_mode = silent
 
     # ──────────────────────────────────────────────

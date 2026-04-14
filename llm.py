@@ -15,8 +15,15 @@ import json
 import os
 import time
 
+import httpx
+
 from logger_config import get_logger
 logger = get_logger(__name__)
+
+# Stall prevention: if no data arrives for this many seconds during streaming,
+# the connection is considered dead. Protects against provider hangs without
+# killing legitimate slow generation (tokens keep the timer alive).
+STREAM_TIMEOUT = httpx.Timeout(None, connect=30.0, read=120.0, write=30.0)
 
 
 # ══════════════════════════════════════════════════
@@ -38,6 +45,7 @@ PRICING = {
     # Pricing: https://openrouter.ai/models
     "moonshotai/kimi-k2.5":       {"input": 0.45, "output": 2.20},
     "z-ai/glm-5":                 {"input": 0.72, "output": 2.30},
+    "z-ai/glm-5.1":               {"input": 1.39, "output": 4.40},
     "deepseek/deepseek-v3.2":     {"input": 0.26, "output": 0.38},
     "qwen/qwen3.5-397b-a17b":     {"input": 0.39, "output": 2.34},
     "minimax/minimax-m2.7":       {"input": 0.30, "output": 1.20},
@@ -100,6 +108,7 @@ class AnthropicProvider:
             with self.client.messages.stream(
                 model=model, system=system_msg, messages=api_messages,
                 max_tokens=max_tokens, temperature=temperature,
+                timeout=STREAM_TIMEOUT,
             ) as stream:
                 for event in stream:
                     if hasattr(event, 'type') and event.type == 'content_block_delta':
@@ -177,7 +186,7 @@ class OpenAIProvider:
         collected = []
         input_tokens = 0
         output_tokens = 0
-        stream = self.client.responses.create(**params)
+        stream = self.client.responses.create(**params, timeout=STREAM_TIMEOUT)
         for event in stream:
             if event.type == "response.output_text.delta":
                 collected.append(event.delta)
@@ -229,6 +238,7 @@ class OllamaProvider:
             temperature=temperature,
             stream=True,
             stream_options={"include_usage": True},
+            timeout=STREAM_TIMEOUT,
         )
         for chunk in stream:
             if chunk.usage:
@@ -294,6 +304,7 @@ class OpenRouterProvider:
             temperature=temperature,
             stream=True,
             stream_options={"include_usage": True},
+            timeout=STREAM_TIMEOUT,
         )
         for chunk in stream:
             if chunk.usage:
@@ -379,9 +390,9 @@ class RunLogger:
                 self.entries = []
 
     def log(self, agent, model, messages, response,
-            input_tokens, output_tokens, elapsed_time):
+            input_tokens, output_tokens, elapsed_time, ttft=None):
         cost = compute_cost(model, input_tokens, output_tokens)
-        self.entries.append({
+        entry = {
             "agent": agent,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "model": model,
@@ -393,7 +404,10 @@ class RunLogger:
             "cost_usd": round(cost, 6),
             "input": messages,
             "output": response,
-        })
+        }
+        if ttft is not None:
+            entry["ttft_s"] = ttft
+        self.entries.append(entry)
         self._flush()
 
     def _flush(self):
@@ -487,8 +501,11 @@ class LLMClient:
         provider_name, model_name = parse_model_string(model)
         provider = self._get_provider(provider_name)
         start_time = time.time()
+        first_token_time = [None]  # mutable container for closure
 
         def on_token(text):
+            if first_token_time[0] is None:
+                first_token_time[0] = time.time()
             if output_manager:
                 output_manager.print_wrapper(text, end='', flush=True, chain_id=chain_id)
 
@@ -504,9 +521,10 @@ class LLMClient:
             output_manager.print_wrapper("", chain_id=chain_id)
 
         elapsed = time.time() - start_time
+        ttft = round(first_token_time[0] - start_time, 2) if first_token_time[0] else None
         self.cost_tracker.record(input_tokens, output_tokens, model_name)
 
         if self.run_logger:
             self.run_logger.log(agent, f"{provider_name}:{model_name}", messages,
-                                content, input_tokens, output_tokens, elapsed)
+                                content, input_tokens, output_tokens, elapsed, ttft)
         return content

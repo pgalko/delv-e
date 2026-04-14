@@ -39,3 +39,12 @@ Column names with slashes (e.g. 'Close/Last') — use df['Close/Last'] not df.Cl
 # --- matplotlib chart quality ---
 Synthesis charts: do NOT add text annotations, arrows, or floating statistics — the report text provides all numbers
 Keep charts clean: only title, axis labels, tick labels, and legend. No ax.annotate, no ax.text callouts
+
+# --- computational limits (execution is killed after 300s) ---
+Bootstrap/permutation/cross-validation: use ≤200 iterations, ≤5 CV folds. Do NOT use 1000+ iterations.
+Iterative model fits (MixedLM, Bradley-Terry, EM, MCMC): filter to groups with ≥10 observations BEFORE fitting, cap at ≤300 groups.
+Pairwise operations (distance matrices, all-pairs tests, correlation matrices on entities): cap at ≤500 entities per dimension, or sample.
+Large regression/OLS: if >10,000 rows, aggregate to per-group summaries before fitting iterative solvers.
+Grid search (GridSearchCV, parameter sweeps): limit to ≤50 total parameter combinations.
+When stratifying models across eras/groups: fit sequentially and store only summary statistics. Clear intermediate results between strata.
+Avoid nested loops that multiply: N_iterations × N_strata × N_entities must stay under 500,000 total operations.

@@ -430,8 +430,7 @@ class AutoExplorer:
     # RESEARCH MODEL INTERPRETER
     # ══════════════════════════════════════════════
 
-    def _interpret_and_update_model(self, winning_solution, quality_score,
-                                     solutions_data=None, selected_index=0, scores=None):
+    def _interpret_and_update_model(self, winning_solution, quality_score):
         """Interpret the latest result and update the research model.
 
         Returns:
@@ -446,26 +445,12 @@ class AutoExplorer:
         # Column list for Exploration Health cross-reference (always available)
         column_list = self.engine._get_column_list() if hasattr(self.engine, '_get_column_list') else "(columns not available)"
 
-        parallel_context = ""
-        if solutions_data and len(solutions_data) > 1 and scores:
-            parts = ["**Other parallel results this iteration (not selected):**"]
-            for i, sol in enumerate(solutions_data):
-                if i == selected_index:
-                    continue
-                result_text = str(sol['results']) if sol['results'] else "No results"
-                parts.append(
-                    f"- [{scores[i]}/10] {sol['question']}\n"
-                    f"  Finding: {result_text}"
-                )
-            parallel_context = '\n'.join(parts)
-
         interpret_prompt = self.engine.prompts.research_model_updater.format(
             seed_question=self.seed_question,
             current_model=current_model,
             question=winning_solution['question'],
             score=quality_score,
             result_summary=result_summary,
-            parallel_results=parallel_context,
             column_list=column_list,
         )
 
@@ -501,16 +486,67 @@ class AutoExplorer:
                 method_used = method_text
 
         # Extract updated model
-        updated_model = self.research_model
-        if 'UPDATED_MODEL:' in response:
-            model_text = response.split('UPDATED_MODEL:')[1]
-            if 'END_MODEL' in model_text:
-                model_text = model_text.split('END_MODEL')[0]
-            model_text = model_text.strip()
-            if model_text:
-                updated_model = model_text
+        updated_model = self._extract_and_validate_model(
+            response, interpret_messages)
 
         return updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used
+
+    @staticmethod
+    def _extract_model_text(response):
+        """Extract the UPDATED_MODEL text from an RI response."""
+        if 'UPDATED_MODEL:' not in response:
+            return ""
+        model_text = response.split('UPDATED_MODEL:')[1]
+        if 'END_MODEL' in model_text:
+            model_text = model_text.split('END_MODEL')[0]
+        return model_text.strip()
+
+    @staticmethod
+    def _count_content_sections(text):
+        """Count research model sections, excluding Strategic Trajectory
+        (which is managed separately via extract/re-splice)."""
+        return sum(1 for line in text.split('\n')
+                   if line.startswith('## ') and 'Strategic Trajectory' not in line)
+
+    def _extract_and_validate_model(self, response, messages):
+        """Extract UPDATED_MODEL from response, validate structure, retry on truncation."""
+        model_text = self._extract_model_text(response)
+        if not model_text:
+            return self.research_model
+
+        current_sections = self._count_content_sections(self.research_model)
+        new_sections = self._count_content_sections(model_text)
+
+        # First iteration — no baseline to compare against
+        if current_sections == 0:
+            return model_text
+
+        # Model is structurally intact
+        if new_sections >= current_sections:
+            return model_text
+
+        # Truncated — retry with code model
+        logger.warning(
+            f"Research model truncated: {new_sections} sections "
+            f"vs {current_sections} — retrying with code model")
+
+        fallback = self._get_fallback_model('Research Interpreter')
+        if not fallback:
+            logger.warning("No fallback model available — keeping existing model")
+            return self.research_model
+
+        retry_response = self._call_agent_with_retry(
+            messages, 'Research Interpreter', model_override=fallback)
+        retry_text = self._extract_model_text(retry_response or "")
+
+        if retry_text and self._count_content_sections(retry_text) >= current_sections:
+            logger.info(f"Code model retry succeeded: "
+                        f"{self._count_content_sections(retry_text)} sections")
+            return retry_text
+
+        logger.warning(
+            f"Code model retry also incomplete — keeping existing model")
+        return self.research_model
 
     @staticmethod
     def _parse_field(response, field_name, default='', valid=None):
@@ -550,8 +586,11 @@ class AutoExplorer:
         if not self.insight_tree:
             return "(No iterations yet)"
 
-        all_nodes = sorted(self.insight_tree.values(), key=lambda n: n['chain_id'])
-        recent = all_nodes[-5:]
+        active_nodes = sorted(
+            [n for n in self.insight_tree.values() if n['status'] == 'active'],
+            key=lambda n: n['chain_id'],
+        )
+        recent = active_nodes[-5:]
 
         parts = []
         for node in recent:
@@ -559,15 +598,12 @@ class AutoExplorer:
             question = node['question']
             digest = node.get('result_digest', '')
             method = node.get('method_used', '')
-            status = node['status']
 
             entry = f"- [{score}/10] Q: {question}"
             if digest:
                 entry += f"\n  Finding: {digest}"
             if method:
                 entry += f"\n  Method: {method}"
-            if status == 'runner_up':
-                entry += f" [RUNNER_UP]"
             parts.append(entry)
 
         return '\n'.join(parts)
@@ -813,12 +849,12 @@ class AutoExplorer:
         if not why_it_matters or len(why_it_matters) < 10:
             why_it_matters = self.seed_question
 
-        # Full results from last 3 analyses (most recent by chain_id)
+        # Full results from last 3 winning analyses (most recent by chain_id)
         if not self.insight_tree:
             return None
 
         recent_nodes = sorted(
-            self.insight_tree.values(),
+            [n for n in self.insight_tree.values() if n['status'] == 'active'],
             key=lambda n: n['chain_id'],
         )[-3:]
 
@@ -1383,9 +1419,6 @@ class AutoExplorer:
                         self._interpret_and_update_model(
                             winning_solution,
                             scores[selected_index],
-                            solutions_data=solutions_data,
-                            selected_index=selected_index,
-                            scores=scores,
                         )
 
                 if new_node_id in self.insight_tree and result_digest:
@@ -1546,11 +1579,12 @@ class AutoExplorer:
                                          arc_history=self.arc_history,
                                          total_iterations=iteration))
 
-            avg_score = sum(n['quality_score'] for n in self.insight_tree.values()) / len(self.insight_tree) if self.insight_tree else 0
+            active_nodes = [n for n in self.insight_tree.values() if n['status'] == 'active']
+            avg_score = sum(n['quality_score'] for n in active_nodes) / len(active_nodes) if active_nodes else 0
 
             print(style.final_box(
                 iterations=iteration,
-                analyses=len(self.insight_tree),
+                analyses=len(active_nodes),
                 avg=avg_score,
                 n_arcs=len(self.arc_history),
                 cost_str=self.engine.cost_tracker.report(),
@@ -1889,8 +1923,11 @@ class AutoExplorer:
         """Build exploration history with tiered compaction."""
         if not self.insight_tree:
             return ""
-        all_nodes = sorted(self.insight_tree.values(), key=lambda n: n['chain_id'])
-        recent = all_nodes[-max_entries:]
+        active_nodes = sorted(
+            [n for n in self.insight_tree.values() if n['status'] == 'active'],
+            key=lambda n: n['chain_id'],
+        )
+        recent = active_nodes[-max_entries:]
 
         if len(recent) > full_detail_count:
             compact_nodes = recent[:-full_detail_count]
@@ -1920,9 +1957,9 @@ class AutoExplorer:
             for node in full_nodes:
                 score = node['quality_score']
                 question = node['question']
-
                 digest = node.get('result_digest', '')
-                if digest and node['status'] == 'active':
+
+                if digest:
                     history_parts.append(
                         f"- [{score}/10] Q: {question}\n  Finding: {digest}"
                     )
@@ -2051,7 +2088,17 @@ class AutoExplorer:
 
 def format_synthesis_input(insight_tree, full_results_store, research_model,
                            seed_question, data_profile=''):
-    """Build structured synthesis input from exploration state."""
+    """Build structured synthesis input from exploration state.
+
+    Section order: Context → Findings Index → Research Model → Evidence.
+    The Research Model comes before Evidence so the synthesis model reads
+    the strategic narrative before drilling into raw numbers.
+
+    Evidence is score-gated:
+      8+: full results (ground truth for key findings)
+      6-7: finding_summary only (context without noise)
+      ≤5:  omitted (kept in Findings Index for completeness)
+    """
     full_results_store = full_results_store or {}
     active = sorted(
         [n for n in insight_tree.values() if n.get('status') == 'active'],
@@ -2072,7 +2119,7 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
         parts.append(f"**Dataset profile:**\n{data_profile}\n")
     parts.append(f"**Exploration scope:** {len(active)} analyses completed\n")
 
-    # Section B: Findings Index
+    # Section B: Findings Index (all analyses, one line each)
     parts.append("═══════════════════════════════════════")
     parts.append("SECTION B: COMPLETE FINDINGS INDEX")
     parts.append("═══════════════════════════════════════\n")
@@ -2081,18 +2128,28 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
         fs = n.get('finding_summary', '') or '(no summary)'
         parts.append(f"[{n['quality_score']}] [[{n['chain_id']}]] {fs}")
 
-    # Section C: Full Evidence
+    # Section C: Research Model (read before evidence — provides the map)
     parts.append("\n═══════════════════════════════════════")
-    parts.append("SECTION C: FULL EVIDENCE")
+    parts.append("SECTION C: RESEARCH MODEL")
+    parts.append("═══════════════════════════════════════\n")
+    parts.append(research_model or "(No research model available)")
+
+    # Section D: Evidence (score-gated)
+    high = [n for n in active if n['quality_score'] >= 8]
+    mid = [n for n in active if 6 <= n['quality_score'] <= 7]
+
+    parts.append("\n═══════════════════════════════════════")
+    parts.append(f"SECTION D: EVIDENCE (score 8+: full results, score 6-7: summaries)")
     parts.append("═══════════════════════════════════════\n")
 
-    for n in active:
+    # Score 8+: full results
+    for n in high:
         chain_key = str(n['chain_id'])
         result_text = full_results_store.get(
             chain_key, n.get('result_summary', 'Results not available')
         )
-        if len(result_text) > 3000:
-            result_text = result_text[:1500] + "\n[...truncated...]\n" + result_text[-1500:]
+        if len(result_text) > 4000:
+            result_text = result_text[:2000] + "\n[...truncated...]\n" + result_text[-2000:]
 
         parts.append(
             f"[[{n['chain_id']}]] Score: {n['quality_score']}/10\n"
@@ -2101,10 +2158,17 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
             f"{'─' * 5}"
         )
 
-    # Section D: Research Model
-    parts.append("\n═══════════════════════════════════════")
-    parts.append("SECTION D: FINAL RESEARCH MODEL")
-    parts.append("═══════════════════════════════════════\n")
-    parts.append(research_model or "(No research model available)")
+    # Score 6-7: finding summary only
+    if mid:
+        parts.append(f"\n{'─' * 20}\nScore 6-7 analyses (summaries only — see Findings Index for IDs):\n")
+        for n in mid:
+            fs = n.get('finding_summary', '')
+            if not fs:
+                fs = n.get('result_digest', '')
+            if not fs:
+                fs = n.get('result_summary', 'No summary')
+                if len(fs) > 200:
+                    fs = fs[:200] + '...'
+            parts.append(f"[[{n['chain_id']}]] [{n['quality_score']}/10] {n['question']}\n  → {fs}")
 
     return '\n'.join(parts)

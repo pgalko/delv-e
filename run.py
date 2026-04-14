@@ -54,6 +54,10 @@ def main():
                         default=True,
                         help="Skip the orientation phase (data profiling). "
                              "Useful for simple datasets or short runs.")
+    parser.add_argument("--auto-stop", dest="auto_stop", action="store_true",
+                        default=False,
+                        help="Allow early termination when the strategic review "
+                             "determines the investigation is complete.")
     args = parser.parse_args()
 
     # Load environment
@@ -140,6 +144,7 @@ def main():
         interactive=args.question is None,
         resumed_state=resumed_state,
         orientation=args.orientation,
+        auto_stop=args.auto_stop,
     )
 
 
