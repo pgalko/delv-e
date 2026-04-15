@@ -152,7 +152,10 @@ def _extract_data(explorer, engine, iteration, max_iterations):
     premium_model = getattr(explorer, 'premium_model', None)
 
     # --- Dataset ---
-    dataset_shape = f"{engine.df.shape[0]:,} rows x {engine.df.shape[1]} cols"
+    if engine.df is not None:
+        dataset_shape = f"{engine.df.shape[0]:,} rows x {engine.df.shape[1]} cols"
+    else:
+        dataset_shape = "computation mode"
 
     # --- Mean score ---
     mean_score = round(sum(winner_scores) / max(len(winner_scores), 1), 1)

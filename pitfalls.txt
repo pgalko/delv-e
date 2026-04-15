@@ -48,3 +48,12 @@ Large regression/OLS: if >10,000 rows, aggregate to per-group summaries before f
 Grid search (GridSearchCV, parameter sweeps): limit to ≤50 total parameter combinations.
 When stratifying models across eras/groups: fit sequentially and store only summary statistics. Clear intermediate results between strata.
 Avoid nested loops that multiply: N_iterations × N_strata × N_entities must stay under 500,000 total operations.
+
+# --- simulation limits (execution is killed after 300s) ---
+Population/agent-based simulations: ≤500 agents, ≤1000 generations. If agents interact pairwise each generation, total rounds = N*(N-1)/2 × generations — keep under 50M.
+Monte Carlo: ≤10,000 iterations for simple calculations, ≤1,000 for anything involving matrix ops or model fitting per iteration.
+Parameter sweeps: ≤20 values per parameter, ≤3 parameters varied simultaneously. Total configurations ≤500.
+Network/graph simulations: ≤5,000 nodes. For network generation + simulation, keep under 2,000 nodes.
+Use numpy vectorization wherever possible. Replace pure-Python nested loops with numpy broadcasting or vectorized operations.
+For evolutionary simulations: use numpy arrays for population state, not lists of objects. Vectorize fitness calculation and selection.
+Always set np.random.seed() for reproducibility. Report the seed in the results block.

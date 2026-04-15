@@ -110,12 +110,14 @@ import pandas as pd
 _df_path, _code_path, _result_path = sys.argv[1], sys.argv[2], sys.argv[3]
 _analysis_dir = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
 
-if _df_path.endswith(".pkl"):
-    _df = pd.read_pickle(_df_path)
-elif _df_path.endswith(".parquet"):
-    _df = pd.read_parquet(_df_path)
-else:
-    _df = pd.read_csv(_df_path, low_memory=False)
+_df = None
+if _df_path:
+    if _df_path.endswith(".pkl"):
+        _df = pd.read_pickle(_df_path)
+    elif _df_path.endswith(".parquet"):
+        _df = pd.read_parquet(_df_path)
+    else:
+        _df = pd.read_csv(_df_path, low_memory=False)
 
 _real_savefig = _mpl_figure.Figure.savefig
 
@@ -128,11 +130,12 @@ try:
     from contextlib import redirect_stdout
     with redirect_stdout(_buf):
         _vars = {
-            "df": _df,
             "_analysis_dir": _analysis_dir or "/tmp",
             "_real_savefig": _real_savefig,
             "os": os,
         }
+        if _df is not None:
+            _vars["df"] = _df
         exec(_user_code, _vars)
     _plots = _vars.get("_saved_plots", [])
     with open(_result_path, "w", encoding="utf-8") as _f:
@@ -250,13 +253,13 @@ class CodeExecutor:
         except Exception:
             pass
 
-    def execute(self, code, df, analysis_dir=None):
+    def execute(self, code, df=None, analysis_dir=None):
         """
         Execute code with df in scope.
 
         Args:
             code: Python code string
-            df: pandas DataFrame
+            df: pandas DataFrame (None for computation-only mode)
             analysis_dir: directory for saving plots (None = no plot saving)
 
         Returns:
@@ -267,7 +270,7 @@ class CodeExecutor:
 
         self._ensure_runner_cached()
 
-        df_path = _serialize_dataframe(df)
+        df_path = _serialize_dataframe(df) if df is not None else None
         code_path = None
         result_path = None
 
@@ -282,7 +285,7 @@ class CodeExecutor:
                 [
                     sys.executable,
                     self._runner_path,
-                    df_path,
+                    df_path or '',
                     code_path,
                     result_path,
                     analysis_dir or '',

@@ -68,6 +68,10 @@ class AutoExplorer:
         self.rotation_history = []           # [(iteration, parent_arc, [{name, question}])] for dashboard
         self.arc_history = []                # [(start_iter, label)] for dashboard heatmap
 
+        # ── Arc reference code (implementation consistency) ──
+        self._arc_reference_code = ""       # winning code from best score-8+ in current arc
+        self._arc_reference_score = 0       # score of the reference code
+
         # Model override for orientation, strategic review, and synthesis
         self.premium_model = None
 
@@ -716,6 +720,13 @@ class AutoExplorer:
             else:
                 self.strategic_next_direction = ""
                 logger.info(f"Strategic review: {commitment_action} (no next direction provided)")
+            # ABANDON: clear reference code — new arc, fresh start
+            # PIVOT: keep reference — core simulation likely still applies
+            if commitment_action == 'ABANDON':
+                if self._arc_reference_code:
+                    logger.info("Arc reference code cleared (ABANDON)")
+                self._arc_reference_code = ""
+                self._arc_reference_score = 0
         else:
             # HOLD — maintain or establish commitment
             self.strategic_next_direction = ""
@@ -1241,6 +1252,8 @@ class AutoExplorer:
                 self.completed_original_arcs = set()
                 self.rotation_history = []
                 self.arc_history = []
+                self._arc_reference_code = ""
+                self._arc_reference_score = 0
 
                 start_iteration = 0
 
@@ -1248,7 +1261,10 @@ class AutoExplorer:
             self._current_iteration = start_iteration
 
             # --- Header ---
-            df_shape = f"{self.engine.df.shape[0]:,} rows × {self.engine.df.shape[1]} cols"
+            if self.engine.df is not None:
+                df_shape = f"{self.engine.df.shape[0]:,} rows × {self.engine.df.shape[1]} cols"
+            else:
+                df_shape = "computation mode (no dataset)"
             agent_model = self.engine.models.agent_model
             code_model = self.engine.models.code_model
             if interactive and not resumed_state:
@@ -1340,6 +1356,7 @@ class AutoExplorer:
 
                     error_occurred = False
                     try:
+                        self.engine._arc_reference_code = self._arc_reference_code
                         self.engine._process_question(question, current_image if q_idx == 0 else None, None, None)
                     except Exception as e:
                         error_occurred = True
@@ -1407,6 +1424,19 @@ class AutoExplorer:
 
                 last_solution_chain = winning_solution['chain_id']
                 last_follow_up_angle = follow_up_angle
+
+                # ── UPDATE ARC REFERENCE CODE ──
+                # Save the winning code from score-8+ analyses as the implementation
+                # reference for subsequent iterations in this arc. Ensures simulation
+                # consistency (generation order, data structures, mechanisms) across
+                # HOLD iterations without sharing code literally.
+                winning_score = scores[selected_index]
+                winning_code = winning_solution.get('code', '')
+                if winning_code and winning_score >= 8 and winning_score > self._arc_reference_score:
+                    self._arc_reference_code = winning_code
+                    self._arc_reference_score = winning_score
+                    logger.info(f"Arc reference code updated (score {winning_score}, "
+                                f"{len(winning_code)} chars)")
 
                 # ── INTERPRET & UPDATE MODEL ──
                 # Save Strategic Trajectory before update — cheap model must not corrupt it
@@ -2024,6 +2054,8 @@ class AutoExplorer:
                 "completed_original_arcs": list(self.completed_original_arcs),
                 "rotation_history": self.rotation_history,
                 "arc_history": self.arc_history,
+                "arc_reference_code": self._arc_reference_code,
+                "arc_reference_score": self._arc_reference_score,
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
@@ -2073,6 +2105,8 @@ class AutoExplorer:
         self.completed_original_arcs = set(ex.get('completed_original_arcs', []))
         self.rotation_history = ex.get('rotation_history', [])
         self.arc_history = ex.get('arc_history', [])
+        self._arc_reference_code = ex.get('arc_reference_code', '')
+        self._arc_reference_score = ex.get('arc_reference_score', 0)
         self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']
@@ -2148,8 +2182,8 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
         result_text = full_results_store.get(
             chain_key, n.get('result_summary', 'Results not available')
         )
-        if len(result_text) > 4000:
-            result_text = result_text[:2000] + "\n[...truncated...]\n" + result_text[-2000:]
+        if len(result_text) > 6000:
+            result_text = result_text[:3000] + "\n[...truncated...]\n" + result_text[-3000:]
 
         parts.append(
             f"[[{n['chain_id']}]] Score: {n['quality_score']}/10\n"

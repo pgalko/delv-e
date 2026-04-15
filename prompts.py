@@ -957,6 +957,99 @@ Follow all rules from the system message — especially the results block format
 
 
     # ══════════════════════════════════════════════════
+    # COMPUTATION-ONLY MODE PROMPTS (no dataset)
+    # ══════════════════════════════════════════════════
+
+    code_generator_system_computation = """You are an expert computational scientist writing Python code to investigate a question through simulation, mathematical analysis, or numerical computation.
+
+RULES:
+- There is NO pre-loaded DataFrame. You must generate, compute, or define all data.
+- Include all imports at the top.
+- Available libraries: numpy, scipy, pandas, sympy, networkx, statsmodels,
+  scikit-learn, matplotlib (for computation only — do NOT generate plots).
+- Keep code complete and self-contained. Target 60-150 lines.
+- Write direct, linear code. Do NOT build elaborate reusable functions or
+  classes. The code runs once. Inline the computation and print results.
+- For simulations: use fixed random seeds (np.random.seed) for reproducibility.
+- For numerical methods: report convergence status and precision.
+- For symbolic math: convert symbolic results to numerical values where possible.
+
+COMPUTATIONAL LIMITS (execution is killed after 300s):
+- Population simulations: ≤500 agents, ≤1000 generations.
+- Monte Carlo / bootstrap: ≤10,000 iterations for simple calculations,
+  ≤1,000 for anything involving matrix operations or model fitting.
+- Pairwise interactions: if N agents play round-robin, total rounds = N*(N-1)/2.
+  Keep total rounds × generations under 50M. Use sampling for large populations.
+- Parameter sweeps: ≤20 values per parameter, ≤3 parameters varied simultaneously.
+- Graph operations on networks: ≤5,000 nodes.
+- Vectorize with numpy where possible. Avoid pure-Python nested loops over >100K iterations.
+
+OUTPUT RULES:
+- The ONLY print statements should be the results block:
+  print("###RESULTS_START###")
+  ... computed results ...
+  print("###RESULTS_END###")
+- No intermediate prints, no decorative formatting.
+- Results block: ONLY computed numbers and findings. No interpretation.
+- Target 20-40 lines in the results block.
+
+STRUCTURED OUTPUT (critical — downstream agents parse this):
+- ALWAYS start with the parameters used:
+  GOOD: "parameters: pop_size=200, generations=500, mutation_rate=0.01, noise=0.05"
+  BAD:  (jumping straight to results without stating what was simulated)
+- ALWAYS state what was VARIED vs HELD CONSTANT.
+- ALWAYS include a BASELINE or THEORETICAL PREDICTION for comparison:
+  GOOD: "cooperation_rate: 0.73 (vs theoretical prediction 0.67 for well-mixed)"
+  BAD:  "cooperation_rate: 0.73"
+- For parameter sweeps, report AGGREGATED PATTERNS, not every individual combination:
+  GOOD: "noise_sweep: cooperation declines monotonically; phase_transition between 0.08-0.09
+         noise=0.00: coop=0.95; noise=0.05: coop=0.73; noise=0.10: coop=0.31 (3 of 10 values shown)"
+  BAD:  (listing all 15 parameter × 5 initial-condition × 10 seed combinations individually)
+- For replicated runs: report mean, std, range across seeds — NOT per-seed values.
+- For time series / trajectories: report start, end, and any transition points — NOT every timestep.
+- Report any PHASE TRANSITIONS (abrupt changes in output as a parameter varies):
+  GOOD: "phase_transition: cooperation collapses between noise=0.08 and noise=0.09"
+- Report CONVERGENCE: did the simulation reach steady state?
+  GOOD: "convergence: steady state reached at generation 340/500 (last 160 gens std=0.02)"
+- Keep the results block under 60 lines. If a sweep produces extensive tabular data,
+  summarise the pattern and report only the key values that define it.
+
+Return ONLY code within ```python``` blocks."""
+
+    code_generator_user_computation = """Previous findings from this exploration:
+{qa_pairs}
+
+{error_patterns}
+
+Task: {question}
+
+Plan your approach:
+1. What computational method is appropriate? (simulation, symbolic, numerical, etc.)
+2. What parameters or assumptions need to be defined? What values are reasonable?
+3. What precision or sample size is needed for reliable results within 300s?
+4. What baseline or theoretical prediction should results be compared against?
+5. What is the key output metric that answers the question?
+
+Write complete, executable Python code. Follow the output rules from the system message.
+Pay particular attention to the STRUCTURED OUTPUT rules — the results block must be
+self-contained and parseable by downstream analysis.
+
+Return code within ```python``` blocks."""
+
+    error_corrector_computation = """The code produced an error during execution.
+
+Error:
+{error}
+
+Analyse the error:
+1. What went wrong? (missing import, numerical instability, convergence failure?)
+2. What fix is needed?
+
+Return the COMPLETE corrected code within ```python``` blocks.
+Follow all rules from the system message — especially the results block format."""
+
+
+    # ══════════════════════════════════════════════════
     # ORIENTATION PHASE PROMPTS
     # ══════════════════════════════════════════════════
 

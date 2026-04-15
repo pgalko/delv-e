@@ -242,18 +242,18 @@ class ExplorationEngine:
         explorer.run("What patterns exist?", max_iterations=5)
     """
 
-    def __init__(self, df, output_dir="output", agent_model=None, code_model=None,
+    def __init__(self, df=None, output_dir="output", agent_model=None, code_model=None,
                  continue_run=False):
         """
         Args:
-            df: pandas DataFrame to analyze
+            df: pandas DataFrame to analyze (None for computation-only mode)
             output_dir: directory for all output files
             agent_model: model for agents (evaluator, theorist, selector, etc.) — default: Haiku
             code_model: model for code generation and error correction — default: Opus
             continue_run: if True, preserve existing output directory and append
         """
-        # DataFrame
-        self.df = df.copy()
+        # DataFrame (None in computation-only mode)
+        self.df = df.copy() if df is not None else None
         self.df_id = "main"
         self.execution_mode = "local"
         self.api_client = None
@@ -293,6 +293,7 @@ class ExplorationEngine:
         self._max_iterations = 0
         self._question = ""
         self.data_profile = ""  # Set by auto_explore after orientation
+        self._arc_reference_code = ""  # Set by auto_explore before _process_question
 
         # Output directory setup
         if continue_run:
@@ -304,14 +305,15 @@ class ExplorationEngine:
             os.makedirs(output_dir)
             os.makedirs(os.path.join(output_dir, "exploration"))
             # Save DataFrame for potential --continue later
-            try:
-                self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
-            except Exception:
-                # Mixed-type columns (e.g. mutation cols with int 0 and str '0') —
-                # coerce object columns to string and retry
-                for col in self.df.select_dtypes(include=['object']).columns:
-                    self.df[col] = self.df[col].astype(str).replace('nan', None)
-                self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
+            if self.df is not None:
+                try:
+                    self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
+                except Exception:
+                    # Mixed-type columns (e.g. mutation cols with int 0 and str '0') —
+                    # coerce object columns to string and retry
+                    for col in self.df.select_dtypes(include=['object']).columns:
+                        self.df[col] = self.df[col].astype(str).replace('nan', None)
+                    self.df.to_parquet(os.path.join(output_dir, "dataframe.parquet"))
 
     # ──────────────────────────────────────────────
     # LLM interface (called by auto_explore agents)
@@ -428,24 +430,46 @@ class ExplorationEngine:
         Simplified pipeline: question → code gen → exec → store results.
         Code generation runs silently. Only results and status are shown.
         """
-        schema = self._get_df_schema()
         qa_context = self.message_manager.format_qa_pairs()
 
         # ── Code Generation (silent — user sees status, not raw LLM output) ──
-        system_msg = self.prompts.code_generator_system
-        user_msg = self.prompts.code_generator_user.format(
-            schema=schema,
-            qa_pairs=qa_context,
-            error_patterns=self.message_manager.format_error_patterns(
-                static_hints=self._load_pitfalls()),
-            question=question,
-        )
-        # Inject analytical profile from orientation (if available)
-        if self.data_profile:
-            user_msg = user_msg.replace(
-                "Previous findings from this exploration:",
-                f"**Analytical Profile (from orientation — use for group sizes and confounders):**\n{self.data_profile}\n\nPrevious findings from this exploration:",
+        if self.df is not None:
+            schema = self._get_df_schema()
+            system_msg = self.prompts.code_generator_system
+            user_msg = self.prompts.code_generator_user.format(
+                schema=schema,
+                qa_pairs=qa_context,
+                error_patterns=self.message_manager.format_error_patterns(
+                    static_hints=self._load_pitfalls()),
+                question=question,
             )
+            # Inject analytical profile from orientation (if available)
+            if self.data_profile:
+                user_msg = user_msg.replace(
+                    "Previous findings from this exploration:",
+                    f"**Analytical Profile (from orientation — use for group sizes and confounders):**\n{self.data_profile}\n\nPrevious findings from this exploration:",
+                )
+        else:
+            system_msg = self.prompts.code_generator_system_computation
+            user_msg = self.prompts.code_generator_user_computation.format(
+                qa_pairs=qa_context,
+                error_patterns=self.message_manager.format_error_patterns(
+                    static_hints=self._load_pitfalls()),
+                question=question,
+            )
+
+        # Inject arc reference code for implementation consistency
+        if self._arc_reference_code:
+            ref_instruction = (
+                "\n\n**REFERENCE IMPLEMENTATION (from this investigation arc, scored highly):**\n"
+                "Rebuild from this implementation — modify ONLY what the current question "
+                "requires. Preserve the generation order, data structures, mechanism "
+                "implementations, and parameter defaults unless the question explicitly "
+                "asks to change them.\n\n```python\n"
+                f"{self._arc_reference_code}\n```"
+            )
+            user_msg += ref_instruction
+
         messages = [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
@@ -499,13 +523,23 @@ class ExplorationEngine:
                 del messages[2]
 
             if retries == 1:
-                fix_msg = self.prompts.error_corrector.format(error=error, schema=schema)
+                if self.df is not None:
+                    fix_msg = self.prompts.error_corrector.format(error=error, schema=self._get_df_schema())
+                else:
+                    fix_msg = self.prompts.error_corrector_computation.format(error=error)
             else:
-                fix_msg = (
-                    f"Still failing. Error:\n{error}\n\n"
-                    "Return the complete corrected code within ```python``` blocks. "
-                    "The DataFrame `df` is pre-loaded. Include all imports."
-                )
+                if self.df is not None:
+                    fix_msg = (
+                        f"Still failing. Error:\n{error}\n\n"
+                        "Return the complete corrected code within ```python``` blocks. "
+                        "The DataFrame `df` is pre-loaded. Include all imports."
+                    )
+                else:
+                    fix_msg = (
+                        f"Still failing. Error:\n{error}\n\n"
+                        "Return the complete corrected code within ```python``` blocks. "
+                        "Include all imports. No DataFrame is available — generate or define all data."
+                    )
 
             messages.append({"role": "assistant", "content": llm_response or ""})
             messages.append({"role": "user", "content": fix_msg})
@@ -602,6 +636,9 @@ class ExplorationEngine:
         Returns the data profile string, or empty string on failure.
         Uses the same code generation + retry + fallback pattern as _process_question.
         """
+        if self.df is None:
+            return ""
+
         schema = self._get_df_schema()
 
         system_msg = self.prompts.orientation_system
@@ -748,6 +785,8 @@ class ExplorationEngine:
 
     def _get_df_schema(self):
         """Rich DataFrame schema for LLM context — includes sample values for reliable code gen."""
+        if self.df is None:
+            return "(No dataset — computation-only mode)"
         parts = []
         parts.append(f"Shape: {self.df.shape[0]} rows × {self.df.shape[1]} columns\n")
 
@@ -789,6 +828,8 @@ class ExplorationEngine:
 
         Lists column names, types, and categorical values only — no head() or
         describe() output. Roughly 5-6x smaller than the full schema."""
+        if self.df is None:
+            return "(No dataset — computation-only mode)"
         parts = []
         parts.append(f"Shape: {self.df.shape[0]} rows × {self.df.shape[1]} columns\n")
         parts.append("Columns:")
@@ -812,6 +853,8 @@ class ExplorationEngine:
         For wide datasets: split by coverage tier so the RI can distinguish
         usable columns from sparse ones without a wall of text.
         """
+        if self.df is None:
+            return "(No dataset — computation-only mode)"
         cols = self.df.columns.tolist()
         if len(cols) <= 50:
             return ', '.join(cols)

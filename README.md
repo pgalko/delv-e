@@ -1,6 +1,6 @@
 # delv-e
 
-Autonomous data investigation powered by LLMs. Give it a dataset and a question, and it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers.
+Autonomous data investigation powered by LLMs. Give it a dataset and a question — or just a question — and it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers. Works with datasets (CSV, Excel, Parquet) or in computation-only mode for simulations, mathematical exploration, and numerical experiments.
 
 The system implements a two-tier model architecture inspired by the division of labor observed in the [Knuth/Stappers/Claude collaboration](https://www-cs-faculty.stanford.edu/~knuth/papers/claude-cycles.pdf) and [analysed by Vishal Misra](https://medium.com/@vishalmisra/knuth-just-showed-us-where-to-put-the-human-013c0330ef0a) through the lens of Pearl's Causal Hierarchy. Cheap, fast models handle high-throughput pattern matching: writing code, scoring results, generating questions. A premium model provides strategic oversight every iteration, maintaining commitment to productive arcs, detecting when to pivot, naming the next direction, and preserving a narrative of *why* the exploration changed course. The goal is to approximate the role a human expert plays in guided AI exploration, without requiring one.
 
@@ -14,8 +14,15 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your API keys
 
-# Run (OSS agents with premium strategic oversight)
+# Run with a dataset (OSS agents with premium strategic oversight)
 python run.py data.csv "What factors drive churn?" \
+    --agent-model openrouter:moonshotai/kimi-k2.5 \
+    --code-model openrouter:moonshotai/kimi-k2.5 \
+    --premium-model anthropic:claude-opus-4-6 \
+    --iterations 50
+
+# Run without a dataset (computation-only mode)
+python run.py "Simulate the evolution of cooperation using iterated Prisoner's Dilemma" \
     --agent-model openrouter:moonshotai/kimi-k2.5 \
     --code-model openrouter:moonshotai/kimi-k2.5 \
     --premium-model anthropic:claude-opus-4-6 \
@@ -46,7 +53,7 @@ The key insight from the article: strategic coherence requires a capable model w
 
 ## How It Works
 
-Before the main loop, an **orientation phase** profiles the dataset's analytical landscape: column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. This produces a compact brief pinned into every agent's context for the entire run.
+Before the main loop, an **orientation phase** profiles the dataset's analytical landscape: column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. This produces a compact brief pinned into every agent's context for the entire run. (In computation-only mode, orientation is skipped — the system begins directly with seed decomposition.)
 
 Then a **seed decomposition** step (premium model) converts the user's research agenda into a focused first analysis and an initial Strategic Trajectory. A broad multi-part question becomes a specific first task with a logical sequence of investigation arcs scaled to the iteration budget.
 
@@ -129,8 +136,10 @@ Both sources are combined and appended to the code generator's prompt, preventin
 ## Usage
 
 ```
-python run.py <dataset> ["<question>"] [options]
+python run.py [<dataset>] ["<question>"] [options]
 ```
+
+The dataset is optional. If the first argument is not a file path, it is treated as the question and the system runs in computation-only mode.
 
 | Option | Default | Description |
 |---|---|---|
@@ -179,6 +188,33 @@ python run.py data.csv "Deep analysis" \
     --code-model ollama:qwen3:30b \
     --premium-model anthropic:claude-opus-4-6
 ```
+
+### Computation-Only Mode
+
+When no dataset is provided, the system runs in computation-only mode. The code generator has access to the full scientific Python stack (numpy, scipy, sympy, pandas, networkx, statsmodels, scikit-learn) and generates code that creates, simulates, or computes rather than analysing an existing DataFrame.
+
+```bash
+# Evolutionary game theory simulation
+python run.py "Simulate the evolution of cooperation using iterated Prisoner's Dilemma" \
+    --iterations 100
+
+# Number theory exploration
+python run.py "Explore the distribution of twin prime gaps up to 10^8" \
+    --iterations 50
+
+# Dynamical systems
+python run.py "Model predator-prey dynamics with 5 species and environmental shocks" \
+    --agent-model ollama:glm-5.1:cloud \
+    --code-model ollama:kimi-k2.5:cloud \
+    --premium-model anthropic:claude-opus-4-6 \
+    --iterations 100
+
+# Monte Carlo optimisation
+python run.py "Find optimal warehouse placement for 50 delivery points with stochastic demand" \
+    --iterations 30
+```
+
+The intelligence loop — research model, strategic review, question generation, synthesis — works identically in both modes. The only difference is how each iteration's investigation step executes: against a dataset or as standalone computation.
 
 ## Resuming Runs
 

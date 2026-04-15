@@ -8,6 +8,10 @@ Usage:
     python run.py data.csv "Explore revenue" --iterations 10
     python run.py data.csv --code-model openai:gpt-5.3-codex
 
+    # Computation-only mode (no dataset)
+    python run.py "Simulate predator-prey dynamics"
+    python run.py "Explore twin prime distribution" --iterations 50
+
     # Use a stronger model for orientation and synthesis
     python run.py data.csv "Explore patterns" \
         --code-model ollama:kimi-k2.5 --premium-model anthropic:claude-opus-4-6
@@ -31,7 +35,9 @@ def main():
         description="delv-e: Autonomous data investigation powered by LLMs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("dataset", help="Path to data file (.csv, .tsv, .xlsx, .parquet, .json, .jsonl)")
+    parser.add_argument("dataset", nargs="?", default=None,
+                        help="Path to data file (.csv, .tsv, .xlsx, .parquet, .json, .jsonl). "
+                             "Omit for computation-only mode (simulations, math, etc.)")
     parser.add_argument("question", nargs="?", default=None,
                         help="Seed question (if omitted, prompts interactively)")
     parser.add_argument("--iterations", type=int, default=5,
@@ -54,11 +60,17 @@ def main():
                         default=True,
                         help="Skip the orientation phase (data profiling). "
                              "Useful for simple datasets or short runs.")
-    parser.add_argument("--auto-stop", dest="auto_stop", action="store_true",
-                        default=False,
-                        help="Allow early termination when the strategic review "
-                             "determines the investigation is complete.")
     args = parser.parse_args()
+
+    # ── Resolve dataset vs question ambiguity ──
+    # If dataset arg is provided but doesn't exist as a file, treat it as the question
+    if args.dataset and not os.path.exists(args.dataset) and not args.continue_run:
+        if args.question is None:
+            args.question = args.dataset
+            args.dataset = None
+        else:
+            print(f"Error: File not found: {args.dataset}", file=sys.stderr)
+            sys.exit(1)
 
     # Load environment
     try:
@@ -69,6 +81,7 @@ def main():
 
     import pandas as pd
     resumed_state = None
+    df = None
 
     if args.continue_run:
         # ── CONTINUE: load saved state and DataFrame ──
@@ -86,20 +99,18 @@ def main():
         completed = resumed_state.get('iterations_completed', 0)
         print(f"Resuming from iteration {completed} ({completed} completed)")
 
-        # Load DataFrame: prefer saved parquet (may have added columns), fall back to dataset arg
+        # Load DataFrame: prefer saved parquet, fall back to dataset arg, allow None
         if os.path.exists(df_path):
             df = pd.read_parquet(df_path)
-        elif os.path.exists(args.dataset):
+        elif args.dataset and os.path.exists(args.dataset):
             df = _load_dataset(args.dataset)
-        else:
-            print(f"Error: Neither saved DataFrame nor {args.dataset} found", file=sys.stderr)
-            sys.exit(1)
-    else:
-        # ── FRESH: load dataset from file ──
-        if not os.path.exists(args.dataset):
-            print(f"Error: File not found: {args.dataset}", file=sys.stderr)
-            sys.exit(1)
+        # df stays None if no dataset was used in the original run
+
+    elif args.dataset:
+        # ── FRESH with dataset ──
         df = _load_dataset(args.dataset)
+
+    # else: df stays None — computation-only mode
 
     # Interactive question prompt if not provided
     question = args.question
@@ -109,7 +120,10 @@ def main():
             print(LOGO)
             print(f"    {DIM}{VERSION} — {TAGLINE}{RESET}")
             print()
-            print(f"    {DIM}Loaded{RESET} {WHITE}{len(df):,} rows × {len(df.columns)} cols{RESET} {DIM}from{RESET} {WHITE}{os.path.basename(args.dataset)}{RESET}")
+            if df is not None:
+                print(f"    {DIM}Loaded{RESET} {WHITE}{len(df):,} rows × {len(df.columns)} cols{RESET} {DIM}from{RESET} {WHITE}{os.path.basename(args.dataset)}{RESET}")
+            else:
+                print(f"    {DIM}Computation mode{RESET} {WHITE}(no dataset){RESET}")
         else:
             print(f"    {DIM}Enter a direction for the continued exploration:{RESET}")
         print()
@@ -144,7 +158,6 @@ def main():
         interactive=args.question is None,
         resumed_state=resumed_state,
         orientation=args.orientation,
-        auto_stop=args.auto_stop,
     )
 
 
