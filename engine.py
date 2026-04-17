@@ -770,6 +770,47 @@ class ExplorationEngine:
 
         return profile
 
+    def run_literature_search(self, query, search_model, mode='midstream',
+                              brief_context=''):
+        """Run a web search for published research and return synthesised results.
+
+        Args:
+            query: search query string
+            search_model: Anthropic model string (e.g. 'anthropic:claude-sonnet-4-6')
+            mode: 'preloop' (broad domain review) or 'midstream' (specific finding)
+            brief_context: short summary of current investigation state (midstream only)
+
+        Returns:
+            Synthesised search results text, or empty string on failure.
+        """
+        if mode == 'preloop':
+            prompt = self.prompts.literature_search_preloop.format(
+                seed_question=query)
+        else:
+            prompt = self.prompts.literature_search_midstream.format(
+                brief_context=brief_context,
+                query=query)
+
+        messages = [{"role": "user", "content": prompt}]
+
+        # Pre-loop gets more searches (broader domain review)
+        # Mid-stream gets fewer (targeted validation)
+        max_uses = 8 if mode == 'preloop' else 3
+
+        try:
+            result = self.llm_client.search_call(
+                messages=messages,
+                model=search_model,
+                max_tokens=4000,
+                temperature=0,
+                agent="Literature Search",
+                max_uses=max_uses,
+            )
+            return result or ""
+        except Exception as e:
+            logger.warning(f"Literature search failed: {e}")
+            return ""
+
     # ──────────────────────────────────────────────
     # File Writing
     # ──────────────────────────────────────────────

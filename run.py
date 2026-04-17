@@ -53,6 +53,9 @@ def main():
     parser.add_argument("--premium-model", default=None,
                         help="provider:model for orientation, connection explorer, and final synthesis — "
                              "high-leverage calls that bookend the run (default: same as code-model)")
+    parser.add_argument("--search-model", default=None,
+                        help="provider:model for literature search — must be Anthropic "
+                             "(default: disabled. Example: anthropic:claude-sonnet-4-6)")
     parser.add_argument("--continue", dest="continue_run", action="store_true",
                         help="Resume from a previous run's saved state. "
                              "Iterations are additive (e.g. 25 completed + --iterations 30 = 30 more).")
@@ -151,6 +154,19 @@ def main():
     from auto_explore import AutoExplorer
     explorer = AutoExplorer(engine)
     explorer.premium_model = args.premium_model
+
+    # Validate and set search model
+    search_model = args.search_model
+    if search_model:
+        provider = search_model.split(':')[0] if ':' in search_model else ''
+        if provider != 'anthropic':
+            from style import DIM, YELLOW, RESET
+            print(f"    {YELLOW}⚠{RESET}  {DIM}Search requires an Anthropic model "
+                  f"(got {search_model}). Search disabled for this run.{RESET}")
+            print()
+            search_model = None
+    explorer.search_model = search_model
+
     explorer.run(
         seed_question=question,
         max_iterations=args.iterations,

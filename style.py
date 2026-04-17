@@ -226,6 +226,15 @@ def file_ref(path, note=""):
 def branch_event(text):
     return f"    {YELLOW}⤷ {text}{RESET}"
 
+def search_status(query):
+    """Display search query being executed."""
+    short_query = query[:60] + "..." if len(query) > 60 else query
+    return f"    {CYAN}⟳{RESET} {DIM}Search:{RESET} {short_query}"
+
+def search_result(summary):
+    """Display search integration result."""
+    return f"    {GREEN}✓{RESET} {DIM}Literature:{RESET} {summary}"
+
 # ── Result output block ────────────────────────────────────
 
 def result_border():

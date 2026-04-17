@@ -134,6 +134,31 @@ class AnthropicProvider:
                 conversation.append(msg)
         return system, conversation
 
+    def search_call(self, messages, model, max_tokens, temperature, max_uses=5):
+        """Call with web search tool enabled. Returns synthesised text from all content blocks."""
+        system_msg, api_messages = self._split_system(messages)
+        try:
+            response = self.client.messages.create(
+                model=model, system=system_msg, messages=api_messages,
+                max_tokens=max_tokens, temperature=temperature,
+                tools=[{"type": "web_search_20260209", "name": "web_search",
+                         "max_uses": max_uses, "allowed_callers": ["direct"]}],
+            )
+        except self._api_error as e:
+            logger.error(f"Anthropic search API error: {e}")
+            raise
+        # Extract text from all content blocks (response includes text + search result blocks)
+        text_parts = []
+        for block in (response.content or []):
+            if hasattr(block, 'text') and block.text:
+                text_parts.append(block.text)
+        content = "\n".join(text_parts)
+        return (
+            content,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
+
 
 class OpenAIProvider:
     """OpenAI Responses API (GPT-5.x, Codex, o-series, GPT-4o, etc.)."""
@@ -527,4 +552,40 @@ class LLMClient:
         if self.run_logger:
             self.run_logger.log(agent, f"{provider_name}:{model_name}", messages,
                                 content, input_tokens, output_tokens, elapsed, ttft)
+        return content
+
+    # Haiku is used for search regardless of search_model because web search
+    # returns massive input tokens (100K-400K) from retrieved pages. At Sonnet
+    # rates ($3/MTok) a single search costs $0.50-1.20; Haiku ($1/MTok) cuts
+    # this to $0.15-0.40 with equivalent synthesis quality for this task.
+    SEARCH_MODEL_OVERRIDE = "claude-haiku-4-5-20251001"
+
+    def search_call(self, messages, model, max_tokens=8000, temperature=0,
+                    agent=None, max_uses=5):
+        """Non-streaming call with web search tool. Anthropic only.
+        Returns response text with search results synthesised.
+        Always uses Haiku to control cost from large search result inputs."""
+        provider_name, _ = parse_model_string(model)
+        if provider_name != 'anthropic':
+            raise ValueError(f"Web search requires Anthropic provider, got '{provider_name}'")
+        provider = self._get_provider(provider_name)
+        model_name = self.SEARCH_MODEL_OVERRIDE
+        start_time = time.time()
+
+        try:
+            content, input_tokens, output_tokens = provider.search_call(
+                messages, model_name, max_tokens, temperature, max_uses=max_uses
+            )
+        except Exception as e:
+            logger.error(f"Search API error: {e}")
+            raise
+
+        content = content or ""
+        elapsed = time.time() - start_time
+        self.cost_tracker.record(input_tokens, output_tokens, model_name)
+
+        if self.run_logger:
+            self.run_logger.log(agent or "Literature Search",
+                                f"{provider_name}:{model_name}", messages,
+                                content, input_tokens, output_tokens, elapsed)
         return content

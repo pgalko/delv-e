@@ -194,10 +194,17 @@ Graduate to Established Findings when confirmed with high confidence.
 Format: - [H#] claim | Confidence: low/medium/high | Evidence: brief
 
 ## Established Findings
-Confirmed discoveries. Max 10 bullet points, each with at least one key number.
-When near the limit, consolidate related findings. Do not drop findings that
-active hypotheses or maturity tracking depend on.
+Confirmed discoveries from simulation. Max 10 bullet points, each with at least one
+key number. When near the limit, consolidate related findings. Do not drop findings
+that active hypotheses or maturity tracking depend on.
 Do not duplicate facts already in the data profile.
+The model may also contain [PUBLISHED] entries from external literature searches.
+These are managed by a separate integration process and re-inserted automatically —
+you MUST NOT output any [PUBLISHED] entries in Established Findings or elsewhere,
+and MUST NOT output STATUS lines. Pretend they don't exist in your output.
+You may reference them in Cross-Finding Connections when a simulation directly
+tests a published claim (e.g., "our result confirms the published prediction"),
+but do not duplicate or rewrite the published entries themselves.
 
 ## Finding Maturity
 Track significant findings (score 7+) through their analytical arc.
@@ -493,6 +500,14 @@ EARLY_STOP: [YES / NO] — YES ONLY when ALL of the following are true:
   directly to synthesis. Most runs should NEVER trigger this. Say NO unless you
   are genuinely certain that further iterations cannot produce new findings.
   Expect YES at most once per run, typically after 60-80% of budget is used.
+SEARCH_NEEDED: [specific search query / NONE] — Web search for published literature.
+  Only executed on PIVOT or ABANDON iterations (HOLD requests are skipped).
+  Useful when:
+  (a) Pivoting into a new domain where established theory would save iterations
+  (b) An arc produced a surprising result worth checking against published work
+  (c) Nearing synthesis and key findings should be validated
+  Use a specific academic query, not a generic topic.
+  Say NONE when the research model already has relevant [PUBLISHED] entries.
 MISSED: [specific missed opportunities or untested connections, or NONE]
 UPDATED_TRAJECTORY:
 [full rewrite of Strategic Trajectory section]
@@ -647,39 +662,43 @@ Or: NONE"""
 
     exploration_synthesis = """You are generating a synthesis report from an autonomous data exploration.
 
-Today's date: {0}
+Today's date: {today_date}
+{synthesis_context}
 
-{1}
-
-Task: {2}
+Task: {task}
 
 ---
 
-Generate a synthesis of what this exploration discovered. Write for a researcher who
-wants to understand WHAT was found and WHY it matters.
+Generate a synthesis of what this exploration discovered. Write for an intelligent
+non-specialist who is comfortable with careful reasoning but not with dense technical
+jargon, specialist domain language, or statistical shorthand.
+The report should still be rigorous, but the opening must be readable, relatable,
+and understandable to a general audience.
 
 THE INPUT HAS FOUR SECTIONS:
 - **Section A (Context):** Original question and dataset profile
 - **Section B (Findings Index):** One-line summary of every analysis with scores and IDs
-- **Section C (Research Model):** Final synthesised understanding — established findings,
-  maturity tracking, cross-finding connections, strategic trajectory. Read this FIRST
-  to understand the investigation's narrative before examining raw evidence.
-- **Section D (Evidence):** Raw numerical results, score-gated: full results for score 8+
-  analyses (the key findings), summaries only for score 6-7, score ≤5 omitted (see
-  Findings Index for completeness). Every quantitative claim must trace to Section D.
+- **Section C (Research Model):** Final synthesised understanding — established findings, maturity tracking, cross-finding connections, strategic trajectory. Read this FIRST to understand the investigation's narrative before examining raw evidence.
+- **Section D (Evidence):** Raw numerical results, score-gated: full results for score 8+ analyses (the key findings), summaries only for score 6-7, score ≤5 omitted (see Findings Index for completeness). Every quantitative claim must trace to Section D.
 
 YOUR APPROACH:
 1. Read the Research Model (Section C) to understand the investigation's arc and conclusions.
-2. Scan the Findings Index (Section B) to identify themes and any score-8+ analyses
-   not covered by the Research Model.
+2. Scan the Findings Index (Section B) to identify themes and any score-8+ analyses not covered by the Research Model.
 3. For each theme, read Full Evidence (Section D) to extract and verify key numbers.
 4. Findings supported by multiple high-scoring analyses (7+) are more reliable.
-5. Pay special attention to Cross-Finding Connections in the Research Model — these
-   represent the system's most integrative discoveries.
+5. Pay special attention to Cross-Finding Connections in the Research Model — these represent the system's most integrative discoveries.
+6. Check [PUBLISHED] entries in the Research Model. These are claims from published
+   scientific literature with STATUS annotations (CONFIRMED, CONTRADICTED, or UNTESTED)
+   based on this investigation's simulation results. When reporting a key finding:
+   - If it CONFIRMS a published prediction, note this: "consistent with [author/theory]"
+   - If it CONTRADICTS a published prediction, highlight the disagreement — this is
+     potentially the most novel contribution of the investigation
+   - UNTESTED published claims belong in The Open Question or Methodological Caveats
+   Published literature references add credibility and context. Use them.
 
 CRITICAL — SELF-CORRECTION AWARENESS:
-This exploration revised its own conclusions as new evidence arrived. Before reporting
-ANY finding, apply these checks:
+This exploration revised its own conclusions as new evidence arrived.
+Before reporting ANY finding, apply these checks:
 
 - **Attention Flags first.** Read the Attention Flags section in the Research Model.
   Any finding marked CONTRADICTED must use the LATER corrected values, not the original.
@@ -687,8 +706,8 @@ ANY finding, apply these checks:
 
 - **Later beats earlier.** When two analyses in the same theme give different numbers,
   the LATER analysis (higher chain_id) takes precedence — it had access to prior results.
-  If analysis A found "effect X = 0.5" and later analysis B found "effect X = 0.3 after
-  controlling for confound Y", report 0.3 and note the confound.
+  If analysis A found "effect X = 0.5" and later analysis B found
+  "effect X = 0.3 after controlling for confound Y", report 0.3 and note the confound.
 
 - **Refutation chains.** Some analyses deliberately test whether an earlier finding
   survives a robustness check. If analysis B explicitly refutes or corrects analysis A,
@@ -698,7 +717,7 @@ ANY finding, apply these checks:
 UNIT VERIFICATION:
 Cross-check all numbers against the data profile in Section A. When citing thresholds
 or coefficients, include the unit from the source analysis. Do not change units from
-what was reported in the original analysis (e.g., do not write "mm" for cm-scale data).
+what was reported in the original analysis.
 
 CITATION RULES:
 - Every quantitative claim must include [[chain_id]] from the analysis's Reference field.
@@ -710,85 +729,100 @@ REPORT STRUCTURE:
 
 The report must read as a narrative, not a numbered list. Follow these principles:
 
-**1. TITLE:** A single sentence that captures the central tension or paradox.
-Not a topic ("Winter Climate Analysis") but a finding ("The Same Snow Falls, but
-Less of It Stays"). The reader should understand the core discovery from the title.
+**1. TITLE:**
+A single sentence that captures the central tension, contrast, or paradox.
+Not a topic ("Customer Retention Analysis") but a finding
+("Usage Grew Faster Than Value").
+The reader should understand the core discovery from the title.
 
-**2. OPENING PARAGRAPH (before any ## section):**
-Lead with the contradiction or surprise. State what the data shows that is
-counterintuitive — the thing that doesn't fit conventional expectations. Then
-state, in one sentence, what the investigation discovered as the resolution.
-This is the hook that makes the reader care.
+**2. OPENING NARRATIVE (before any ## section):**
+Immediately after the title, write a short narrative introduction for a non-technical
+reader. This replaces both the brief summary and any "Questions Addressed" section.
 
-**3. ## Questions Addressed**
-The original research agenda may contain specific questions or sub-questions. Before
-the detailed narrative, provide direct answers grounded in the investigation's findings.
+The opening narrative must:
+- be 4-6 short paragraphs
+- read like a coherent story, not a list or FAQ
+- begin with the broad question the investigation set out to explore
+- state what a reader might intuitively expect
+- explain what the exploration actually found instead
+- describe the one or two conditions under which the picture changed
+- end with the main takeaway in clear everyday language
 
-For multi-part questions: answer each identifiable sub-question separately.
-For a single focused question: provide one comprehensive answer that synthesises
-the key findings into a clear, complete response.
+Style rules for the opening narrative:
+- Use plain English throughout
+- Avoid p-values, coefficients, R-squared, effect sizes, model names, and statistical jargon
+- Avoid repetitive phrasing such as starting every paragraph with
+  "the analysis shows" or "the investigation found"
+- Keep technical terms only when absolutely necessary, and explain them in plain language
+  the first time they appear
+- This section should be understandable on its own by someone with no background in
+  the specific technical domain of the investigation
+- It should feel like a short explanatory essay, not an abstract
+- You may include a small number of concrete numbers only if they are central to the story
+- Citations [[chain_id]] are still required for any quantitative claim
 
-For each answer:
-- State the question in bold
-- Answer in 2-3 sentences (single questions may use a short paragraph) using only
-  established findings (cite [[chain_id]])
-- If a question was tested and found null or rejected, say so directly
-- If the answer depends on measurement choice, state the dependency
-- End each answer with an italic parenthetical referencing which ## section(s) below
-  contain the full technical detail, e.g. *(Full detail: "Section Title" below.)*
-Use plain language — no p-values, no coefficients, no statistical jargon. This section
-serves readers who want answers without reading the full report.
+**3. ## What Did Not Explain the Pattern**
+After the opening narrative, briefly list the main alternative explanations that were
+tested and did not hold up. This keeps the report rigorous without sounding like a
+technical appendix. For each:
+- state the idea in plain language
+- cite the evidence that ruled it out
+- give only the single most important number
 
-**4. ## Tested and Rejected**
-Immediately after the opening, list the alternative explanations that were
-systematically tested and eliminated. This shows rigour and pre-empts the reader's
-objections. For each: state the hypothesis, cite the evidence that refutes it,
-give the key statistic.
+**4. KEY FINDING SECTIONS (multiple ## sections):**
+Each major finding gets its own ## section.
+Order them by CAUSAL LOGIC, not by importance — each section should motivate the
+question that the next section answers.
 
-**5. KEY FINDING SECTIONS (multiple ## sections):**
-Each major finding gets its own ## section. Order them by CAUSAL LOGIC, not by
-importance — each section should motivate the question that the next section
-answers. Use DECLARATIVE section titles that state the conclusion:
-  GOOD: "NE Continental Air Quadrupled — and Explains Most of the Change"
-  BAD:  "Wind Direction Analysis"
-  GOOD: "More Melt Days, Not Worse Melt Days"
-  BAD:  "Pure Melt Day Trends"
+Use DECLARATIVE section titles that state the conclusion:
+GOOD: "Price Became Less Important Once Delivery Speed Improved"
+BAD: "Pricing Analysis"
+GOOD: "Most of the Change Came From One Segment"
+BAD: "Segment Results"
+
+Write the main body of each finding section in clear prose first, with technical detail
+embedded only where needed to support the claim. Do not write as if addressing peer reviewers.
 
 After each key finding section's technical content (before the --- separator),
 add a single italic paragraph beginning with "*In plain terms:*" that explains
-the finding for a non-technical audience. Focus on what the finding means in
-practice — who should care and why. Use analogies where helpful. Avoid all
-statistical jargon: no p-values, R², coefficients, standard deviations, or
-confidence intervals. Each summary should be 3-5 sentences. The reader should
-understand the practical implication without having read the technical paragraphs
-above. Do NOT add plain-language summaries to Questions Addressed, Tested and Rejected,
-Cross-Cutting Patterns, The Open Question, Methodological Caveats, or What Is Stable sections.
+the finding for a non-technical audience. Focus on what the finding means in practice —
+who should care and why. Use analogies where helpful. Avoid all statistical jargon:
+no p-values, R-squared, coefficients, standard deviations, or confidence intervals.
+Each summary should be 3-5 sentences. The reader should understand the practical
+implication without having read the technical paragraphs above.
 
-**6. ## Cross-Cutting Patterns**
-2-3 higher-order principles that UNIFY multiple findings. Not "Finding A and
-Finding B are related" but "A single structural change (X) explains why A, B,
-and C all shifted simultaneously." These should be genuinely synthetic insights,
-not summaries of individual findings.
+Do NOT add plain-language summaries to:
+- What Did Not Explain the Pattern
+- Cross-Cutting Patterns
+- The Open Question
+- Methodological Caveats
+- What Is Stable, What Is Changing
 
-**7. ## The Open Question**
-Separate from methodological caveats. This is the most important thing the data
-CANNOT answer — the gap that matters for future work. Frame it as a question,
-explain why the available data can't answer it, and suggest what data would.
+**5. ## Cross-Cutting Patterns**
+2-3 higher-order principles that UNIFY multiple findings.
+Not "Finding A and Finding B are related" but
+"A single structural change (X) explains why A, B, and C all shifted together."
+These should be genuinely synthetic insights, not summaries of individual findings.
 
-**8. ## Methodological Caveats**
+**6. ## The Open Question**
+Separate from methodological caveats.
+This is the most important thing the data CANNOT answer — the gap that matters for future work.
+Frame it as a question, explain why the available data can't answer it, and suggest what evidence would.
+
+**7. ## Methodological Caveats**
 Short, factual list of limitations: sample sizes, method-dependent significance,
-data reliability issues. No interpretation — just the facts the reader needs
-to assess confidence.
+data reliability issues, modelling assumptions, or coverage gaps.
+No interpretation — just the facts the reader needs to assess confidence.
 
-**9. ## What Is Stable, What Is Changing**
+**8. ## What Is Stable, What Is Changing**
 A scannable summary in three categories:
-- **Stable:** variables that show no significant trend
-- **Increasing/changing:** variables with significant upward trends or structural shifts
-- **Declining:** variables with significant downward trends or loss
+- **Stable:** variables or relationships that show no meaningful change
+- **Increasing/changing:** variables or relationships showing upward trends, shifts, or emerging effects
+- **Declining:** variables or relationships showing downward trends, weakening, or loss
 
-**10. ## Conclusion**
-3-5 sentences tying together the key discoveries. Restate the central finding,
-the mechanism, and the single most important implication or open question.
+**9. ## Conclusion**
+3-5 sentences tying together the key discoveries.
+Restate the central finding, the mechanism, and the single most important implication or open question.
 
 ---
 
@@ -799,10 +833,12 @@ IMPORTANT:
 - Avoid references to system internals (iterations, phases, scores)
 
 COMPLETENESS CHECK — do this AFTER drafting:
-Scan the Findings Index for any score-8+ analysis not yet cited. If it represents a
-distinct finding not covered in your draft, add it. If it refines a finding you already
-reported, incorporate the refinement. Prioritise findings that are OPERATIONALLY
-ACTIONABLE (implications for decisions) over those that are purely descriptive."""
+Scan the Findings Index for any score-8+ analysis not yet cited.
+If it represents a distinct finding not covered in your draft, add it.
+If it refines a finding you already reported, incorporate the refinement.
+
+Prioritise findings that are OPERATIONALLY ACTIONABLE
+(implications for decisions) over those that are purely descriptive."""
 
 
     # ══════════════════════════════════════════════════
@@ -1135,3 +1171,74 @@ handle specially. Output: a compact analytical brief (30-second scan). Plain Eng
 with numbers inline.
 
 Return code within ```python``` blocks using ###PROFILE_START### / ###PROFILE_END### delimiters."""
+
+
+    # ══════════════════════════════════════════════════
+    # LITERATURE SEARCH PROMPTS
+    # ══════════════════════════════════════════════════
+
+    literature_search_preloop = """Search for established research on the following topic. This is a pre-investigation literature review — the goal is to prevent rediscovering known results and to identify the current research frontier.
+
+Topic: {seed_question}
+
+Search for and synthesise:
+1. ESTABLISHED MECHANISMS: What mechanisms/theories are well-accepted? Name specific models and their predictions.
+2. PUBLISHED PARAMETERS: What parameter ranges have been explored in simulations? What ESS/equilibria have been found?
+3. OPEN DEBATES: Where does the field disagree? What competing theories exist?
+4. METHODOLOGICAL PITFALLS: What approaches have been tried and found inadequate? What common mistakes do papers in this area warn about?
+
+Format each finding as a bullet starting with [PUBLISHED] and include the key citation or source.
+Keep the total under 2000 characters — this will be integrated into an evolving research model."""
+
+    literature_search_midstream = """Search for published research relevant to this specific finding from an ongoing computational investigation.
+
+Investigation context:
+{brief_context}
+
+Specific query: {query}
+
+Search for:
+1. Is this finding already established in the literature? If so, cite the key papers.
+2. Does this finding contradict any published results? If so, name the contradiction.
+3. Are there published parameter ranges or methodological details that could calibrate our result?
+
+Format each finding as a bullet starting with [PUBLISHED] and include the key citation or source.
+Keep the total under 1500 characters."""
+
+    literature_integration = """You are integrating published research findings into an investigation's knowledge base.
+
+SEARCH RESULTS (from web search):
+{search_results}
+
+EXISTING [PUBLISHED] ENTRIES (from previous searches):
+{existing_published}
+
+SIMULATION FINDINGS SO FAR (read-only context for STATUS assessment):
+{sim_context}
+
+CURRENT INVESTIGATION DIRECTION:
+{arc_direction}
+
+TASK: Return ONLY the [PUBLISHED] entries that should appear in the research model.
+Do NOT return the full research model. Do NOT return simulation findings.
+Return ONLY bullet points starting with "- [PUBLISHED]".
+
+RULES:
+1. Maximum 8 [PUBLISHED] entries total (combining new and existing).
+2. Each entry: one bullet starting with "- [PUBLISHED]" followed by the claim,
+   ending with "STATUS: UNTESTED / CONFIRMED / CONTRADICTED"
+   STATUS refers to THIS investigation's simulation results only:
+   - UNTESTED: no simulation has tested this claim yet
+   - CONFIRMED: simulation results agree with the claim
+   - CONTRADICTED: simulation results disagree with the claim
+   If no simulation findings exist, ALL entries must be UNTESTED.
+3. Merge related findings. Prefer specific, actionable claims over general theory.
+4. Drop entries the investigation has moved past entirely.
+5. Preserve existing CONFIRMED/CONTRADICTED entries.
+6. Use bullet points only. No tables, no headers, no STATUS on separate lines.
+
+FORMAT (exactly this):
+- [PUBLISHED] Claim text here. (Author, Year). STATUS: UNTESTED
+- [PUBLISHED] Another claim. (Author, Year). STATUS: CONFIRMED — matches EF-3
+
+SEARCH_SUMMARY: [N findings: X CONFIRMED, Y CONTRADICTED, Z UNTESTED]"""

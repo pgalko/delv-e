@@ -72,6 +72,11 @@ class AutoExplorer:
         self._arc_reference_code = ""       # winning code from best score-8+ in current arc
         self._arc_reference_score = 0       # score of the reference code
 
+        # ── Literature search ──
+        self.search_model = None            # set from run.py; None = search disabled
+        self.search_history = []            # [(iteration, query, summary)] for dashboard
+        self._published_entries = []        # [PUBLISHED] entries, protected from RI
+
         # Model override for orientation, strategic review, and synthesis
         self.premium_model = None
 
@@ -437,11 +442,19 @@ class AutoExplorer:
     def _interpret_and_update_model(self, winning_solution, quality_score):
         """Interpret the latest result and update the research model.
 
+        [PUBLISHED] entries are protected from RI modification — extracted before
+        the RI runs, re-inserted after. The RI sees them in input for reference
+        but cannot write them (the prompt tells it not to, and the splice code
+        enforces it regardless).
+
         Returns:
             (updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used)
         """
         if self.kill_signal:
             return self.research_model, "LOW", False, False, "", ""
+
+        # ── EXTRACT [PUBLISHED] ENTRIES (protect from RI) ──
+        self._extract_published_snapshot()
 
         result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
         current_model = self.research_model if self.research_model else "(No model yet — this is the first result. Initialize the model from scratch.)"
@@ -493,7 +506,87 @@ class AutoExplorer:
         updated_model = self._extract_and_validate_model(
             response, interpret_messages)
 
+        # ── SPLICE [PUBLISHED] ENTRIES BACK IN ──
+        updated_model = self._splice_published_entries(updated_model)
+
         return updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used
+
+    def _extract_published_snapshot(self):
+        """Extract [PUBLISHED] entries from current research model and store them.
+        Called before RI runs to protect entries from modification."""
+        if not hasattr(self, '_published_entries'):
+            self._published_entries = []
+
+        if not self.research_model:
+            self._published_entries = []
+            return
+
+        published = []
+        for line in self.research_model.split('\n'):
+            if '[PUBLISHED]' in line:
+                # Keep original formatting (bullet, status, etc)
+                published.append(line.rstrip())
+        self._published_entries = published
+
+    def _splice_published_entries(self, model_text):
+        """Strip any [PUBLISHED] entries from model_text and re-insert the stored
+        canonical set into the Established Findings section.
+
+        This enforces that only the integration call can modify [PUBLISHED] entries
+        — the RI's output is stripped of them regardless of what it wrote.
+        """
+        if not hasattr(self, '_published_entries') or not self._published_entries:
+            # No stored entries — just strip any [PUBLISHED] the RI may have invented
+            lines = model_text.split('\n')
+            result_lines = [l for l in lines
+                            if '[PUBLISHED]' not in l
+                            and not l.strip().startswith('STATUS:')
+                            and not l.strip().startswith('- STATUS:')]
+            return '\n'.join(result_lines)
+
+        # Strip existing [PUBLISHED] lines and orphaned STATUS lines
+        lines = model_text.split('\n')
+        stripped = []
+        for line in lines:
+            if '[PUBLISHED]' in line:
+                continue
+            if line.strip().startswith('STATUS:'):
+                continue
+            if line.strip().startswith('- STATUS:'):
+                continue
+            stripped.append(line)
+        model_text = '\n'.join(stripped)
+
+        # Insert stored entries at end of Established Findings section
+        if '## Established Findings' not in model_text:
+            # Section missing — append at end (degenerate case)
+            return model_text + '\n\n## Established Findings\n' + '\n'.join(self._published_entries)
+
+        lines = model_text.split('\n')
+        result_lines = []
+        in_ef = False
+        inserted = False
+
+        for line in lines:
+            if '## Established Findings' in line:
+                in_ef = True
+                result_lines.append(line)
+                continue
+            if line.startswith('## ') and in_ef:
+                # Insert published entries before next section
+                for pub in self._published_entries:
+                    result_lines.append(pub)
+                result_lines.append('')
+                in_ef = False
+                inserted = True
+            result_lines.append(line)
+
+        # If Established Findings was the last section
+        if in_ef and not inserted:
+            for pub in self._published_entries:
+                result_lines.append(pub)
+
+        return '\n'.join(result_lines)
 
     @staticmethod
     def _extract_model_text(response):
@@ -512,27 +605,36 @@ class AutoExplorer:
         return sum(1 for line in text.split('\n')
                    if line.startswith('## ') and 'Strategic Trajectory' not in line)
 
+    # Expected content sections (excluding Strategic Trajectory which is managed separately):
+    # Active Hypotheses, Established Findings, Finding Maturity, Cross-Finding Connections,
+    # Attention Flags, Biggest Gap, Exploration Health
+    _EXPECTED_MODEL_SECTIONS = 7
+
     def _extract_and_validate_model(self, response, messages):
         """Extract UPDATED_MODEL from response, validate structure, retry on truncation."""
         model_text = self._extract_model_text(response)
         if not model_text:
             return self.research_model
 
-        current_sections = self._count_content_sections(self.research_model)
         new_sections = self._count_content_sections(model_text)
 
         # First iteration — no baseline to compare against
+        current_sections = self._count_content_sections(self.research_model)
         if current_sections == 0:
             return model_text
 
+        # Compare against expected structure, not current model
+        # (current may be inflated by rogue sections from integration calls)
+        threshold = min(current_sections, self._EXPECTED_MODEL_SECTIONS)
+
         # Model is structurally intact
-        if new_sections >= current_sections:
+        if new_sections >= threshold:
             return model_text
 
         # Truncated — retry with code model
         logger.warning(
             f"Research model truncated: {new_sections} sections "
-            f"vs {current_sections} — retrying with code model")
+            f"vs {threshold} expected — retrying with code model")
 
         fallback = self._get_fallback_model('Research Interpreter')
         if not fallback:
@@ -543,7 +645,7 @@ class AutoExplorer:
             messages, 'Research Interpreter', model_override=fallback)
         retry_text = self._extract_model_text(retry_response or "")
 
-        if retry_text and self._count_content_sections(retry_text) >= current_sections:
+        if retry_text and self._count_content_sections(retry_text) >= threshold:
             logger.info(f"Code model retry succeeded: "
                         f"{self._count_content_sections(retry_text)} sections")
             return retry_text
@@ -692,6 +794,15 @@ class AutoExplorer:
             if self._early_stop_requested:
                 logger.info("Strategic review requested EARLY_STOP")
 
+        # ── Parse SEARCH_NEEDED ──
+        search_query = ""
+        if 'SEARCH_NEEDED:' in response:
+            sq_text = response.split('SEARCH_NEEDED:')[1].split('\n')[0].strip()
+            # SR may append explanation: "NONE — already have relevant entries"
+            sq_keyword = sq_text.split('—')[0].split('-')[0].strip().upper()
+            if sq_keyword not in ('NONE', 'N/A', ''):
+                search_query = sq_text
+
         # ── Parse MISSED ──
         missed = ""
         if 'MISSED:' in response:
@@ -731,6 +842,41 @@ class AutoExplorer:
             # HOLD — maintain or establish commitment
             self.strategic_next_direction = ""
             logger.info("Strategic review: HOLD commitment")
+
+        # ── MID-STREAM LITERATURE SEARCH (when SR requests it) ──
+        # Only fire on PIVOT or ABANDON — HOLD means we're deepening a known domain
+        # and don't need external context. This naturally limits search frequency
+        # since HOLDs are ~60-70% of iterations.
+        if search_query and self.search_model:
+            if commitment_action == 'HOLD':
+                logger.info(f"SR requested search but suppressed during HOLD "
+                            f"(search only fires on PIVOT/ABANDON)")
+            else:
+                logger.info(f"SR requested search ({commitment_action}): {search_query[:80]}")
+                print(style.search_status(search_query))
+                try:
+                    brief_context = self._build_search_context()
+                    with style.spinner("Searching and integrating literature"):
+                        search_results = self.engine.run_literature_search(
+                            search_query, self.search_model,
+                            mode='midstream', brief_context=brief_context)
+                        if search_results:
+                            integrated = self._integrate_search_results(
+                                search_results, self.research_model)
+                        else:
+                            integrated = None
+                    if integrated:
+                        self.research_model = integrated
+                        summary = getattr(self, '_last_search_summary', 'findings integrated')
+                        self.search_history.append((iteration, search_query[:80], summary))
+                        print(style.search_result(summary))
+                        logger.info(f"Mid-stream literature: {summary}")
+                    elif search_results:
+                        logger.warning("Literature integration returned empty")
+                    else:
+                        logger.warning("Mid-stream search returned no results")
+                except Exception as e:
+                    logger.warning(f"Mid-stream literature search failed: {e}")
 
         # ── REFRAMING PROBE: fires on any commitment when strategic review requests it ──
         reframing_override = False
@@ -797,6 +943,14 @@ class AutoExplorer:
     def _update_strategic_trajectory(self, new_trajectory):
         """Splice the premium model's trajectory into the research model."""
         section_header = '## Strategic Trajectory'
+
+        # Normalise: collapse any consecutive duplicate headers the RI may have emitted
+        import re
+        self.research_model = re.sub(
+            r'(## Strategic Trajectory[ \t]*\n)+', section_header + '\n',
+            self.research_model
+        )
+
         if section_header in self.research_model:
             # Find the section and replace everything up to next ## or end
             before = self.research_model.split(section_header)[0]
@@ -813,6 +967,148 @@ class AutoExplorer:
         else:
             # Append if section doesn't exist yet
             self.research_model += f"\n\n{section_header}\n{new_trajectory}"
+
+    # ══════════════════════════════════════════════
+    # LITERATURE SEARCH HELPERS
+    # ══════════════════════════════════════════════
+
+    def _integrate_search_results(self, search_results, current_model):
+        """Integrate search results into research model via premium model + code splice.
+        
+        The premium model reasons about what matters and sets STATUS.
+        Code handles the structural insertion — no model rewrites the full document.
+        Returns the updated research model, or empty string on failure.
+        """
+        # Extract existing [PUBLISHED] entries for continuity
+        existing_published = []
+        for line in current_model.split('\n'):
+            if '[PUBLISHED]' in line:
+                existing_published.append(line.strip())
+
+        # Extract simulation findings (read-only context for STATUS assessment)
+        sim_findings = self._extract_model_section('Established Findings')
+        # Filter out [PUBLISHED] lines — only simulation findings for context
+        if sim_findings:
+            sim_lines = [l for l in sim_findings.split('\n')
+                         if l.strip() and '[PUBLISHED]' not in l]
+            sim_context = '\n'.join(sim_lines)
+        else:
+            sim_context = "(No simulation findings yet)"
+
+        arc_direction = self.current_arc_direction or self.seed_question
+
+        prompt = self.engine.prompts.literature_integration.format(
+            search_results=search_results,
+            existing_published='\n'.join(existing_published) if existing_published else "(None yet)",
+            sim_context=sim_context,
+            arc_direction=arc_direction[:200],
+        )
+        messages = [{"role": "user", "content": prompt}]
+        model = self.premium_model or self.search_model
+
+        try:
+            response = self.engine.llm_client.call(
+                messages=messages,
+                model=model,
+                max_tokens=4000,
+                temperature=0,
+                agent="Literature Integration",
+            )
+            if not response or not response.strip():
+                return ""
+
+            # Extract [PUBLISHED] entries from response
+            new_published = []
+            for line in response.split('\n'):
+                stripped = line.strip()
+                if '[PUBLISHED]' in stripped:
+                    # Ensure bullet format
+                    if not stripped.startswith('- '):
+                        stripped = f'- {stripped}'
+                    new_published.append(stripped)
+
+            # Extract SEARCH_SUMMARY for logging
+            summary = self._extract_search_summary(response)
+
+            if not new_published:
+                logger.warning("Integration returned no [PUBLISHED] entries")
+                return ""
+
+            # ── UPDATE PROTECTED SNAPSHOT ──
+            # Integration is the ONLY agent that can modify [PUBLISHED] entries.
+            # The RI reads them (for reference) but splice enforces immutability.
+            self._published_entries = new_published
+
+            # Splice: remove old [PUBLISHED] lines from Established Findings,
+            # insert new ones at the end of the section
+            if '## Established Findings' not in current_model:
+                # Pre-loop or empty model — create minimal section
+                published_block = '\n'.join(new_published)
+                if current_model and not current_model.startswith('('):
+                    # Append to existing model
+                    spliced = f"{current_model}\n\n## Established Findings\n\n{published_block}\n"
+                else:
+                    # Empty model — just the published entries
+                    spliced = f"## Established Findings\n\n{published_block}\n"
+                self._last_search_summary = summary
+                return spliced
+
+            lines = current_model.split('\n')
+            result_lines = []
+            in_ef = False
+            inserted = False
+
+            for i, line in enumerate(lines):
+                if '## Established Findings' in line:
+                    in_ef = True
+                    result_lines.append(line)
+                    continue
+                if line.startswith('## ') and in_ef:
+                    # Insert new [PUBLISHED] entries before next section
+                    for pub in new_published:
+                        result_lines.append(pub)
+                    result_lines.append('')  # blank line before next section
+                    in_ef = False
+                    inserted = True
+                    result_lines.append(line)
+                    continue
+                if in_ef and '[PUBLISHED]' in line:
+                    continue  # drop old [PUBLISHED] lines
+                if in_ef and line.strip().startswith('STATUS:'):
+                    continue  # drop orphaned STATUS lines
+                if in_ef and line.strip().startswith('- STATUS:'):
+                    continue  # drop bullet STATUS lines
+                result_lines.append(line)
+
+            # If Established Findings was the last section (no ## after it)
+            if in_ef and not inserted:
+                for pub in new_published:
+                    result_lines.append(pub)
+
+            # Store summary for extraction
+            self._last_search_summary = summary
+            return '\n'.join(result_lines)
+
+        except Exception as e:
+            logger.warning(f"Literature integration failed: {e}")
+            return ""
+
+    def _build_search_context(self):
+        """Build brief context from research model for mid-stream search."""
+        # Extract last few established findings for context
+        findings = self._extract_model_section('Established Findings')
+        if findings:
+            lines = [l.strip() for l in findings.split('\n') if l.strip().startswith('-')]
+            return '\n'.join(lines[-5:]) if lines else self.seed_question
+        return self.seed_question
+
+    @staticmethod
+    def _extract_search_summary(integrated_model):
+        """Extract SEARCH_SUMMARY line from the integrated model response."""
+        for line in integrated_model.split('\n'):
+            if 'SEARCH_SUMMARY:' in line:
+                return line.split('SEARCH_SUMMARY:')[1].strip()
+        return "findings integrated"
 
     # ══════════════════════════════════════════════
     # REFRAMING PROBE (premium model)
@@ -1254,6 +1550,8 @@ class AutoExplorer:
                 self.arc_history = []
                 self._arc_reference_code = ""
                 self._arc_reference_score = 0
+                self.search_history = []
+                self._published_entries = []
 
                 start_iteration = 0
 
@@ -1296,6 +1594,32 @@ class AutoExplorer:
                 if self.data_profile:
                     self.engine.data_profile = self.data_profile
                     logger.info(f"Orientation complete: {len(self.data_profile)} chars")
+
+            # ── PRE-LOOP LITERATURE SEARCH (computation mode, fresh runs only) ──
+            if (self.search_model and not resumed_state and not self.kill_signal
+                    and self.engine.df is None):
+                logger.info("Running pre-loop literature search")
+                print(style.search_status(seed_question[:60]))
+                try:
+                    with style.spinner("Searching published literature"):
+                        search_results = self.engine.run_literature_search(
+                            seed_question, self.search_model, mode='preloop')
+                    if search_results:
+                        with style.spinner("Integrating literature"):
+                            integrated = self._integrate_search_results(
+                                search_results, self.research_model or "(Empty — first iteration)")
+                        if integrated:
+                            self.research_model = integrated
+                            summary = getattr(self, '_last_search_summary', 'findings integrated')
+                            self.search_history.append((0, seed_question[:80], summary))
+                            print(style.search_result(summary))
+                            logger.info(f"Pre-loop literature: {summary}")
+                        else:
+                            logger.warning("Literature integration returned empty")
+                    else:
+                        logger.warning("Pre-loop search returned no results")
+                except Exception as e:
+                    logger.warning(f"Pre-loop literature search failed: {e}")
 
             # ── SEED DECOMPOSITION (fresh runs only) ──
             if not resumed_state and not self.kill_signal:
@@ -1655,9 +1979,9 @@ class AutoExplorer:
         import datetime
         today = datetime.date.today().strftime("%Y-%m-%d")
         prompt = self.engine.prompts.exploration_synthesis.format(
-            today,
-            synthesis_context,
-            f"Synthesize all findings from the exploration seeded by: {seed_question}",
+            today_date=today,
+            synthesis_context=synthesis_context,
+            task=f"Synthesize all findings from the exploration seeded by: {seed_question}",
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -2056,6 +2380,8 @@ class AutoExplorer:
                 "arc_history": self.arc_history,
                 "arc_reference_code": self._arc_reference_code,
                 "arc_reference_score": self._arc_reference_score,
+                "search_history": self.search_history,
+                "published_entries": getattr(self, '_published_entries', []),
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
@@ -2107,6 +2433,8 @@ class AutoExplorer:
         self.arc_history = ex.get('arc_history', [])
         self._arc_reference_code = ex.get('arc_reference_code', '')
         self._arc_reference_score = ex.get('arc_reference_score', 0)
+        self.search_history = ex.get('search_history', [])
+        self._published_entries = ex.get('published_entries', [])
         self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']

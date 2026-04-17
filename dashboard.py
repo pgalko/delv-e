@@ -209,6 +209,7 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'significant': significant,
         'probe_history': getattr(explorer, 'probe_history', []),
         'rotation_history': getattr(explorer, 'rotation_history', []),
+        'search_history': getattr(explorer, 'search_history', []),
         'heatmap_arcs': heatmap_arcs,
         'probe_iters': probe_iters,
         'rot_iters': rot_iters,
@@ -227,8 +228,15 @@ def _parse_section(rm, header):
         if line.startswith('## ') and in_section:
             break
         if in_section and line.strip().startswith('- '):
-            lines.append(line.strip()[2:])
+            text = line.strip()[2:]
+            # Skip STATUS-only lines from [PUBLISHED] entries
+            if text.startswith('STATUS:'):
+                continue
+            lines.append(text)
         elif in_section and line.strip() and not line.strip().startswith('#'):
+            # Skip standalone STATUS lines without bullet prefix too
+            if line.strip().startswith('STATUS:'):
+                continue
             lines.append(line.strip())
     return lines
 
@@ -305,7 +313,9 @@ def _render_html(d):
     agent_order = [
         'Code Generator', 'Question Generator', 'Research Interpreter',
         'Result Evaluator', 'Question Selector', 'Error Corrector',
-        'Strategic Review', 'Reframing Probe', 'Perspective Rotation', 'Seed Decomposition', 'Synthesis Generator'
+        'Strategic Review', 'Reframing Probe', 'Perspective Rotation',
+        'Literature Search', 'Literature Integration',
+        'Seed Decomposition', 'Synthesis Generator'
     ]
     max_calls = max(d['agent_counts'].values()) if d['agent_counts'] else 1
     agent_html = ''
@@ -316,8 +326,12 @@ def _render_html(d):
         pct = round(count / max_calls * 100)
         label = agent.lower().replace('_', ' ')
         is_premium = agent in ('Strategic Review', 'Reframing Probe', 'Perspective Rotation', 'Seed Decomposition', 'Synthesis Generator')
-        bar_color = 'var(--purple)' if is_premium else ('var(--amber)' if agent == 'Error Corrector' else 'var(--blue)')
-        premium_tag = ' <span style="font-weight: 400; color: var(--fg3);">premium</span>' if is_premium else ''
+        is_search = agent in ('Literature Search', 'Literature Integration')
+        bar_color = ('var(--cyan)' if is_search else
+                     'var(--purple)' if is_premium else
+                     ('var(--amber)' if agent == 'Error Corrector' else 'var(--blue)'))
+        tag = (' <span style="font-weight: 400; color: var(--fg3);">search</span>' if is_search else
+               ' <span style="font-weight: 400; color: var(--fg3);">premium</span>' if is_premium else '')
         agent_html += f'''
         <div class="health-row">
           <span class="health-label">{label}</span>
@@ -325,7 +339,7 @@ def _render_html(d):
             <div class="bar-wrap" style="width: 180px;">
               <div class="bar-fill" style="width: {max(pct, 1)}%; background: {bar_color};"></div>
             </div>
-            <span class="health-val">{count}{premium_tag}</span>
+            <span class="health-val">{count}{tag}</span>
           </div>
         </div>'''
 
@@ -351,6 +365,29 @@ def _render_html(d):
   <div style="margin-top: 16px;">
     <div class="section-title">Reframing probes ({len(d['probe_history'])})</div>
     <div class="card">{probe_items}
+    </div>
+  </div>'''
+
+    # Search history HTML
+    search_html = ''
+    if d['search_history']:
+        search_items = ''
+        for entry in d['search_history']:
+            if len(entry) == 3:
+                it, query, summary = entry
+            else:
+                it, query = entry[0], entry[1] if len(entry) > 1 else ''
+                summary = ''
+            search_items += f'''
+            <div class="finding-item">
+              <span class="finding-badge badge-quantified">LIT</span>
+              <span style="color: var(--fg2);">iter {it}</span>
+              <span style="margin-left: 4px;" title="{_escape(query)}">{_escape(summary[:120] or query[:120])}</span>
+            </div>'''
+        search_html = f'''
+  <div style="margin-top: 16px;">
+    <div class="section-title">Literature searches ({len(d['search_history'])})</div>
+    <div class="card">{search_items}
     </div>
   </div>'''
 
@@ -687,6 +724,8 @@ def _render_html(d):
   </div>
 
 {probe_html}
+
+{search_html}
 
 {rotation_html}
 

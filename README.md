@@ -123,6 +123,32 @@ python run.py data.csv "Analyze trends" --iterations 100 --auto-stop
 
 Default is `auto_stop=False` — the full iteration budget is always used unless explicitly opted in.
 
+### Literature Search
+
+When `--search-model` is provided with an Anthropic model, the system can search published literature and integrate findings into the research model. This prevents rediscovering established results and helps validate novel findings.
+
+**Pre-loop search** (computation-only mode): Before the first iteration, the system searches for established research on the seed question and integrates `[PUBLISHED]` findings into the research model. This fills the role that orientation plays for dataset mode — grounding the investigation in existing knowledge.
+
+**Mid-stream search**: The strategic review can request a search at any iteration by outputting `SEARCH_NEEDED: <specific query>`. This typically happens when pivoting into an unfamiliar domain, when a surprising finding might already be established, or when nearing synthesis and top findings should be validated. Published findings are integrated into the research model with STATUS annotations (UNTESTED, CONFIRMED, or CONTRADICTED) relative to the system's own simulation results.
+
+Literature claims enter the research model as `[PUBLISHED]` entries alongside the system's own findings. They are treated as testable predictions, not assumptions — when simulation results contradict published claims, this is flagged as potentially novel rather than as an error.
+
+```bash
+# Enable search (must be an Anthropic model)
+python run.py "Simulate evolution of cooperation" \
+    --search-model anthropic:claude-sonnet-4-6
+
+# Search with dataset (mid-stream only, no pre-loop)
+python run.py data.csv "Analyze trends" \
+    --search-model anthropic:claude-sonnet-4-6
+
+# Non-Anthropic search model — warning, search disabled
+python run.py "Simulate aging" --search-model ollama:qwen3
+# → "Search requires an Anthropic model. Search disabled for this run."
+```
+
+Search adds ~$0.50-1.20 per 100-iteration run (8-12 searches at ~$0.05-0.10 each). Default is disabled — no cost unless explicitly opted in.
+
 ### Error Patterns and Pitfalls
 
 The code generator benefits from two sources of error prevention:
@@ -152,6 +178,7 @@ The dataset is optional. If the first argument is not a file path, it is treated
 | `--agent-model` | anthropic:claude-haiku-4-5-20251001 | Model for agents (evaluator, QG, RI, selector) |
 | `--code-model` | anthropic:claude-haiku-4-5-20251001 | Model for code generation |
 | `--premium-model` | same as code-model | Model for orientation, strategic review, and synthesis |
+| `--search-model` | disabled | Anthropic model for literature search (e.g. `anthropic:claude-sonnet-4-6`) |
 
 ### Providers
 
