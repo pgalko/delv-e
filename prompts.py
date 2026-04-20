@@ -1095,6 +1095,20 @@ Goal: characterise the ANALYTICAL LANDSCAPE — not test hypotheses. Subsequent 
 should start from knowledge, not assumption. Every observation must end with a practical
 ACTION for downstream analysts (what to filter, avoid, derive, or handle specially).
 
+DATA DICTIONARY HANDLING:
+If a DATA DICTIONARY is provided in the user message, treat it as authoritative for
+column meanings, event-specific semantics, and known caveats. The dictionary is shown
+ONLY to you during orientation — it is NOT shown to the Question Generator, Evaluator,
+or Strategic Reviewer. Your profile is the only channel that carries its constraints
+forward to them. You MUST restate the dictionary's non-obvious constraints in a
+dedicated KEY CONSTRAINTS block at the top of your profile output (see section 0),
+preserving SPECIFICS verbatim: exact IDs (e.g. "athletes 03, 08, 13" — not "some
+athletes"), exact column names, exact cutoffs, exact categorical values. Where
+possible, verify dictionary claims empirically (e.g. if the dictionary says column X
+is NaN for athletes A, B, C, confirm the coverage pattern with code and note any
+discrepancy). If no dictionary is provided, omit the KEY CONSTRAINTS section and
+markers entirely.
+
 RULES (same as code generation):
 - `df` is pre-loaded. Do NOT redefine it. Include imports. Use vectorized ops.
 - Handle nulls. Keep code concise (80-150 lines). No visualisations needed.
@@ -1107,6 +1121,29 @@ GOOD: "Chemo arm: n=341 (18%). Concentrated in Basal (67%) and Her2 (45%),
 sparse in LumA (8%, n=26). → Exclude NC from subgroup analysis."
 
 ANALYSIS DIMENSIONS (adapt to dataset — skip sections that don't apply):
+
+0. KEY CONSTRAINTS — REQUIRED when a data dictionary was provided.
+   Emit this block immediately after ###PROFILE_START### and before any
+   other analysis. Wrap it in ###KEY_CONSTRAINTS_START### / ###KEY_CONSTRAINTS_END###
+   markers. This block is the ONLY dictionary content that survives unconditionally
+   to the Question Generator, Evaluator, and Strategic Reviewer — they do not
+   see the dictionary directly, and the rest of your profile may be truncated
+   if it exceeds the character cap. If a dictionary is provided and you omit
+   this block, downstream agents will make avoidable errors.
+
+   Format: short numbered guardrails, one per constraint. Each entry:
+     - preserves SPECIFICS verbatim (exact IDs, column names, categorical values,
+       numeric cutoffs)
+     - ends with a "→" practical action
+     - is ≤ 3 lines
+
+   Good: "→ pb_seconds is event-specific (10km for athlete01, HM for 02/03/14,
+   Marathon for 04-13). Stratify by primary_discipline; never correlate across
+   all athletes."
+   Not:  "→ Some athletes run different events."
+
+   If NO data dictionary is provided, omit this block entirely — do not emit
+   the markers.
 
 1. COVERAGE MAP: Profile each column's non-null coverage (% of rows). Flag columns
    below 50% as SPARSE — these likely record only specific conditions (e.g., equipment
@@ -1144,10 +1181,16 @@ ANALYSIS DIMENSIONS (adapt to dataset — skip sections that don't apply):
 
 Use these delimiters:
 print("###PROFILE_START###")
-... analytical brief ...
+print("###KEY_CONSTRAINTS_START###")
+... numbered key constraints here, each ending with → action (omit this block and its markers if no dictionary was provided) ...
+print("###KEY_CONSTRAINTS_END###")
+... the rest of the analytical brief (sections 1–6) ...
 print("###PROFILE_END###")"""
 
-    orientation_user = """DataFrame info:
+    orientation_user = """DATA DICTIONARY (authoritative context for column meaning and known caveats — see system prompt for handling):
+{data_dictionary}
+
+DataFrame info:
 {schema}
 
 Seed question for this exploration:
@@ -1165,6 +1208,12 @@ Compute CROSS-VARIABLE relationships invisible from individual columns:
 4. Structure: near-redundant columns? Derivable variables (diffs, ratios, rolling)?
    Circular variables needing special handling?
 5. Power: what comparisons are feasible? Where do stratifications create empty cells?
+
+If a data dictionary was provided above, you MUST begin your brief with a KEY CONSTRAINTS
+block wrapped in ###KEY_CONSTRAINTS_START### / ###KEY_CONSTRAINTS_END### markers — this
+is the only channel that carries dictionary content to downstream agents, and the rest
+of the profile may be truncated. Each constraint must preserve specifics verbatim
+(exact IDs, column names, cutoffs) and end with a "→" practical action.
 
 Every observation must end with a practical action: what to filter, avoid, derive, or
 handle specially. Output: a compact analytical brief (30-second scan). Plain English

@@ -243,7 +243,7 @@ class ExplorationEngine:
     """
 
     def __init__(self, df=None, output_dir="output", agent_model=None, code_model=None,
-                 continue_run=False):
+                 continue_run=False, data_dictionary=None):
         """
         Args:
             df: pandas DataFrame to analyze (None for computation-only mode)
@@ -251,6 +251,10 @@ class ExplorationEngine:
             agent_model: model for agents (evaluator, theorist, selector, etc.) — default: Haiku
             code_model: model for code generation and error correction — default: Opus
             continue_run: if True, preserve existing output directory and append
+            data_dictionary: optional string (markdown) describing columns and
+                constraints. Consumed ONLY by run_orientation(); its key rules
+                must be restated in the orientation profile so they propagate
+                to downstream agents.
         """
         # DataFrame (None in computation-only mode)
         self.df = df.copy() if df is not None else None
@@ -293,6 +297,7 @@ class ExplorationEngine:
         self._max_iterations = 0
         self._question = ""
         self.data_profile = ""  # Set by auto_explore after orientation
+        self.data_dictionary_text = data_dictionary or ""  # NEW
         self._arc_reference_code = ""  # Set by auto_explore before _process_question
 
         # Output directory setup
@@ -645,6 +650,11 @@ class ExplorationEngine:
         user_msg = self.prompts.orientation_user.format(
             schema=schema,
             seed_question=seed_question,
+            data_dictionary=(
+                self.data_dictionary_text
+                if self.data_dictionary_text
+                else "(No data dictionary provided for this dataset. Infer constraints empirically from the schema and your own analysis; flag anything that looks surprising. Skip the KEY CONSTRAINTS section entirely in the profile.)"
+            ),
         )
         messages = [
             {"role": "system", "content": system_msg},
@@ -745,9 +755,9 @@ class ExplorationEngine:
             else:
                 profile = results.strip()[:3000]
 
-        # Truncate if excessively long (target ~500-1000 tokens)
-        if len(profile) > 4000:
-            profile = profile[:4000] + "\n[...truncated]"
+        # Truncate if excessively long
+        if len(profile) > 12000:
+            profile = profile[:12000] + "\n[...truncated]"
 
         # Display
         code_lines = len(code.strip().split('\n'))

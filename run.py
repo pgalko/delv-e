@@ -63,6 +63,12 @@ def main():
                         default=True,
                         help="Skip the orientation phase (data profiling). "
                              "Useful for simple datasets or short runs.")
+    parser.add_argument("--data-dictionary", default=None,
+                        help="Path to a markdown file describing dataset columns, "
+                             "constraints, and caveats. Fed into orientation as "
+                             "authoritative context; propagated to all agents via "
+                             "the profile. Orientation-only — CG does not see the "
+                             "verbatim file.")
     args = parser.parse_args()
 
     # ── Resolve dataset vs question ambiguity ──
@@ -114,6 +120,31 @@ def main():
         df = _load_dataset(args.dataset)
 
     # else: df stays None — computation-only mode
+    
+    # Load data dictionary if provided
+    data_dictionary_text = None
+    if args.data_dictionary:
+        from style import DIM, YELLOW, RESET
+        if not os.path.exists(args.data_dictionary):
+            print(f"    {YELLOW}⚠{RESET}  {DIM}Data dictionary file not found: "
+                  f"{args.data_dictionary}. Continuing without it.{RESET}")
+        else:
+            try:
+                with open(args.data_dictionary, 'r', encoding='utf-8') as f:
+                    data_dictionary_text = f.read()
+                DICT_MAX_CHARS = 20000
+                if len(data_dictionary_text) > DICT_MAX_CHARS:
+                    print(f"    {YELLOW}⚠{RESET}  {DIM}Data dictionary is "
+                          f"{len(data_dictionary_text):,} chars (soft cap: "
+                          f"{DICT_MAX_CHARS:,}). Truncating tail.{RESET}")
+                    data_dictionary_text = (
+                        data_dictionary_text[:DICT_MAX_CHARS]
+                        + "\n\n[... data dictionary truncated by delv-e ...]"
+                    )
+            except Exception as e:
+                print(f"    {YELLOW}⚠{RESET}  {DIM}Could not read data dictionary: "
+                      f"{e}. Continuing without it.{RESET}")
+                data_dictionary_text = None
 
     # Interactive question prompt if not provided
     question = args.question
@@ -148,7 +179,18 @@ def main():
         agent_model=args.agent_model,
         code_model=args.code_model,
         continue_run=args.continue_run,
+        data_dictionary=data_dictionary_text,   # NEW
     )
+
+    # Edge case: orientation skipped but dictionary provided.
+    # Without this, the dictionary would be silently dropped — it's only
+    # consumed by orientation. Pass it through as the profile directly so
+    # its constraints still propagate to all downstream agents.
+    if not args.orientation and data_dictionary_text:
+        engine.data_profile = (
+            "*[Data dictionary passed through verbatim — orientation was skipped.]*\n\n"
+            + data_dictionary_text
+        )
 
     # Run exploration
     from auto_explore import AutoExplorer

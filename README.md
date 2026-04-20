@@ -21,6 +21,12 @@ python run.py data.csv "What factors drive churn?" \
     --premium-model anthropic:claude-opus-4-6 \
     --iterations 50
 
+# Run with a data dictionary (recommended for datasets with non-obvious semantics)
+python run.py data.csv "What factors drive churn?" \
+    --data-dictionary data_dictionary.md \
+    --premium-model anthropic:claude-opus-4-6 \
+    --iterations 50
+
 # Run without a dataset (computation-only mode)
 python run.py "Simulate the evolution of cooperation using iterated Prisoner's Dilemma" \
     --agent-model openrouter:moonshotai/kimi-k2.5 \
@@ -53,7 +59,7 @@ The key insight from the article: strategic coherence requires a capable model w
 
 ## How It Works
 
-Before the main loop, an **orientation phase** profiles the dataset's analytical landscape: column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. This produces a compact brief pinned into every agent's context for the entire run. (In computation-only mode, orientation is skipped — the system begins directly with seed decomposition.)
+Before the main loop, an **orientation phase** profiles the dataset's analytical landscape: column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. This produces a compact brief pinned into every agent's context for the entire run. When a data dictionary is provided via `--data-dictionary`, orientation also reads it as authoritative context for column semantics and known caveats, and emits a KEY CONSTRAINTS block at the top of the profile that propagates those constraints to all downstream agents (see [Data Dictionary](#data-dictionary) below). In computation-only mode, orientation is skipped — the system begins directly with seed decomposition.
 
 Then a **seed decomposition** step (premium model) converts the user's research agenda into a focused first analysis and an initial Strategic Trajectory. A broad multi-part question becomes a specific first task with a logical sequence of investigation arcs scaled to the iteration budget.
 
@@ -123,6 +129,34 @@ python run.py data.csv "Analyze trends" --iterations 100 --auto-stop
 
 Default is `auto_stop=False` — the full iteration budget is always used unless explicitly opted in.
 
+### Data Dictionary
+
+When `--data-dictionary PATH` points to a markdown file, delv-e treats its contents as authoritative context for column meanings and known caveats. This matters whenever the schema alone cannot express everything an analyst needs to know — event-specific columns (a PB time that means marathon for some athletes and half-marathon for others), categorical values with non-obvious semantics (`location_status` being `ethiopia` / `abroad` / `no_gps` rather than a simple boolean), sparse columns with structured missingness (specific IDs having all-NaN rows by design), or derived columns that look numeric but carry constraints about comparability. Without a dictionary, the Question Generator will sometimes propose questions that violate these constraints — correlating event-heterogeneous PBs across athletes, or treating missingness as random when it is structured.
+
+**The dictionary feeds orientation, not the Code Generator.** The architecture is single-channel: dictionary → orientation → profile → all downstream agents. Orientation reads the dictionary as authoritative input and is required to emit a **KEY CONSTRAINTS** block at the top of the profile, restating the dictionary's non-obvious rules as numbered guardrails with specifics preserved verbatim (exact IDs, column names, cutoffs, categorical values). Each constraint ends with a "→" practical action. This block is what every downstream agent sees — the dictionary itself is not pinned to the Code Generator, Question Generator, Evaluator, or Strategic Reviewer.
+
+This design keeps the architecture simple (one context channel, not two), avoids duplicating constraints across agents where they might drift out of sync, and makes orientation the single quality lever: if findings cite dictionary constraints correctly, the chain is working; if not, improving the orientation prompt fixes it everywhere at once.
+
+**File format.** A plain markdown file. delv-e reads it verbatim — no preprocessing, no schema required — but conventionally useful sections include:
+
+- A one-paragraph overview of the dataset
+- A "Must-read constraints" section with numbered non-obvious rules (event-specificity, categorical value meanings, known NaN patterns, columns that look comparable but aren't)
+- A column reference organized by role (identifiers, time, metrics, derived, covariates)
+- Source-data quirks baked into the ETL
+
+Soft cap: 20 KB. If the file exceeds this, the tail is truncated with a warning; the orientation still runs. For most datasets, 2–4 KB is the right size — enough to capture the caveats a new analyst would need, short enough that the orientation can internalize and restate the key rules precisely.
+
+```bash
+# Use a data dictionary alongside the seed question
+python run.py data.csv "<question>" \
+    --data-dictionary data_dictionary.md \
+    --iterations 50 --auto-stop
+```
+
+**Interaction with `--no-orientation`.** Orientation is normally the only consumer of the dictionary. If both `--data-dictionary` and `--no-orientation` are passed, the dictionary is passed through verbatim as the profile (with a one-line note) so its constraints still reach downstream agents. This is a fallback, not a recommended mode — orientation adds empirical grounding (coverage patterns, actual group sizes, observed confounds) that the dictionary alone cannot provide.
+
+**When to use a dictionary.** Datasets with domain-specific semantics (clinical studies, sports science, financial instruments, scientific instrumentation), datasets with event-heterogeneous comparability (per-athlete, per-patient, per-instrument metrics), datasets where categorical values encode something beyond what the names suggest, and datasets where column missingness is structured rather than random. For generic datasets where column names are self-explanatory and missingness is exchangeable, a dictionary adds little — the schema's types and sample values already convey the useful content.
+
 ### Literature Search
 
 When `--search-model` is provided with an Anthropic model, the system can search published literature and integrate findings into the research model. This prevents rediscovering established results and helps validate novel findings.
@@ -175,6 +209,7 @@ The dataset is optional. If the first argument is not a file path, it is treated
 | `--continue` | | Resume from previous run's checkpoint |
 | `--no-orientation` | | Skip the orientation phase (data profiling) |
 | `--auto-stop` | | Allow early termination when investigation is complete |
+| `--data-dictionary PATH` | none | Markdown file with column semantics and caveats; consumed by orientation (see [Data Dictionary](#data-dictionary)) |
 | `--agent-model` | anthropic:claude-haiku-4-5-20251001 | Model for agents (evaluator, QG, RI, selector) |
 | `--code-model` | anthropic:claude-haiku-4-5-20251001 | Model for code generation |
 | `--premium-model` | same as code-model | Model for orientation, strategic review, and synthesis |
@@ -201,6 +236,12 @@ python run.py data.csv "Analyze trends" --iterations 15
 
 # Quick 3-iteration run, skip orientation
 python run.py data.csv "What's the class balance?" --iterations 3 --no-orientation
+
+# With a data dictionary for a domain-specific dataset
+python run.py clinical_trial.csv "What predicts response to treatment?" \
+    --data-dictionary trial_dictionary.md \
+    --premium-model anthropic:claude-opus-4-6 \
+    --iterations 50 --auto-stop
 
 # 100 iterations with auto-stop
 python run.py data.csv "What drives peak snowpack decline?" \
@@ -302,7 +343,7 @@ The dashboard shows a green "View Report" button when the run completes, linking
 
 LLMs have no memory between calls. delv-e manages context through five layers:
 
-**Data Profile** produced by the orientation phase before iteration 1. A compact analytical brief (~500-1000 tokens) covering column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. The orientation is aware of coverage-driven correlation artifacts (e.g., two sparse columns appearing correlated because they're both only recorded during the same operational period). Pinned into every agent's context for the entire run.
+**Data Profile** produced by the orientation phase before iteration 1. An analytical brief (capped at 12 KB, ~3K tokens) covering column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. The orientation is aware of coverage-driven correlation artifacts (e.g., two sparse columns appearing correlated because they're both only recorded during the same operational period). When a data dictionary is provided via `--data-dictionary`, the profile also leads with a KEY CONSTRAINTS block carrying the dictionary's non-obvious rules forward verbatim. The complete profile is pinned into every agent's context for the entire run.
 
 **Insight Tree** where every analysis is a node with question, results, score, and summaries. Agents see a tiered view: recent entries with RI-curated key numbers (result_digest), older entries compressed to one-sentence summaries (finding_summary from the evaluator). Nothing is deleted. The system manages visibility, not existence. Non-winning solutions from parallel evaluation are stored as runner-ups for completeness but are not revisited.
 
@@ -340,13 +381,17 @@ The evaluator generates one-sentence summaries for all parallel solutions (not j
 
 The strategic review (premium model) runs every iteration but is lightweight, roughly 6K input tokens and 600 output tokens per call. Over 100 iterations this adds roughly $7 at Opus pricing. Synthesis generation adds ~$0.50 and synthesis chart generation adds ~$0.50-0.80 (one premium model call per key finding chart). Total premium model cost for a 100-iteration run is typically $8-10.
 
+A data dictionary adds negligible cost — it enters the prompt only during orientation (one call per run) and is not re-injected per iteration. Its constraints reach downstream agents via the KEY CONSTRAINTS block in the profile, which is the same data_profile pin that would exist without the dictionary.
+
 Check `output/cost.txt` after each run for exact breakdown by agent.
 
 ## Architecture
 
 ```
-run.py               CLI: dataset loading, --continue handling, --auto-stop flag
+run.py               CLI: dataset loading, --continue handling, --auto-stop flag,
+                     --data-dictionary loading
 engine.py            ExplorationEngine: LLM pipeline, code execution, orientation
+                     (with optional data dictionary injection)
 auto_explore.py      Core loop: commitment system, strategic review, perspective rotation,
                      auto-stop, synthesis charts, research model management
 output.py            OutputManager: all rendering — terminal display, analysis markdown,
