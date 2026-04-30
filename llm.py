@@ -138,11 +138,12 @@ class AnthropicProvider:
         """Call with web search tool enabled. Returns synthesised text from all content blocks."""
         system_msg, api_messages = self._split_system(messages)
         try:
+            tool_type = os.environ.get("ANTHROPIC_WEB_SEARCH_TOOL_TYPE", "web_search_20250305")
+            tool = {"type": tool_type, "name": "web_search", "max_uses": max_uses}
             response = self.client.messages.create(
                 model=model, system=system_msg, messages=api_messages,
                 max_tokens=max_tokens, temperature=temperature,
-                tools=[{"type": "web_search_20260209", "name": "web_search",
-                         "max_uses": max_uses, "allowed_callers": ["direct"]}],
+                tools=[tool],
             )
         except self._api_error as e:
             logger.error(f"Anthropic search API error: {e}")
@@ -555,9 +556,11 @@ class LLMClient:
         return content
 
     # Haiku is used for search regardless of search_model because web search
-    # returns massive input tokens (100K-400K) from retrieved pages. At Sonnet
-    # rates ($3/MTok) a single search costs $0.50-1.20; Haiku ($1/MTok) cuts
-    # this to $0.15-0.40 with equivalent synthesis quality for this task.
+    # returns massive input tokens from retrieved pages. The provider is still
+    # validated from search_model, but the concrete model is pinned here to
+    # control cost. The search tool type itself is configured in
+    # AnthropicProvider.search_call and defaults to the broadly compatible
+    # web_search_20250305 tool.
     SEARCH_MODEL_OVERRIDE = "claude-haiku-4-5-20251001"
 
     def search_call(self, messages, model, max_tokens=8000, temperature=0,

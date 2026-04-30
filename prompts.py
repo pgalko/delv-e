@@ -3,7 +3,6 @@ Prompt templates for delv-e.
 
 Architecture:
   - Lean, task-specific agent prompts (no repeated preamble)
-  - Finding Completeness: maturity tracking in Research Model guides investigation depth
   - Strategic Review: premium model runs every iteration to maintain strategic coherence,
     enforce commitments, detect missed opportunities, and surface untested connections
   - Code prompts: rules in system prompt only; user/error inherit
@@ -23,8 +22,10 @@ Templates used by the engine:
   - code_generator_system
   - code_generator_user
   - error_corrector
-  - orientation_system
-  - orientation_user
+  - orientation_compute_system   ← Phase 1: code emitting structured FACTS
+  - orientation_compute_user
+  - orientation_narrate_system   ← Phase 2: prose profile constrained by FACTS
+  - orientation_narrate_user
 """
 
 
@@ -32,45 +33,34 @@ class PromptManager:
     """Container for all prompt templates."""
 
     # ══════════════════════════════════════════════════
-    # FINDING MATURITY TEMPLATE
-    # Referenced by research_model_updater, evaluator,
-    # and question generator.
-    # ══════════════════════════════════════════════════
-
-    _MATURITY_STAGES = """Finding maturity stages (each finding progresses through these):
-  DETECTED    — Signal found (score 7+). Direction and approximate magnitude known.
-  QUANTIFIED  — Rate, significance, and effect size precisely established.
-  DECOMPOSED  — Tested across subgroups, percentiles, or time periods. Distribution characterised.
-  REGIME-TESTED — Checked for structural breaks or temporal instability at candidate breakpoints.
-  COMPLETE    — Ready for cross-finding connection testing. Operationally interpretable.
-
-Maturity advances when evidence for a stage arrives — it does NOT require a dedicated analysis
-per stage. A single well-designed analysis can advance multiple stages. If a finding is
-contradicted at any stage, drop or downgrade it rather than forcing it through remaining stages."""
-
-    # ══════════════════════════════════════════════════
     # AUTO-EXPLORE AGENT PROMPTS
     # ══════════════════════════════════════════════════
 
     ideas_explorer_auto = """You are generating analytical questions for a data exploration system.
 
+**Seed question:** {seed_question}
+
+Each question should plausibly advance this seed or the work needed to answer it.
+
 {commitment_instruction}
 
 Consult the **Strategic Trajectory** section in the Research Model for the current
-commitment and planned investigation sequence. All questions should align with the
-CURRENT COMMITMENT stated there.
+commitment. All questions should align with the CURRENT COMMITMENT.
 
-If the Exploration Health section shows breadth as LOW, at least 3 of your 5 questions
-MUST target unexplored territory.
+Consult the **Structural Landscape** section for what's identifiable, what's blocked,
+and what's an open question. In particular:
+- Do NOT generate questions in directions listed under "Foreclosed Directions" —
+  these have already been tried and conclusively failed. Re-running them wastes budget.
+- Prefer questions that resolve entries under "Open Questions" when tractable.
+- Prefer questions that would close an identifiability gap, foreclose a blocked
+  approach with a clean diagnostic, or test an [ESTABLISHED] finding's robustness.
 
-**When the commitment is HOLD on a specific finding:** All 5 questions must target
-THE SAME finding. Consult Finding Maturity to identify the least-mature significant
-finding, then generate 5 different ways to advance it to its next stage:
-  DETECTED → quantify (rate, magnitude, significance)
-  QUANTIFIED → decompose (subgroups, percentiles, distribution cuts)
-  DECOMPOSED → regime-test (split at temporal breakpoints, rolling windows)
-  REGIME-TESTED → connect (test interaction with other established findings)
-Do NOT split questions across different findings when holding.
+If the Exploration Health section shows Breadth: LOW, at least 3 of your 5 questions
+MUST target columns or variable groups from the Unexplored list.
+
+**When the commitment is HOLD:** All 5 questions must drill into the same direction.
+Generate 5 different ways to advance the current finding — different controls,
+different subsets, different tests of robustness or identifiability.
 
 **When pivoting to new territory:** Generate diverse questions that survey different
 aspects of the new direction. Cover multiple angles and variables.
@@ -103,7 +93,9 @@ Score results, select the best, and guide the exploration's direction.
 
 ═══ CONTEXT ═══
 
-**Original question:** {seed_question}
+**Original seed question:** {seed_question}
+
+**Most recent tested estimand:** {recent_estimand}
 
 {exploration_state}
 
@@ -114,23 +106,41 @@ Score results, select the best, and guide the exploration's direction.
 
 ═══ TASK: SCORE AND SELECT ═══
 
-Rate each solution 1-10:
-- 8-10: Genuine discovery — changes understanding, opens new territory
-- 5-7: Solid contribution — useful detail, moderate model update
-- 3-4: Incremental — confirms what we suspected
-- 1-2: Failed or no new information
+Score is a JOINT judgement on analytical quality AND seed-relevance. A
+sophisticated analysis of an irrelevant subset is not high-value. The seed is
+the anchor: the goal is to advance THAT question, not to do interesting
+work in its neighbourhood.
 
-Confirming what the research model already states is 3-4 at best.
-Diminishing returns: if the Research Model already has high confidence on
-the topic and Finding Maturity shows DECOMPOSED or beyond, score for
-novelty — precision refinements on exhausted arcs are LOW value.
+Score 1-10:
+
+- 8-10: Materially advances the SEED estimand. Closes a seed-relevant
+  identifiability gap, validates a seed-relevant finding under stress, or
+  unblocks a previously foreclosed seed-relevant path. Includes clean
+  foreclosures with diagnostic when the foreclosed approach was attempting
+  to answer the seed (VIF check, decisive null with diagnostic, coefficient
+  reversal under controls — these save downstream budget).
+- 5-7: Useful contribution to a seed-adjacent question, or a robustness
+  check on a seed-relevant finding. Restricted-subset analyses that change
+  estimand without advancing the seed cap here.
+- 3-4: Confirms what the research model already states at [ESTABLISHED]
+  status, OR a methodologically sound analysis of a substrate already
+  diagnosed as confounded for the seed (e.g., further refining a within-
+  Ethiopia gradient that the model already records as venue-purpose
+  confounded).
+- 1-2: Failed or no new information.
+
+Anti-pattern check: if the recent estimand has narrowed substantially from
+the seed (sample restricted, conditioning variables added, population
+filtered) without explicit budget for the narrowed question, the analysis
+caps at 6 even if methodologically sound. State this in REASON when it
+applies.
 
 ═══ RESPONSE FORMAT (strict) ═══
 
-SCORES: [comma-separated scores 1-10 for each solution]
+SCORES: [comma-separated scores 1-10]
 SUMMARIES: [one-to-two sentence summary per solution, separated by |]
-SELECTED: [solution number with highest analytical value]
-REASON: [One sentence — why the selected solution is most valuable]
+SELECTED: [solution number with highest joint analytical-and-seed value]
+REASON: [One sentence — why selected; flag scope-cap if applied]
 FOLLOW_UP_ANGLE: [Most promising specific direction for next iteration]"""
 
 
@@ -139,7 +149,7 @@ Maintain a living research model and monitor the exploration's health.
 
 ═══ CONTEXT ═══
 
-**Original question:** {seed_question}
+**Seed question:** {seed_question}
 
 **Available columns (for Exploration Health cross-reference):**
 {column_list}
@@ -153,126 +163,116 @@ Quality score: {score}/10
 Findings:
 {result_summary}
 
-═══ TASK 1: ASSESS IMPACT ═══
+═══ TASK 1: ASSESS IMPACT AND SCOPE ═══
 
 MODEL_IMPACT: [HIGH / MEDIUM / LOW]
-- HIGH: Changes HOW we understand something. New mechanism, contradiction, reframing.
-- MEDIUM: Changes WHAT we know in a way that affects next steps.
-- LOW: Confirms or adds precision to an already-characterised finding.
-
-If score ≤5, impact should be LOW unless it contradicts an existing finding.
-Back-to-back refinements of the same claim are LOW regardless of score.
+- HIGH: changes HOW we understand something (new mechanism, contradiction,
+  reframing, or resolves an identifiability question).
+- MEDIUM: changes WHAT we know in a way that affects next steps.
+- LOW: confirms or adds precision to an already-characterised finding.
+If score ≤5, impact is LOW unless the result contradicts an existing finding
+or reveals a new structural constraint.
 
 CONTRADICTION: [YES / NO]
-YES if the result DIRECTLY REVERSES a claimed relationship direction, OR if the
-proposed explanation for a finding invokes a mechanism that Established Findings
-show to be non-significant or absent. Check before accepting any causal claim.
+YES if the result reverses a claimed relationship direction, OR invokes a
+mechanism that Established Findings show absent.
 
 ARC_EXHAUSTED: [YES / NO]
-YES if further investigation of the current arc would yield diminishing returns.
-A finding is NOT complete until checked against alternative outcome measures
-(if available) and tested for confounding by group membership.
+YES if further work on the current arc would yield diminishing returns.
 
-MATURITY_ADVANCE: [finding name → new stage, or NONE]
-If this result provides evidence that advances a finding's maturity, state which
-finding and what stage it advances to. A single result can advance multiple stages
-if the evidence covers them (e.g., a subgroup analysis that also reveals a breakpoint).
+RESULT_DIGEST: [3-5 lines — the key numbers]
 
-RESULT_DIGEST: [3-5 lines — the key numbers that matter for ongoing analysis]
+METHOD_USED: [one phrase — analytical technique. e.g. "rolling correlation
+by decade", "VIF check with venue fixed effects".]
 
-METHOD_USED: [One phrase describing the analytical technique — e.g. "rolling correlation
-by decade", "logistic regression with interaction term", "binned comparison pre/post breakpoint".
-This helps the strategic reviewer detect methodological monoculture.]
+TESTED_ESTIMAND: [one sentence describing what THIS analysis actually
+estimates and for which subset of the data. State the population, the
+conditioning variables, any restrictions applied. This is NOT necessarily
+the seed question — restrictions narrow the estimand. Examples:
+"altitude penalty within HR 130-165 band, temperature 7.6-17.5°C, 9 of 11
+athletes" or "raw cross-regime pace gap, all athletes with both regimes".
+This field exists so downstream agents can detect when the tested question
+has drifted from the seed.]
 
 ═══ TASK 2: UPDATE THE RESEARCH MODEL ═══
 
 UPDATED_MODEL:
 
+## Established Findings
+Confirmed discoveries, each tagged with one STATUS prefix and ≥1 key number.
+Max 10 bullets. When near limit, consolidate.
+
+Format: `- [STATUS] claim with key number [[chain_id]]`
+
+STATUS tags (assign at first promotion, update as evidence accumulates):
+
+| Tag | Meaning |
+|---|---|
+| ESTABLISHED | survived multiple analyses, confound-controlled where available, no contradicting evidence |
+| PROVISIONAL | signal present and survives attempted analyses, but a specific identification or coverage gap remains |
+| SHRINKS | initial effect deflated under controls. Show progression (raw → controlled). Use whether deflation is to null or to a smaller positive value |
+| CONTRADICTED | earlier finding reversed by later analysis. Cite both chain_ids; state which to rely on |
+| BLOCKED | the seed-relevant question was attempted but cannot be answered with available evidence. Distinguish from foreclosure (which lives in Structural Landscape and applies to specific *approaches*): BLOCKED applies to a *question* that the data cannot resolve. State the blocker concisely |
+
+Update rules:
+- New finding: [ESTABLISHED] if well-controlled, [PROVISIONAL] if one
+  specific identifiability or coverage gap remains, [BLOCKED] if the seed
+  question was attempted and the data cannot support resolution.
+- Later analysis deflates [ESTABLISHED] substantially (>30% coefficient
+  change OR significance loss): retag [SHRINKS], add progression.
+- Later analysis reverses direction: retag [CONTRADICTED], cite both chain_ids.
+- Do not duplicate facts in the data profile.
+- [PUBLISHED] entries: managed by a separate process, re-inserted automatically.
+  Do NOT write, modify, or output them.
+
 ## Active Hypotheses
 Testable claims the next analysis could strengthen or refute. Max 4.
-Graduate to Established Findings when confirmed with high confidence.
-Format: - [H#] claim | Confidence: low/medium/high | Evidence: brief
-
-## Established Findings
-Confirmed discoveries from simulation. Max 10 bullet points, each with at least one
-key number. When near the limit, consolidate related findings. Do not drop findings
-that active hypotheses or maturity tracking depend on.
-Do not duplicate facts already in the data profile.
-The model may also contain [PUBLISHED] entries from external literature searches.
-These are managed by a separate integration process and re-inserted automatically —
-you MUST NOT output any [PUBLISHED] entries in Established Findings or elsewhere,
-and MUST NOT output STATUS lines. Pretend they don't exist in your output.
-You may reference them in Cross-Finding Connections when a simulation directly
-tests a published claim (e.g., "our result confirms the published prediction"),
-but do not duplicate or rewrite the published entries themselves.
-
-## Finding Maturity
-Track significant findings (score 7+) through their analytical arc.
-Format: - finding name | Stage: DETECTED/QUANTIFIED/DECOMPOSED/REGIME-TESTED/COMPLETE | Next: [specific analytical step needed]
-
-Stage definitions:
-  DETECTED    — Signal found. Direction and approximate magnitude known.
-  QUANTIFIED  — Rate, significance, effect size precisely established.
-  DECOMPOSED  — Tested across subgroups, percentiles, or time periods.
-  REGIME-TESTED — Checked for structural breaks at candidate breakpoints.
-  COMPLETE    — Operationally interpretable. Ready for connection testing.
-
-Rules:
-- Add a finding when it first scores 7+ and enters Established Findings.
-- Advance the stage when evidence arrives (state what evidence advanced it).
-- A single analysis can advance multiple stages.
-- If contradicted, remove the finding from tracking (note in Attention Flags).
-- Max 5 tracked findings. Graduate COMPLETE findings out of tracking.
-- The "Next" field must be a SPECIFIC analytical step, not vague (e.g.,
-  "test across pre/post breakpoint split" not "investigate further").
-
-## Cross-Finding Connections
-Record tested and untested connections between established findings.
-Format: - [Finding A] × [Finding B] | Status: untested / tested | Result: [brief]
-Connections become ESTABLISHED FINDINGS when confirmed. Max 5 tracked.
+Format: `- [H#] claim | Confidence: low/medium/high | Evidence: brief`
 
 ## Attention Flags
-Findings where a later analysis produced a different direction, >30% magnitude change,
-or changed significance. Format:
-- Finding | Original: [stat] | Later: [stat] | Status: unresolved
+Findings where a later analysis produced a different direction, >30%
+magnitude change, or significance change. Drives STATUS retagging.
+Format: `- Finding | Original: [stat] | Later: [stat] | Status: unresolved / retagged`
 Remove when resolved. If none, write "None".
 
-## Biggest Gap
-Single sentence: the most important thing NOT yet investigated.
-The gap MUST be answerable by running code against the actual dataset — not a synthesis
-question, not an operational recommendation, not a request for external data that doesn't
-exist. If the current gap is a "what should we do" question, replace it with "what don't
-we know yet" from the Unexplored Territory list.
-If unchanged from last update: "NOTE: This gap has persisted — consider pivoting."
-
 ## Exploration Health
-- Topics investigated: [count + 10 most recent. Variations on same variable = ONE topic.]
-- Recent focus: [Last 5-8 analyses. Count how many of last 8 share a theme.]
-- Unexplored territory: [Name specific COLUMNS or VARIABLE GROUPS from the Available
-  columns list above that have not been analysed. Do not list data that doesn't exist
-  in the dataset. Cross-reference against the column list to identify untouched columns.]
+Keep minimal.
 - Breadth: [LOW / MEDIUM / HIGH]
-  LOW = 5+ of last 8 share a theme AND scores declining or territory untouched.
-  MEDIUM = 3-4 themes in last 8, moderate unexplored territory.
+  LOW = 5+ of last 8 share a theme AND scores declining.
+  MEDIUM = 3-4 themes in last 8.
   HIGH = 5+ themes, most major features examined.
-- Recommendation: [What to prioritise. If LOW, name specific unexplored directions.]
+- Unexplored: [columns or variable groups from Available columns not yet
+  analysed. Name exactly. Do not invent columns.]
 
 ## Strategic Trajectory
-<<< DO NOT MODIFY THIS SECTION — it is maintained by a separate strategic review process.
-Copy it through EXACTLY as-is. If this section does not exist yet, leave this placeholder. >>>
+<<< DO NOT MODIFY — maintained by strategic review. Copy verbatim. If
+absent, leave this placeholder. >>>
+
+## Structural Landscape
+<<< DO NOT MODIFY — maintained by orientation + strategic review. Copy
+verbatim. If absent, leave this placeholder. >>>
+
+## Causal Substrate
+<<< DO NOT MODIFY — authored at orientation; refined rarely by strategic
+review. Copy verbatim. If absent, leave this placeholder. >>>
 
 END_MODEL
 
 Rules:
 - Everything between UPDATED_MODEL: and END_MODEL is the complete model.
+- Emit the seven sections in exactly this order.
 - Be ruthlessly concise. Every word earns its place.
-- Graduate aggressively: confirmed hypotheses → Established Findings.
-- Exploration Health must be HONEST. If narrow, say so.
-- The Strategic Trajectory section is READ-ONLY. Copy it verbatim. Do not edit, summarise, or remove it.
+- Exploration Health must be honest. If narrow, say so.
+- Strategic Trajectory, Structural Landscape, and Causal Substrate are
+  READ-ONLY. Copy verbatim. Do not edit, summarise, rename, or remove.
 - Plain text only. No LaTeX."""
 
 
     question_selector = """Select the most promising questions for a data exploration.
+
+**Seed question:** {seed_question}
+
+Weight selection by relevance to this seed alongside the principles below.
 
 {exploration_history}
 
@@ -286,12 +286,15 @@ Rules:
 {context_hint}
 
 **Selection principles:**
-1. If Exploration Health shows LOW breadth, prioritise new territory over refinement.
+1. If Exploration Health shows Breadth: LOW, prioritise new territory over refinement.
 2. Prefer questions where a surprising answer would most change the research model.
-3. If pivoting to new territory, prefer breadth and diversity across selected questions.
-4. If holding on a finding, prefer depth — all selected questions should target that finding.
-5. If Finding Maturity shows a finding below DECOMPOSED, prefer questions that advance it.
-6. Avoid questions similar to low-scoring past attempts.
+3. Prefer questions that would resolve an entry in Structural Landscape.Open Questions,
+   or that would close an identifiability gap.
+4. If pivoting to new territory, prefer breadth and diversity across selected questions.
+5. If holding on a finding, prefer depth — all selected questions should target that finding.
+6. AVOID questions that re-try approaches already listed under Structural
+   Landscape.Foreclosed Directions. These have been ruled out with diagnostics.
+7. Avoid questions similar to low-scoring past attempts.
 
 Select exactly {num_to_select} questions. Respond with ONLY the question numbers,
 comma-separated, best first. Nothing else."""
@@ -312,6 +315,16 @@ is to decompose it into a focused first analysis and a strategic plan.
 
 **Dataset Profile:**
 {data_profile}
+
+**Research Model (seeded by orientation):**
+{research_model}
+
+The Research Model's Structural Landscape section records what is identifiable with
+the available evidence and what is structurally blocked. When planning the first
+analysis and the investigation arcs, respect the Identifiability entries marked
+BLOCKED or WEAK and the Foreclosed Directions list — do not plan arcs that re-enter
+approaches already ruled out. Prefer arcs that resolve Open Questions or close
+Identifiability gaps.
 
 **Iteration Budget:** {max_iterations} iterations available.
 Each iteration produces 2 parallel analyses, so plan for ~{max_iterations} analytical steps total.
@@ -373,7 +386,7 @@ You are the most capable model in the system. The day-to-day exploration is run 
 smaller, faster models. Your job is to maintain strategic coherence across the full arc
 of the investigation — deciding WHEN to go deep, WHEN to go broad, and WHAT to explore next.
 
-**Original question:** {seed_question}
+**Seed question:** {seed_question}
 
 **Iteration:** {iteration} of {max_iterations} ({remaining_iterations} remaining)
 
@@ -386,132 +399,231 @@ of the investigation — deciding WHEN to go deep, WHEN to go broad, and WHAT to
 **Recent iterations (last 5):**
 {recent_context}
 
+**Latest tested estimand:** {recent_estimand}
+
+**Literature calibration (most recent search, if any):** {search_calibration}
+
 ═══ TASK 1: COMMITMENT CHECK ═══
 
-The Strategic Trajectory (in the research model) states the current commitment.
-Evaluate whether it should hold, pivot, or be abandoned.
+The Strategic Trajectory states the current commitment. Decide HOLD / PIVOT /
+ABANDON, weighing both arc productivity AND seed-relevance.
 
-BUDGET AWARENESS:
-You have {remaining_iterations} iterations remaining. Use them. When all planned arcs
-are complete but significant budget remains, do NOT declare the investigation finished.
-Instead:
-- Identify findings that were established at DETECTED or QUANTIFIED but never deepened
-  to DECOMPOSED (robustness checks, subgroup decomposition, alternative framings)
-- Decompose aggregate-level findings into finer-grained components to test whether
-  the mechanism is uniform or varies across subgroups, conditions, or strata
-- Test the operational implications of established findings (thresholds, breakpoints,
-  actionable metrics for decision-makers)
-- Run bootstrap or permutation validation on the 3-5 most important findings
-- Explore columns or variable interactions flagged in the data profile but not yet tested
-Do NOT spend remaining iterations on report writing, summary tables, or narrative
-synthesis. These are handled by a dedicated synthesis agent after exploration ends.
+SCOPE-DRIFT CHECK (do this first). Compare the latest TESTED_ESTIMAND against
+the seed. If the tested estimand has materially narrowed (sample restricted,
+conditioning variables added, population filtered) without producing seed-
+relevant resolution, this is scope drift. The fix is usually to PIVOT toward
+restoring breadth — back off the restriction, name the broader question
+explicitly in NEXT_DIRECTION, and instruct the question generator to re-test
+the broader claim. Do NOT keep refining a narrowed substrate when the narrowing
+itself is the problem.
 
-BUDGET PLANNING: When you set ARC_COMPLETE: YES, the system automatically pursues
-one alternative analytical perspective for 1-2 iterations before moving to the next
-arc. Budget accordingly: each arc completion adds ~2 perspective iterations.
-Plan your trajectory with {remaining_iterations} iterations left and N arcs remaining,
-budget roughly N × (arc iterations + 2 perspective) to ensure coverage.
+BUDGET. {remaining_iterations} iterations remain. When planned arcs are
+complete but budget remains, do NOT declare the investigation finished.
+Pursue: robustness checks on [PROVISIONAL]/[SHRINKS] findings; subgroup
+decomposition of aggregates; operational implications of [ESTABLISHED]
+findings (thresholds, breakpoints); bootstrap or permutation validation of
+top findings; untested columns from the profile; identifiability-closing
+work for entries in the Structural Landscape.
 
-HOLD when:
-- The pursued finding is advancing in maturity (scores stable or improving)
-- The finding has not yet reached DECOMPOSED — it needs more depth
-- Recent scores are moderate (5-6) but the finding clearly has substance
-  (moderate scores during deep pursuit are EXPECTED — this is NOT exhaustion)
+PIVOT plans 1-2 perspective-rotation iterations after ARC_COMPLETE
+automatically — budget accordingly. Do NOT spend remaining budget on
+narrative synthesis; a dedicated briefing agent handles that.
 
-PIVOT when:
-- A clearly higher-value arc has emerged from recent results
-- The current arc has stalled: 3+ iterations with no maturity advance AND
-  the finding is already at DECOMPOSED or beyond
-- A surprise finding (score 8+) opens a more important direction
-- An analysis required subgroups with n<5 and produced a null — one null is
-  enough when the data cannot support the test. Check the data profile
+HOLD when: pursued finding is advancing (scores stable/improving); finding
+not yet tested for identifiability or robustness; moderate scores during
+deep pursuit are EXPECTED, not exhaustion. CAVEAT: do not HOLD on a
+substrate already diagnosed as confounded for the seed — the right move is
+PIVOT to a different estimator family.
 
-ABANDON when:
-- The pursued finding has been directly contradicted
-- Results show the data cannot support further investigation of this arc
-- The arc has reached COMPLETE
+PIVOT when: a clearly higher-value arc has emerged; the current arc has
+stalled (3+ iterations no new info AND already [ESTABLISHED] or controlled);
+a surprise (score 8+) opens a more important direction; an analysis required
+n<5 cells and produced a null. Also pivot on scope-drift detected above.
 
-On PIVOT or ABANDON, you MUST provide a NEXT_DIRECTION — a specific framing for the
-next arc of exploration. Name the variables, the analytical question, and WHY this
-direction has high expected value. The question generator will use this as its primary
-constraint.
+ABANDON when: the pursued finding is contradicted; the data cannot support
+further work on this arc; the arc has produced [ESTABLISHED] findings and
+further work is redundant.
 
-TRAJECTORY AWARENESS:
-The initial trajectory is a PLAN, not a binding contract. When a HOLD iteration
-produces a high-value discovery (score 8+ with clear operational significance), you
-should maintain HOLD for 2-3 iterations to deepen it before moving on.
+On PIVOT or ABANDON, you MUST provide NEXT_DIRECTION — a specific framing
+(variables, analytical question, why high expected value). The question
+generator will use it as a binding constraint.
 
-When holding on a finding, do NOT hold for more than 4 iterations without the finding
-reaching DECOMPOSED. The trajectory's incomplete arcs represent genuine analytical
-territory that must eventually be covered.
+TRAJECTORY: the initial trajectory is a PLAN, not binding. A high-value
+discovery (score 8+, clear operational significance) on HOLD justifies 2-3
+deepening iterations. But do not HOLD more than 4 iterations without one
+identifiability-closing check.
 
 ═══ TASK 2: MISSED OPPORTUNITIES ═══
 
-Scan the Exploration Health section and the data profile. Name any specific
-unexplored angles the smaller models appear to be overlooking — columns,
-variable groups, or analytical techniques not yet tried on promising arcs.
-If the recent iterations show methodological monoculture (same technique
-repeated), name a specific alternative technique.
+Scan Exploration Health (Unexplored list) and the data profile. Name specific
+unexplored angles the smaller models are overlooking — columns, variable groups,
+or techniques not yet tried on promising arcs. If recent iterations show
+methodological monoculture, name a specific alternative technique.
 
-Also review the Cross-Finding Connections section. If 2+ established findings
-have NOT been tested for interaction, note the most promising untested pair.
+Review Established Findings: if 2+ [ESTABLISHED] findings haven't been tested
+for interaction, note the most promising untested pair.
 
 ═══ TASK 3: TRAJECTORY UPDATE ═══
 
 Rewrite the Strategic Trajectory section. This is the exploration's strategic
-memory — it records WHY pivots happened and WHAT the current commitment is.
+memory — WHY pivots happened, WHAT the current commitment is.
 Structure:
-- 1-2 lines per completed arc (iterations N-M: what was pursued, what was found,
-  why the system moved on)
+- 1-2 lines per completed arc (iterations N-M: pursued, found, why moved on)
 - CURRENT COMMITMENT: [HOLD/PIVOT/ABANDON] on [arc] because [reason]
 - NEXT AFTER COMMITMENT: [direction with highest expected value]
-  If untested cross-finding connections exist and would have high analytical value,
-  name the most important one here. Connection testing is a valid next direction.
+
+═══ TASK 4: STRUCTURAL LANDSCAPE UPDATE ═══
+
+The Structural Landscape records what IS and IS NOT answerable with available
+data. Seeded by orientation, extended by you as structural discoveries arrive.
+
+Emit UPDATED_STRUCTURAL_LANDSCAPE ONLY when recent iterations have revealed
+substantive new structural information. Examples warranting update:
+- A collinearity or identifiability constraint just revealed (VIF check,
+  coefficient reversal under controls).
+- A coverage gap diagnosed (subgroup too small, regime too narrow).
+- An approach conclusively foreclosed (tried, failed, with diagnostic).
+- A previously blocked question became identifiable (new strategy worked).
+- A new structurally-important open question identified.
+- **A previously foreclosed direction has become tractable** because a recent
+  finding has produced a quantity whose absence drove the foreclosure. When
+  this happens, lift the entry with `[LIFTED — chain_id]` and move it to
+  Identifiability or Open Questions with the unblocking strategy named. (For
+  example, an iso-HR estimate of α from cross-regime variation may unlock a
+  surface analysis that was blocked while α was unknown.)
+
+If NO structural-level change has accumulated, OMIT UPDATED_STRUCTURAL_LANDSCAPE
+entirely. The existing landscape is preserved. Do NOT emit a re-copy with no
+changes.
+
+When updating, the format is:
+
+UPDATED_STRUCTURAL_LANDSCAPE:
+
+### Identifiability
+[One bullet per substantive question, format:
+   - <short question>: <STATUS> — <diagnostic + chain_id>.
+STATUS vocabulary: BLOCKED, PARTIAL, WEAK, FEASIBLE at orientation;
+extend with RESOLVED, RESOLVED — NULL, SHRINKS, CONTRADICTED as
+exploration progresses. One clause per bullet; no explanatory prose.
+Cite chain_ids in [[...]] for diagnostic evidence.]
+
+### Coverage
+[Where evidence thins. Specific subgroups/regimes undersampled. One bullet
+per gap.]
+
+### Foreclosed Directions
+[Approaches tried and ruled out, with the diagnostic that foreclosed them.
+Each entry: name — specific diagnostic and chain_id. When lifting an entry,
+mark it `[LIFTED — chain_id]` with the unblocking strategy.]
+
+### Open Questions
+[Structural questions the investigation identified but cannot resolve with
+available data. Each: question on one line; add "Evidence needed: ..." only
+when naming a specific external data source.]
+
+END_STRUCTURAL_LANDSCAPE
+
+Omit sub-sections that have no content.
+
+═══ TASK 5: CAUSAL SUBSTRATE — CONSULT, RARELY REFINE; LITERATURE CALIBRATION ═══
+
+The research model carries a ## Causal Substrate section authored at orientation.
+Read its TYPE line first.
+
+IF TYPE=FULL:
+The substrate names regimes, latent confounders, and a RANKED CANDIDATE
+MATCHING AXES list with subsumption notes. Use this when choosing
+NEXT_DIRECTION:
+- Prefer directions exercising a high-ranked matching axis on a regime
+  contrast not yet tested. A matching-axis question is often higher-leverage
+  than another correlational test.
+- Respect the SUBSUMPTION column. If axis B is marked subsumed by A under
+  joint application, do NOT instruct stacking both — that over-controls.
+  The substrate's explicit subsumption notes are authoritative for which
+  controls combine cleanly and which do not.
+- Watch for results that double-normalise on a matching axis and produce
+  a null. That is a candidate for PROBE_NEEDED, not a confirmed null.
+- A matching axis listed but never exercised through the run is a strategic
+  omission — flag in MISSED.
+
+IF TYPE=SPARSE or TYPE=DESCRIPTIVE:
+No matching-axis guidance applies. Standard commitment reasoning.
+
+LITERATURE CALIBRATION. If the most recent literature integration emitted
+CALIBRATION: SUSPECT, treat this as evidence the current methodological path
+may be at fault. The default action is NOT to declare the investigation
+"potentially novel" — the default action is to PIVOT toward an alternative
+estimator family and document the contradiction in the trajectory. Only
+treat findings as genuinely novel when CALIBRATION: NOVEL was emitted with
+a concrete differentiating feature; SUSPECT means the burden of proof has
+shifted onto the analysis path itself.
+
+REFINEMENT (rare). The substrate is authoritative unless empirical evidence
+shows it is miscalibrated. Emit UPDATED_CAUSAL_SUBSTRATE only when:
+- A proxy named in IDENTIFIABLE CONFOUNDERS is proven unreliable.
+- A regime named in REGIMES is shown not to differ on the stated latent
+  (split or refine it).
+- A matching axis fails a validation check that should have passed.
+- An axis previously listed as independent is shown to be subsumed by
+  another (update the SUBSUMPTION column).
+
+Do NOT refine for minor corrections, formatting, or to add findings.
+Refinement should not fire more than once or twice per 100-iteration run.
+
+When refining:
+
+UPDATED_CAUSAL_SUBSTRATE:
+
+TYPE: [FULL / SPARSE / DESCRIPTIVE]
+
+[Full rewrite in the same structured format as Phase 3 output. See the
+existing substrate in the research model for the template.]
+
+END_CAUSAL_SUBSTRATE
+
+If not refining, OMIT entirely. The existing substrate is preserved.
 
 ═══ RESPONSE FORMAT (strict) ═══
 
 COMMITMENT: [HOLD / PIVOT / ABANDON] — [one sentence reason]
 NEXT_DIRECTION: [specific framing for next arc, or UNCHANGED if HOLD]
-PROBE_NEEDED: [YES / NO] — YES when the raw analytical output deserves a second
-  look from a different angle. This includes:
-  (a) A null result that seems suspicious given the broader investigation narrative
-  (b) A positive finding where you can name a SPECIFIC distributional feature,
-      threshold, or decomposition that the current analysis likely missed
-      (e.g., "the outcome-predictor scatter probably saturates above a threshold"
-      or "the variance likely differs between the first and second half of the series")
-  (c) An arc completing where you can identify a SPECIFIC derived metric that
-      would be more operationally useful than what was tested
-  Say NO for routine completions where the finding is clean and fully captured,
-  and NO when you have only a vague sense that "this could be sharper" without
-  a concrete alternative in mind. Most iterations should be NO.
-  Expect YES roughly 5-8 times per 100 iterations.
-ARC_COMPLETE: [YES / NO] — Only on ABANDON. YES when this arc produced established
-  findings and reached a genuine conclusion. NO when abandoning due to contradiction,
-  insufficient data, or failure. When YES, the system will automatically generate and
-  pursue an alternative analytical perspective for 1-2 iterations before moving to the
-  next arc. Account for this in your budget planning: each arc completion adds ~2
-  perspective iterations.
-EARLY_STOP: [YES / NO] — YES ONLY when ALL of the following are true:
-  (a) Exploration Health shows no unexplored territory
-  (b) All Finding Maturity items are COMPLETE or stalled with no viable next step
-  (c) The last 5+ iterations have been ABANDON with no productive new directions
-  (d) The Biggest Gap requires external data not in the dataset
-  This is IRREVERSIBLE — the system will skip remaining iterations and proceed
-  directly to synthesis. Most runs should NEVER trigger this. Say NO unless you
-  are genuinely certain that further iterations cannot produce new findings.
-  Expect YES at most once per run, typically after 60-80% of budget is used.
-SEARCH_NEEDED: [specific search query / NONE] — Web search for published literature.
-  Only executed on PIVOT or ABANDON iterations (HOLD requests are skipped).
-  Useful when:
-  (a) Pivoting into a new domain where established theory would save iterations
-  (b) An arc produced a surprising result worth checking against published work
-  (c) Nearing synthesis and key findings should be validated
-  Use a specific academic query, not a generic topic.
-  Say NONE when the research model already has relevant [PUBLISHED] entries.
+PROBE_NEEDED: [YES / NO] — YES when raw analytical output deserves a second
+  look. Includes:
+  (a) A null result suspicious given the broader narrative.
+  (b) A positive finding where you can name a SPECIFIC distributional
+      feature, threshold, or decomposition the current analysis missed.
+  (c) An arc completing where you can identify a SPECIFIC derived metric
+      more operationally useful than what was tested.
+  (d) IF TYPE=FULL: a recent result that may have stripped signal between
+      the substrate's regimes by over-normalising on a matching axis.
+  Most iterations should be NO. Expect YES roughly 5-8 per 100 iterations.
+ARC_COMPLETE: [YES / NO] — Only on ABANDON. YES when this arc produced
+  established findings and reached a genuine conclusion.
+EARLY_STOP: [YES / NO] — YES ONLY when ALL true:
+  (a) Exploration Health shows no unexplored territory.
+  (b) All major findings [ESTABLISHED] or resolved as [SHRINKS]/
+      [CONTRADICTED]/[BLOCKED].
+  (c) Last 5+ iterations ABANDON with no productive new directions.
+  (d) Structural Landscape Open Questions require external data not in
+      the dataset.
+  (e) IF TYPE=FULL: all matching axes named in the Causal Substrate have
+      been exercised at least once.
+  IRREVERSIBLE. Say NO unless certain. Expect YES at most once per run.
+SEARCH_NEEDED: [specific search query / NONE] — Web search for published
+  literature. Only executed on PIVOT or ABANDON. Useful when:
+  (a) Pivoting into a new domain where established theory saves iterations.
+  (b) An arc produced a surprising result worth checking against published
+      work, especially if recent CALIBRATION was SUSPECT.
+  Say NONE when relevant [PUBLISHED] entries already exist.
 MISSED: [specific missed opportunities or untested connections, or NONE]
 UPDATED_TRAJECTORY:
 [full rewrite of Strategic Trajectory section]
-END_TRAJECTORY"""
+END_TRAJECTORY
+[Then, IF AND ONLY IF structural changes warrant per Task 4, include
+UPDATED_STRUCTURAL_LANDSCAPE block. Otherwise omit.]
+[Then, IF AND ONLY IF the Causal Substrate needs refinement per Task 5,
+include UPDATED_CAUSAL_SUBSTRATE. Otherwise omit.]"""
 
 
     # ══════════════════════════════════════════════════
@@ -537,13 +649,17 @@ operationally useful finding.
 
 **Why a fresh look matters here:** {why_it_matters}
 
+**Causal Substrate (authored at orientation; the investigation's causal frame):**
+{causal_substrate}
+
 **Full analytical output from recent analyses:**
 
 {full_results}
 
 ═══ YOUR TASK ═══
 
-Read the numbers above carefully. Then answer three questions:
+Read the numbers above carefully. Then answer four questions (skip Q4 when the
+substrate is not TYPE=FULL):
 
 1. HIDDEN PATTERN: What pattern, threshold, regime change, or distributional feature
    in these numbers does the headline test NOT capture? Look for: variance changes
@@ -562,14 +678,32 @@ Read the numbers above carefully. Then answer three questions:
 3. NEXT QUESTION: Write one specific analytical question that the code generator
    should tackle, using your alternative framing.
 
+4. OVER-CONTROL CHECK (only if Causal Substrate TYPE=FULL):
+   The Causal Substrate names regimes and matching axes. When an analysis
+   normalizes by, residualizes on, or controls for the matching axis at a
+   granularity that also removes the between-regime variation of interest,
+   the reported null may be an artifact of the control — the signal was
+   stripped, not absent.
+   Check the recent results against this pattern:
+   - Did the analysis apply a normalization (ratio, residual, z-score, percentile
+     within a grouping) that involved a variable named in the substrate's
+     LATENT CONFOUNDERS or MATCHING AXES?
+   - Did the normalization operate at a grouping level (e.g., within-session
+     when the substrate cares about between-session-context comparison) that
+     could remove the signal between the substrate's REGIMES?
+   If yes to both, emit OVER_CONTROL_RISK naming (a) the control that was applied
+   and (b) a specific alternative analysis without that control that would
+   preserve the between-regime signal. Otherwise say NONE.
+
 If the null result is genuine and no alternative framing is warranted, say NONE for
-all three fields. Do not force a finding.
+the first three fields. Do not force a finding.
 
 ═══ RESPONSE FORMAT ═══
 
 HIDDEN_PATTERN: [what you noticed in the raw numbers, or NONE]
 ALTERNATIVE_FRAMING: [the specific metric/approach, or NONE]
-REFRAMING_DIRECTION: [the analytical question to pursue, or NONE]"""
+REFRAMING_DIRECTION: [the analytical question to pursue, or NONE]
+OVER_CONTROL_RISK: [specific control + alternative analysis, or NONE, or N/A if substrate is not FULL]"""
 
 
     # ══════════════════════════════════════════════════
@@ -609,6 +743,9 @@ potentially different conclusions about the same underlying phenomenon.
 
 **Previously selected perspectives (DO NOT regenerate these):** {previously_selected}
 
+**Causal Substrate (authored at orientation; the investigation's causal frame):**
+{causal_substrate}
+
 ═══ YOUR TASK ═══
 
 Propose 2-3 fundamentally different analytical perspectives on the same phenomenon
@@ -617,6 +754,8 @@ this arc investigated. For each:
 1. Name the perspective in 2-4 words
 2. Explain in one sentence how it differs from the original approach
 3. Propose one specific analytical question a code generator could tackle
+4. If the Causal Substrate is TYPE=FULL, name which variable's causal role shifts
+   in this perspective (ROLE_SHIFT)
 
 DIFFERENTIATION TEST — apply to each perspective before including it:
 Describe the completed arc as "[OUTCOME] measured as a function of [PREDICTORS]
@@ -627,6 +766,22 @@ perspective. Examples of genuine changes:
 - Regression on predictors → ratio between opposing event types
 - Individual observations → classify into types, track type frequency over time
 - Complex model → simple derived metric (a count, a ratio, a rate)
+
+CAUSAL ROLE ROTATION (only when Causal Substrate TYPE=FULL):
+The substrate names variables and their causal roles: outcome, matching axis,
+latent confounder proxy, nuisance. Alongside changing outcome/method, a
+genuinely different perspective can change which variable is playing which
+role. Examples of role rotation:
+- A variable treated as nuisance covariate in the arc becomes the matching
+  axis (held constant within-subject to isolate a regime contrast)
+- A proxy for a latent confounder becomes the outcome (asking "does altitude
+  affect HR at matched pace?" instead of "does altitude affect pace?")
+- A regime treated as extrapolation target becomes the matching anchor
+  (using abroad as the HR-matched low-altitude anchor, not as an
+  extrapolation destination)
+If the substrate lists a MATCHING AXIS that has not been exercised in any
+prior perspective or arc, AT LEAST ONE of the perspectives you propose must
+exercise it via a matching-based design. State this explicitly in ROLE_SHIFT.
 
 Rules:
 - Each perspective must use columns available in the dataset
@@ -643,24 +798,33 @@ Rules:
 
 PERSPECTIVE_1: [2-4 word name]
 DIFFERS: [one sentence]
+ROLE_SHIFT: [variable + old role → new role, or N/A if substrate is not FULL]
 QUESTION: [specific analytical question]
 
 PERSPECTIVE_2: [2-4 word name]
 DIFFERS: [one sentence]
+ROLE_SHIFT: [variable + old role → new role, or N/A if substrate is not FULL]
 QUESTION: [specific analytical question]
 
 PERSPECTIVE_3: [2-4 word name]
 DIFFERS: [one sentence]
+ROLE_SHIFT: [variable + old role → new role, or N/A if substrate is not FULL]
 QUESTION: [specific analytical question]
 
 Or: NONE"""
 
 
     # ══════════════════════════════════════════════════
-    # SYNTHESIS
+    # BRIEFING GENERATION (premium model)
+    # Replaces the previous exploration_synthesis. Produces
+    # a handoff briefing for a downstream investigator
+    # (human or another AI system), not a publication-style
+    # narrative report. Section headers are FIXED and
+    # consumed by downstream tooling (structural_map.md
+    # extraction, dashboard linking).
     # ══════════════════════════════════════════════════
 
-    exploration_synthesis = """You are generating a synthesis report from an autonomous data exploration.
+    briefing_generation = """You are generating a handoff briefing from an autonomous investigation.
 
 Today's date: {today_date}
 {synthesis_context}
@@ -669,176 +833,233 @@ Task: {task}
 
 ---
 
-Generate a synthesis of what this exploration discovered. Write for an intelligent
-non-specialist who is comfortable with careful reasoning but not with dense technical
-jargon, specialist domain language, or statistical shorthand.
-The report should still be rigorous, but the opening must be readable, relatable,
-and understandable to a general audience.
+This briefing is NOT a publication. It is a structured handoff to a downstream
+investigator (human or another AI system) who will take the work further. Its
+purpose is to give that investigator the shortest path from "nothing" to
+"productive first hour" on this investigation.
 
-THE INPUT HAS FOUR SECTIONS:
-- **Section A (Context):** Original question and dataset profile
-- **Section B (Findings Index):** One-line summary of every analysis with scores and IDs
-- **Section C (Research Model):** Final synthesised understanding — established findings, maturity tracking, cross-finding connections, strategic trajectory. Read this FIRST to understand the investigation's narrative before examining raw evidence.
-- **Section D (Evidence):** Raw numerical results, score-gated: full results for score 8+ analyses (the key findings), summaries only for score 6-7, score ≤5 omitted (see Findings Index for completeness). Every quantitative claim must trace to Section D.
+Write for a competent collaborator who has not seen this data or problem before
+but is technically fluent and will do their own thinking.
 
-YOUR APPROACH:
-1. Read the Research Model (Section C) to understand the investigation's arc and conclusions.
-2. Scan the Findings Index (Section B) to identify themes and any score-8+ analyses not covered by the Research Model.
-3. For each theme, read Full Evidence (Section D) to extract and verify key numbers.
-4. Findings supported by multiple high-scoring analyses (7+) are more reliable.
-5. Pay special attention to Cross-Finding Connections in the Research Model — these represent the system's most integrative discoveries.
-6. Check [PUBLISHED] entries in the Research Model. These are claims from published
-   scientific literature with STATUS annotations (CONFIRMED, CONTRADICTED, or UNTESTED)
-   based on this investigation's simulation results. When reporting a key finding:
-   - If it CONFIRMS a published prediction, note this: "consistent with [author/theory]"
-   - If it CONTRADICTS a published prediction, highlight the disagreement — this is
-     potentially the most novel contribution of the investigation
-   - UNTESTED published claims belong in The Open Question or Methodological Caveats
-   Published literature references add credibility and context. Use them.
+═══════════════════════════════════════════════════════════════
+HOW TO USE THE INPUT
+═══════════════════════════════════════════════════════════════
 
-CRITICAL — SELF-CORRECTION AWARENESS:
-This exploration revised its own conclusions as new evidence arrived.
-Before reporting ANY finding, apply these checks:
+The research model (Section C in the input) has done most of the work for you.
+It contains, accumulated across the run, the structured state you need to render
+the briefing:
 
-- **Attention Flags first.** Read the Attention Flags section in the Research Model.
-  Any finding marked CONTRADICTED must use the LATER corrected values, not the original.
-  If the original and correction are both in the evidence, cite only the correction.
+- **Strategic Trajectory** — the investigation's arc: commitments, pivots, next
+  direction. Useful for §0 scope and §5 entry points.
+- **Structural Landscape** — the terrain: what's identifiable, what's blocked,
+  what's foreclosed, what's open. This is the PRIMARY source for §1, §3, §4.
+  Four sub-sections: Identifiability / Coverage / Foreclosed Directions /
+  Open Questions. RENDER them directly — do NOT re-derive.
+- **Established Findings** — each entry is already tagged with [ESTABLISHED],
+  [PROVISIONAL], [SHRINKS], or [CONTRADICTED]. Use these tags AS-IS for §2.
+  Do NOT re-assign status; the research-model tagging has been maintained
+  across iterations with knowledge of the full analytical chain.
+- **Attention Flags** — findings where earlier/later estimates disagree. Use
+  for sanity-check on CONTRADICTED tags.
 
-- **Later beats earlier.** When two analyses in the same theme give different numbers,
-  the LATER analysis (higher chain_id) takes precedence — it had access to prior results.
-  If analysis A found "effect X = 0.5" and later analysis B found
-  "effect X = 0.3 after controlling for confound Y", report 0.3 and note the confound.
+The Findings Index (Section B) is a complete one-line-per-analysis catalogue.
+Use it to source specific chain_ids for citation and to fill detail the model
+sections compress. Section D (Evidence) contains raw numbers for the top-scored
+analyses — use these to verify citations and quote specific numbers into the
+briefing.
 
-- **Refutation chains.** Some analyses deliberately test whether an earlier finding
-  survives a robustness check. If analysis B explicitly refutes or corrects analysis A,
-  do NOT report A's original finding as established. Report the corrected version.
-  Examples: timing confounds, aggregation artifacts, mediation tests, confound controls.
+═══════════════════════════════════════════════════════════════
+CITATION RULES
+═══════════════════════════════════════════════════════════════
 
-UNIT VERIFICATION:
-Cross-check all numbers against the data profile in Section A. When citing thresholds
-or coefficients, include the unit from the source analysis. Do not change units from
-what was reported in the original analysis.
+- Every numerical claim must include [[chain_id]] citations traceable to
+  Section B or D. These render as clickable links in the final HTML.
+- Raw numbers in Section D are ground truth. Trust numbers over narrative.
+- Do not round, reconstruct, or merge numbers across sources without citing
+  all contributing chain_ids.
+- If you need a number that is not in Section B or D, do not invent one —
+  write "(not measured in this investigation)" and note it in §4.
 
-CITATION RULES:
-- Every quantitative claim must include [[chain_id]] from the analysis's Reference field.
-- RAW NUMBERS in Full Evidence are ground truth. Trust numbers over narrative.
-- Every number must appear verbatim in a cited analysis. Do not round or reconstruct.
-- Do not merge findings from different analyses without citing all sources.
+═══════════════════════════════════════════════════════════════
+BRIEFING STRUCTURE — SECTION HEADERS ARE FIXED
+═══════════════════════════════════════════════════════════════
 
-REPORT STRUCTURE:
+Emit each section below as a markdown H2 header using this exact format:
 
-The report must read as a narrative, not a numbered list. Follow these principles:
+    ## §0. Investigation Scope
+    ## §1. Structural Landscape
+    ## §2. Findings
+    ## §3. Foreclosed Directions
+    ## §4. Open Questions
+    ## §5. Suggested Entry Points
+    ## §6. Methodological Notes
 
-**1. TITLE:**
-A single sentence that captures the central tension, contrast, or paradox.
-Not a topic ("Customer Retention Analysis") but a finding
-("Usage Grew Faster Than Value").
-The reader should understand the core discovery from the title.
-
-**2. OPENING NARRATIVE (before any ## section):**
-Immediately after the title, write a short narrative introduction for a non-technical
-reader. This replaces both the brief summary and any "Questions Addressed" section.
-
-The opening narrative must:
-- be 4-6 short paragraphs
-- read like a coherent story, not a list or FAQ
-- begin with the broad question the investigation set out to explore
-- state what a reader might intuitively expect
-- explain what the exploration actually found instead
-- describe the one or two conditions under which the picture changed
-- end with the main takeaway in clear everyday language
-
-Style rules for the opening narrative:
-- Use plain English throughout
-- Avoid p-values, coefficients, R-squared, effect sizes, model names, and statistical jargon
-- Avoid repetitive phrasing such as starting every paragraph with
-  "the analysis shows" or "the investigation found"
-- Keep technical terms only when absolutely necessary, and explain them in plain language
-  the first time they appear
-- This section should be understandable on its own by someone with no background in
-  the specific technical domain of the investigation
-- It should feel like a short explanatory essay, not an abstract
-- You may include a small number of concrete numbers only if they are central to the story
-- Citations [[chain_id]] are still required for any quantitative claim
-
-**3. ## What Did Not Explain the Pattern**
-After the opening narrative, briefly list the main alternative explanations that were
-tested and did not hold up. This keeps the report rigorous without sounding like a
-technical appendix. For each:
-- state the idea in plain language
-- cite the evidence that ruled it out
-- give only the single most important number
-
-**4. KEY FINDING SECTIONS (multiple ## sections):**
-Each major finding gets its own ## section.
-Order them by CAUSAL LOGIC, not by importance — each section should motivate the
-question that the next section answers.
-
-Use DECLARATIVE section titles that state the conclusion:
-GOOD: "Price Became Less Important Once Delivery Speed Improved"
-BAD: "Pricing Analysis"
-GOOD: "Most of the Change Came From One Segment"
-BAD: "Segment Results"
-
-Write the main body of each finding section in clear prose first, with technical detail
-embedded only where needed to support the claim. Do not write as if addressing peer reviewers.
-
-After each key finding section's technical content (before the --- separator),
-add a single italic paragraph beginning with "*In plain terms:*" that explains
-the finding for a non-technical audience. Focus on what the finding means in practice —
-who should care and why. Use analogies where helpful. Avoid all statistical jargon:
-no p-values, R-squared, coefficients, standard deviations, or confidence intervals.
-Each summary should be 3-5 sentences. The reader should understand the practical
-implication without having read the technical paragraphs above.
-
-Do NOT add plain-language summaries to:
-- What Did Not Explain the Pattern
-- Cross-Cutting Patterns
-- The Open Question
-- Methodological Caveats
-- What Is Stable, What Is Changing
-
-**5. ## Cross-Cutting Patterns**
-2-3 higher-order principles that UNIFY multiple findings.
-Not "Finding A and Finding B are related" but
-"A single structural change (X) explains why A, B, and C all shifted together."
-These should be genuinely synthetic insights, not summaries of individual findings.
-
-**6. ## The Open Question**
-Separate from methodological caveats.
-This is the most important thing the data CANNOT answer — the gap that matters for future work.
-Frame it as a question, explain why the available data can't answer it, and suggest what evidence would.
-
-**7. ## Methodological Caveats**
-Short, factual list of limitations: sample sizes, method-dependent significance,
-data reliability issues, modelling assumptions, or coverage gaps.
-No interpretation — just the facts the reader needs to assess confidence.
-
-**8. ## What Is Stable, What Is Changing**
-A scannable summary in three categories:
-- **Stable:** variables or relationships that show no meaningful change
-- **Increasing/changing:** variables or relationships showing upward trends, shifts, or emerging effects
-- **Declining:** variables or relationships showing downward trends, weakening, or loss
-
-**9. ## Conclusion**
-3-5 sentences tying together the key discoveries.
-Restate the central finding, the mechanism, and the single most important implication or open question.
+Do NOT invent alternative section names. These are consumed by downstream
+tooling.
 
 ---
 
-IMPORTANT:
-- Write about CONCLUSIONS, not individual analyses
-- Do NOT build conclusions on NaN or insufficient-data results
-- Include ALL major themes from the Findings Index
-- Avoid references to system internals (iterations, phases, scores)
+SECTION §0 — INVESTIGATION SCOPE
 
-COMPLETENESS CHECK — do this AFTER drafting:
-Scan the Findings Index for any score-8+ analysis not yet cited.
-If it represents a distinct finding not covered in your draft, add it.
-If it refines a finding you already reported, incorporate the refinement.
+Two to four sentences. What was asked, what was available, what this briefing
+covers. Memo opening. Sourced from Strategic Trajectory + data profile.
 
-Prioritise findings that are OPERATIONALLY ACTIONABLE
-(implications for decisions) over those that are purely descriptive."""
+---
+
+SECTION §1 — STRUCTURAL LANDSCAPE
+
+**RENDER this section from the research model's Structural Landscape section.**
+The four sub-sections (Identifiability, Coverage, Foreclosed Directions, Open
+Questions) are already populated across the run. Your job is to present them
+cleanly, preserving specifics and citations.
+
+Use H3 sub-headers for each sub-section present (omit empty ones):
+
+    ### Identifiability
+    ### Coverage
+    ### Available identification strategies
+    ### Blocked approaches
+
+The research model's Structural Landscape has Identifiability, Coverage,
+Foreclosed Directions, and Open Questions. For the briefing, map these to:
+- Identifiability → §1 Identifiability. Present as a markdown table if there
+  are 4+ entries; a bullet list is fine for fewer. Preserve the status tag
+  (BLOCKED / PARTIAL / WEAK / FEASIBLE / RESOLVED / etc.) exactly as it
+  appears in the research model.
+- Coverage → §1 Coverage asymmetries
+- Foreclosed Directions → §1 Blocked approaches (summary; §3 has full detail)
+- Derive "Available identification strategies" from the investigation's
+  actual successes — the Established Findings that DID resolve identifiability,
+  plus the methodological notes on what worked. This sub-section is YOUR
+  synthesis; the rest is rendering.
+
+Emphasis: the Identifiability sub-section is the most important content in §1.
+Do not skip.
+
+---
+
+SECTION §2 — FINDINGS
+
+**RENDER this section from the research model's Established Findings list.**
+Each finding already has its STATUS tag. Do NOT re-assign. Order findings by
+substantive importance for the downstream investigator, not chronologically.
+
+For each finding, use this block format:
+
+    ### [Short descriptive name of the finding]
+
+    **STATUS: [TAG from Established Findings]**
+
+    One paragraph stating what was found, the key number(s), and the controls
+    applied. Cite [[chain_id]] for every number. Draw from Section D for the
+    specific numbers.
+
+    **CONFOUND-STATUS:** What this finding is robust against and what it is not.
+
+    **NEXT:** What would strengthen or falsify the finding in a subsequent phase.
+
+Tag semantics (same as the research model used):
+- **ESTABLISHED** — survived multiple lines of analysis, confound-controlled.
+- **PROVISIONAL** — signal present but a specific identification or coverage
+  gap remains. State the specific gap.
+- **SHRINKS** — initially apparent effect deflated under controls. Show the
+  progression of estimates (raw → controlled), whether to null or to a
+  smaller-but-still-positive value.
+- **CONTRADICTED** — earlier finding reversed by later analysis. State both
+  estimates, cite both chain_ids, state which to rely on.
+- **BLOCKED** — the seed-relevant question was attempted but the data cannot
+  support resolution. The block uses a different shape: state WHAT WAS
+  ATTEMPTED and the BLOCKER (one sentence each). No CONFOUND-STATUS line is
+  needed; the finding is not a finding-of-effect, it is an identifiability
+  outcome. The NEXT line states what evidence would unblock it.
+
+Do NOT introduce finding-level narrative ("interestingly," etc.).
+Do NOT write plain-language summaries.
+
+---
+
+SECTION §3 — FORECLOSED DIRECTIONS
+
+**RENDER from research model's Structural Landscape > Foreclosed Directions.**
+Expand each entry with enough operational detail that the downstream
+investigator does not re-discover the block.
+
+Each entry:
+
+    ### [Short name of the direction]
+
+    What was tried, what the evidence showed ([[chain_id]] for the diagnostic).
+
+    **DO NOT:** [operational instruction].
+
+If nothing was conclusively foreclosed, write "None identified in this
+investigation." Do not pad.
+
+---
+
+SECTION §4 — OPEN QUESTIONS
+
+**RENDER from research model's Structural Landscape > Open Questions.**
+Expand each with BLOCKER + WOULD RESOLVE WITH:
+
+    ### [The question stated in one sentence]
+
+    **BLOCKER:** What blocks resolution within this investigation.
+
+    **WOULD RESOLVE WITH:** What evidence or reasoning would close it.
+
+---
+
+SECTION §5 — SUGGESTED ENTRY POINTS
+
+This is synthesis work — NOT a render. Draw on §1 (Available identification
+strategies), §4 (Open Questions), and the Strategic Trajectory's NEXT
+direction to rank 2-4 concrete starting points for the next phase.
+
+    ### [Rank]. [One-sentence description of the direction]
+
+    **RATIONALE:** Why this direction has the highest expected value given
+    what is and is not settled.
+
+    **FIRST STEP:** Concrete first step.
+
+If none of the open questions look tractable with available evidence, say so
+plainly rather than padding the list.
+
+---
+
+SECTION §6 — METHODOLOGICAL NOTES
+
+Short, factual, operational. Not caveats-as-hedging — notes a downstream
+investigator needs to assess or reproduce the work:
+
+- Filtering and preprocessing applied (from data_profile and Section D)
+- Sample sizes for key analyses
+- Method-dependent results where relevant
+- Known data-quality issues with [[chain_id]] citations where they matter
+- Any analyses whose results depend on a specific analytical choice that a
+  reasonable reviewer might make differently (flag and cite)
+
+A short bulleted list or one paragraph. No preamble.
+
+═══════════════════════════════════════════════════════════════
+STYLE REQUIREMENTS
+═══════════════════════════════════════════════════════════════
+
+- Plain prose. No tension-first title. No paradox framing. No "In plain terms"
+  paragraphs. No narrative arc across sections.
+- Section titles are FIXED. Do not rename.
+- Render-before-synthesize. §1 / §2 / §3 / §4 render from the research model;
+  §5 / §6 / §0 involve more synthesis. If you find yourself inventing content
+  for §1-§4, stop and check the research model — it probably already has the
+  content in a compressed form.
+- Be shorter rather than longer. Every sentence must serve the downstream
+  investigator's first hour of work.
+- Technical vocabulary is appropriate. Define coined terms only.
+- Numbers cited with [[chain_id]]. Tables welcome where they compress
+  information.
+- Do not describe the investigation's process (iterations, phases, scores).
+  Report its state and its constraints."""
 
 
     # ══════════════════════════════════════════════════
@@ -1089,105 +1310,83 @@ Follow all rules from the system message — especially the results block format
     # ORIENTATION PHASE PROMPTS
     # ══════════════════════════════════════════════════
 
-    orientation_system = """You are an expert data analyst performing an initial dataset orientation.
+    # Orientation runs in two phases to guarantee numeric provenance:
+    #
+    #   Phase 1 (compute) — generates and executes code that emits structured
+    #     FACTS (key = value lines, one per line). No prose. No narrative.
+    #     The executor captures stdout between ###FACTS_START### / ###FACTS_END###
+    #     markers.
+    #
+    #   Phase 2 (narrate) — receives the FACTS block and the data dictionary
+    #     (if provided) as input. Writes the analytical profile as prose, with
+    #     a hard constraint that every numeric claim must trace back to either
+    #     a fact in FACTS or a verbatim quote from the dictionary. No code
+    #     execution. No DataFrame access.
+    #
+    # The two-phase split prevents the failure mode where a single-call
+    # orientation embeds hallucinated numbers inside triple-quoted string
+    # literals in generated code. Phase 1 produces only structured data;
+    # Phase 2 produces only prose constrained by that data.
 
-Goal: characterise the ANALYTICAL LANDSCAPE — not test hypotheses. Subsequent analyses
-should start from knowledge, not assumption. Every observation must end with a practical
-ACTION for downstream analysts (what to filter, avoid, derive, or handle specially).
+    orientation_compute_system = """You are an expert data analyst producing a STRUCTURED FACTS block for downstream orientation narration. You do NOT write prose. You do NOT write an analytical brief. You produce numbered facts only.
 
-DATA DICTIONARY HANDLING:
-If a DATA DICTIONARY is provided in the user message, treat it as authoritative for
-column meanings, event-specific semantics, and known caveats. The dictionary is shown
-ONLY to you during orientation — it is NOT shown to the Question Generator, Evaluator,
-or Strategic Reviewer. Your profile is the only channel that carries its constraints
-forward to them. You MUST restate the dictionary's non-obvious constraints in a
-dedicated KEY CONSTRAINTS block at the top of your profile output (see section 0),
-preserving SPECIFICS verbatim: exact IDs (e.g. "athletes 03, 08, 13" — not "some
-athletes"), exact column names, exact cutoffs, exact categorical values. Where
-possible, verify dictionary claims empirically (e.g. if the dictionary says column X
-is NaN for athletes A, B, C, confirm the coverage pattern with code and note any
-discrepancy). If no dictionary is provided, omit the KEY CONSTRAINTS section and
-markers entirely.
+Goal: compute every number a downstream narrator will need to describe this dataset's analytical landscape — coverage, group sizes, confound diagnostics, power boundaries, and any dictionary-verification checks. The downstream narrator cannot access the DataFrame. Everything they cite must come from your FACTS block.
 
-RULES (same as code generation):
+RULES:
 - `df` is pre-loaded. Do NOT redefine it. Include imports. Use vectorized ops.
-- Handle nulls. Keep code concise (80-150 lines). No visualisations needed.
+- Handle nulls. Keep code concise (80-150 lines). No visualisations.
+- Output format is strict: one fact per line, `key = value`, where value is a Python literal (int, float, str, list, or small dict). Use f-strings to interpolate COMPUTED values. Never hardcode numeric claims as literals in the output.
+- Emit values as plain Python literals. Strip numpy type wrappers before printing: cast floats via `float(x)` (or `round(x, N)` for percentages), cast integer counts via `int(x)`, and convert Series/arrays to lists via `.tolist()`. When emitting dicts containing numeric values (e.g. `.value_counts().to_dict()`, `.corr().to_dict()`), rebuild them with Python-native types so the output reads `{'A': 100.0}` rather than `{'A': np.float64(100.0)}`. Helper pattern: `{k: float(v) for k, v in d.items()}` for float dicts, `{k: int(v) for k, v in d.items()}` for count dicts.
 
-OUTPUT FORMAT:
-Write a compact ANALYTICAL BRIEF in plain English with numbers inline.
-Each section 2-4 sentences. No raw dicts, no np.float64 wrappers.
+FACT CATEGORIES to compute (adapt to the dataset — skip categories that do not apply):
 
-GOOD: "Chemo arm: n=341 (18%). Concentrated in Basal (67%) and Her2 (45%),
-sparse in LumA (8%, n=26). → Exclude NC from subgroup analysis."
+A. BASICS
+   total_laps, total_sessions, total_athletes, date_range (if temporal).
 
-ANALYSIS DIMENSIONS (adapt to dataset — skip sections that don't apply):
+B. COVERAGE
+   For every column: non-null percentage. Flag sparse columns (<50%).
+   For each sparse column: describe what non-null rows share (if determinable).
 
-0. KEY CONSTRAINTS — REQUIRED when a data dictionary was provided.
-   Emit this block immediately after ###PROFILE_START### and before any
-   other analysis. Wrap it in ###KEY_CONSTRAINTS_START### / ###KEY_CONSTRAINTS_END###
-   markers. This block is the ONLY dictionary content that survives unconditionally
-   to the Question Generator, Evaluator, and Strategic Reviewer — they do not
-   see the dictionary directly, and the rest of your profile may be truncated
-   if it exceeds the character cap. If a dictionary is provided and you omit
-   this block, downstream agents will make avoidable errors.
+C. GROUP SIZES
+   Counts for each categorical variable (value_counts).
+   Athletes/subjects per group.
+   Cross-tabulations between 2-3 primary groupings. Identify empty cells.
+   For the seed question's key stratifications, report exact cell counts.
 
-   Format: short numbered guardrails, one per constraint. Each entry:
-     - preserves SPECIFICS verbatim (exact IDs, column names, categorical values,
-       numeric cutoffs)
-     - ends with a "→" practical action
-     - is ≤ 3 lines
+D. CONFOUND DIAGNOSTICS
+   Cramér's V for categorical × categorical pairs where both have non-trivial variation.
+   Pearson correlation for continuous × continuous pairs (on FULLY-COVERED columns only).
+   For sparse columns: coverage overlap % (what fraction of one column's non-nulls also have non-null in the other). A high overlap makes their correlation a coverage artifact.
 
-   Good: "→ pb_seconds is event-specific (10km for athlete01, HM for 02/03/14,
-   Marathon for 04-13). Stratify by primary_discipline; never correlate across
-   all athletes."
-   Not:  "→ Some athletes run different events."
+E. POWER BOUNDARIES
+   For each stratification the seed question implies: is the smallest cell ≥ 5? ≥ 10? Report the smallest cell.
+   Within-unit variation for within-X designs: how many units have ≥ 2 levels of Y?
 
-   If NO data dictionary is provided, omit this block entirely — do not emit
-   the markers.
+F. DICTIONARY VERIFICATION (only if a dictionary is provided)
+   For every factual claim in the dictionary that can be checked empirically (coverage patterns, counts, category values), emit a verification fact:
+     dict_check_<name> = {{"claim": "...", "verified": True/False, "observed": ...}}
+   Example: dict_check_athletes_no_races = {{"claim": "days_to_nearest_race NaN for 03,08,13", "verified": True, "observed": ["athlete03", "athlete08", "athlete13"]}}
 
-1. COVERAGE MAP: Profile each column's non-null coverage (% of rows). Flag columns
-   below 50% as SPARSE — these likely record only specific conditions (e.g., equipment
-   active, event occurring). State what the NaN rows probably mean for each sparse column
-   (e.g., "not recorded" vs "zero" vs "not applicable").
-   → For each sparse column, state: what downstream analyses should assume about NaN rows.
+OUTPUT FORMAT (strict):
 
-2. OUTCOME LANDSCAPE: Likely target variable(s), distribution, where outcomes concentrate.
-   → State required filters (e.g., "restrict to rows where [condition] for [domain] analysis").
+print("###FACTS_START###")
+# A. BASICS
+print(f"total_laps = {{len(df)}}")
+print(f"total_sessions = {{df['session_id'].nunique()}}")
+# ... etc. Every numeric value on the RHS must be a computed expression or a reference to a variable holding a computed expression. NEVER write `print("abroad_sessions = 47")` — always `print(f"abroad_sessions = {{abroad_n_sessions}}")` after computing abroad_n_sessions from df.
+print("###FACTS_END###")
 
-3. GROUP SIZES: How groups break down. Cross-tabulate main groupings. Name thin cells.
-   → Name specific infeasible comparisons and any empty cells in cross-tabulations.
+VALUE CLEANLINESS: Emit values as plain Python literals. Strip numpy type wrappers before printing — Phase 2 is a pure LLM call and wastes tokens parsing `np.float64(100.0)` when `100.0` would do. Use `float(x)`, `int(x)`, or `round(x, 2)` to coerce scalars, and wrap dict/list values with a helper, e.g.:
+    def clean(v):
+        if isinstance(v, dict): return {{str(k): clean(vv) for k, vv in v.items()}}
+        if isinstance(v, list): return [clean(vv) for vv in v]
+        if hasattr(v, 'item'): return v.item()  # numpy scalar → Python scalar
+        return v
+    print(f"coverage_pct = {{clean(coverage_dict)}}")
 
-4. CONFOUNDING MAP: Which variables are entangled (Cramér's V >0.3 or >20pp differences).
-   CRITICAL: Before computing correlations between two columns, check their coverage overlap.
-   If both columns are sparse (<50%) and their non-null rows substantially overlap (>80%
-   of the sparser column's non-nulls also have non-null in the other), the correlation is
-   a SELECTION ARTIFACT — it reflects shared operational context (e.g., both measured only
-   when equipment is running), not a genuine relationship. Report these separately as
-   "coverage-driven correlations" with the overlap percentage, NOT as confounds.
-   → For genuine confounds, state the direction and what analyses they could bias.
+Do not wrap facts in any OTHER markers. Do not emit KEY_CONSTRAINTS, STRUCTURAL_LANDSCAPE, PROFILE, or prose sections. Those are Phase 2's job."""
 
-5. VARIABLE STRUCTURE: Near-redundant variables (r>0.85 on FULLY-COVERED columns only),
-   derived variables, clusters.
-   → Identify DERIVABLE variables not present in the data but computable: day-over-day
-   differences, ratios, rolling averages, cumulative sums. Name the source columns and
-   what the derived variable would represent analytically.
-   → Flag circular variables (e.g., compass bearings in degrees, time of day) that need
-   special handling: "bin into categories, do not use linear regression or Pearson correlation."
-
-6. POWER BOUNDARIES: Based on the group sizes above, state what depth of analysis is
-   feasible. Name specific feasible comparisons and specific infeasible ones.
-   → If stratification creates empty cells, recommend alternative splits (e.g., "use
-   pre/post breakpoint instead of decade stratification to avoid empty cells").
-
-Use these delimiters:
-print("###PROFILE_START###")
-print("###KEY_CONSTRAINTS_START###")
-... numbered key constraints here, each ending with → action (omit this block and its markers if no dictionary was provided) ...
-print("###KEY_CONSTRAINTS_END###")
-... the rest of the analytical brief (sections 1–6) ...
-print("###PROFILE_END###")"""
-
-    orientation_user = """DATA DICTIONARY (authoritative context for column meaning and known caveats — see system prompt for handling):
+    orientation_compute_user = """DATA DICTIONARY (authoritative context for column meaning and known caveats; use it to decide WHICH facts matter, then verify its empirical claims):
 {data_dictionary}
 
 DataFrame info:
@@ -1196,30 +1395,222 @@ DataFrame info:
 Seed question for this exploration:
 {seed_question}
 
-Write Python code to profile this dataset's analytical landscape. Do NOT test hypotheses.
-The column-level schema above already provides types, nulls, ranges, and samples.
-Compute CROSS-VARIABLE relationships invisible from individual columns:
+Write Python code to emit a FACTS block for this dataset. Compute the numbers a downstream narrator will need to describe:
+- Coverage: every column's non-null %.
+- Group sizes: counts for each categorical, cross-tabs for the 2-3 primary groupings, smallest cells.
+- Confounds: Cramér's V for categorical pairs, correlations for continuous pairs, coverage-overlap checks for sparse pairs.
+- Power: for each stratification the seed question implies, smallest cell size.
+- Dictionary verification: one check per empirical claim in the dictionary.
 
-1. Coverage: profile every column's non-null percentage. Identify sparse columns (<50%).
-   For sparse columns, check what their NaN rows represent.
-2. Groups: which are large enough for comparison? Where are the thin/empty cells?
-3. Confounds: which variables are entangled? BEFORE correlating sparse columns, check
-   whether their non-null rows overlap — if so, the correlation is a coverage artifact.
-4. Structure: near-redundant columns? Derivable variables (diffs, ratios, rolling)?
-   Circular variables needing special handling?
-5. Power: what comparisons are feasible? Where do stratifications create empty cells?
+Every fact must be emitted as `key = value` on its own line, inside ###FACTS_START### / ###FACTS_END### markers, with every numeric value coming from a computed expression (f-string interpolation). Return code within ```python``` blocks."""
 
-If a data dictionary was provided above, you MUST begin your brief with a KEY CONSTRAINTS
-block wrapped in ###KEY_CONSTRAINTS_START### / ###KEY_CONSTRAINTS_END### markers — this
-is the only channel that carries dictionary content to downstream agents, and the rest
-of the profile may be truncated. Each constraint must preserve specifics verbatim
-(exact IDs, column names, cutoffs) and end with a "→" practical action.
 
-Every observation must end with a practical action: what to filter, avoid, derive, or
-handle specially. Output: a compact analytical brief (30-second scan). Plain English
-with numbers inline.
+    orientation_narrate_system = """You are an expert data analyst writing an ANALYTICAL PROFILE from a pre-computed FACTS block. You do NOT execute code. You do NOT have access to the DataFrame. You write prose constrained by FACTS and (if provided) a data dictionary.
 
-Return code within ```python``` blocks using ###PROFILE_START### / ###PROFILE_END### delimiters."""
+HARD CONSTRAINT ON NUMERIC CLAIMS:
+Every number you write — counts, percentages, IDs, cutoffs, thresholds — must come from one of two sources:
+  (1) A fact in the FACTS block (cite by key name where ambiguous).
+  (2) A direct quote from the data dictionary.
+
+If you want to state a number and it is in neither source, write "[not computed]" in its place. Do NOT invent, estimate, or approximate. Do NOT round or re-derive numbers. A missing number is acceptable; a wrong number is not.
+
+DATA DICTIONARY HANDLING:
+If a dictionary is provided, it is the authoritative source for column meanings, event-specific semantics, and known caveats. Quote its constraints verbatim in the KEY CONSTRAINTS block below. Where the dictionary states an approximate count (e.g. "≈ 1,080 laps"), replace with the exact count from FACTS in parentheses: "(FACTS: 1,077)".
+
+OUTPUT STRUCTURE:
+
+print("###PROFILE_START###")
+
+0. KEY CONSTRAINTS — REQUIRED when a dictionary was provided; omit markers entirely if no dictionary.
+   Wrap in ###KEY_CONSTRAINTS_START### / ###KEY_CONSTRAINTS_END### markers.
+   One numbered guardrail per constraint. Each entry preserves specifics verbatim (exact IDs, column names, categorical values, numeric cutoffs) and ends with a "→" practical action. ≤ 3 lines each.
+
+0b. STRUCTURAL LANDSCAPE (initial seed) — REQUIRED every run.
+   Wrap in ###STRUCTURAL_LANDSCAPE_START### / ###STRUCTURAL_LANDSCAPE_END### markers.
+   Sub-sections (omit any with nothing concrete):
+
+   ### Identifiability
+   One bullet per substantive question the seed touches, in this exact format:
+     - <short question>: <STATUS> — <one diagnostic from FACTS>.
+   STATUS is one of: BLOCKED, PARTIAL, WEAK, FEASIBLE. The diagnostic is a single clause citing a FACT (Cramér's V, correlation, coverage %, cell count). Do NOT add explanatory second or third sentences; the diagnostic speaks for itself. If two questions share the same diagnostic, merge them into one bullet. Target: ~100 chars per bullet.
+
+   ### Coverage
+   Where the evidence thins. Specific subgroups/regimes with their exact counts from FACTS. One bullet per gap.
+
+   ### Foreclosed Directions
+   Approaches that look natural but will not yield. One-line diagnosis per entry, citing FACTS for the structural reason. Leave empty if nothing foreclosed.
+
+   ### Open Questions
+   Structural questions the dataset raises but evidence cannot resolve. Each entry: the question in one line. Add "Evidence needed: ..." ONLY when you can name a specific external data source (e.g. VO₂max tests, race calendars, lab measurements) — not when it would be a rephrase of the question.
+
+1–6. ANALYTICAL BRIEF (coverage map, outcomes, group sizes, confounds, variable structure, power boundaries). MAX 2 sentences per section. Do not repeat facts already stated in the Structural Landscape — this brief supplements, not duplicates. Each section must end with a → practical action. Omit any section whose content would be redundant with the Landscape; the brief's role is short background context, not a second pass at identifiability. Every number from FACTS.
+
+print("###PROFILE_END###")
+
+CRITICAL: This is a pure-text response, not code. Do NOT wrap in ```python```. Do NOT use print() in your actual output. Emit the profile text directly, with the ### markers as literal text markers."""
+
+    orientation_narrate_user = """FACTS (computed from the DataFrame in Phase 1 — this is your ONLY source for numeric claims):
+{facts}
+
+DATA DICTIONARY (authoritative for column meanings and known caveats; omit KEY CONSTRAINTS block entirely if this is "(none)"):
+{data_dictionary}
+
+DataFrame schema (for column names and types):
+{schema}
+
+Seed question:
+{seed_question}
+
+Write the analytical profile. Every numeric claim must come from FACTS or the dictionary. Missing numbers → "[not computed]". Do not invent. Emit the profile text directly (not inside ```python``` blocks)."""
+
+
+    # ══════════════════════════════════════════════════
+    # CAUSAL SUBSTRATE (Phase 3 of orientation)
+    # ══════════════════════════════════════════════════
+
+    causal_substrate_system = """You are an expert methodologist decomposing a research seed into its causal substrate before exploration begins. You do NOT propose analyses. You do NOT test hypotheses. You identify what's being compared, what could confound the comparison, and which observed variables can be held constant to isolate the contrast of interest.
+
+This is a Rung-3 (counterfactual reasoning) exercise. The output is a MAP of the causal terrain, not a recipe of controls to apply. Downstream agents will choose specific controls from your menu; you are not telling them which to apply.
+
+Three TYPE classifications are possible, and you MUST choose honestly:
+
+FULL — The seed implies a comparison between two or more regimes (contexts, conditions, treatments, time periods, populations), AND at least ONE candidate confounder of that comparison passes the three gate conditions below. Other confounders may fail the gate and should be reported as unidentifiable — one passing confounder is enough to justify FULL.
+
+SPARSE — The seed asks a causal question, but NO enumerated confounder passes all three gate conditions: no clean regime contrast exists, or every candidate confounder lacks a proxy, or no candidate has a plausible matching axis in the data. Common in computation-only mode where observed variables don't exist yet.
+
+DESCRIPTIVE — The seed asks for characterization or exploration, not causal comparison. Patterns, distributions, clusters, trends within a single context. Rung-3 matching logic does not apply.
+
+ENUMERATION STEP (do this first, before the gate check):
+List candidate latent confounders that plausibly differ between the seed's regimes and could drive the outcome difference. Cast a wide net — think about what domain experts would name as threats to a clean regime-effect estimate. Enumerate as many as are plausible; aim for 3-6 candidates.
+
+GATE CHECK — apply INDEPENDENTLY to each enumerated candidate:
+(a) NAMED REGIMES: The seed identifies at least two distinct contexts whose outcome values should be compared. Seed-level (pass once, applies to all candidates). If you cannot name concrete regimes, FULL fails globally.
+(b) LATENT CONFOUNDER WITH PROXY: Does at least one observed variable plausibly proxy this candidate's latent? Name the proxy concretely. If no observed variable proxies this candidate, this candidate fails the gate — but other candidates may still pass.
+(c) MATCHING-AXIS CANDIDATE: Can at least one observed variable hold the latent approximately constant across regimes at subject-level (or within-session) granularity? The matching axis can be the same variable as the proxy in (b). If matching is only feasible at aggregate/population level, this candidate is weaker than the data supports.
+
+CLASSIFICATION RULE:
+- (a) fails globally: TYPE=DESCRIPTIVE (not really causal) or SPARSE if causal intent is present but no regimes are named.
+- (a) passes globally but NO enumerated candidate passes (b) and (c): TYPE=SPARSE. Record the failed candidates in RATIONALE.
+- (a) passes globally and AT LEAST ONE candidate passes (b) and (c): TYPE=FULL. In FULL output, distinguish passing candidates (which carry matching-axis guidance) from failed candidates (recorded as unidentifiable for transparency).
+
+IMPORTANT: The first confounder that comes to mind is often not the one that passes the gate. If your first candidate fails at (b) or (c), do not stop — continue enumerating. A seed may have one confounder clearly unidentifiable alongside another cleanly identifiable. FULL is warranted whenever at least one passes.
+
+═══ CANDIDATE MATCHING AXES — RANKED MENU WITH SUBSUMPTION ═══
+
+For TYPE=FULL, the most important downstream artefact is the RANKED CANDIDATE MATCHING AXES table. Downstream agents read this list and select controls from it. They do NOT stack all controls jointly.
+
+Rank axes by leverage on the regime contrast:
+- Rank 1 = strongest single axis (e.g., a within-subject HR-matched contrast that absorbs both intent and most weather variation through behavioural compensation).
+- Rank 2 = next-best alternative (e.g., temperature-overlap restriction that is robust on a different dimension).
+- Rank 3+ = weaker complementary axes.
+
+For each axis, fill the SUBSUMPTION column. State which OTHER axes in the menu are made REDUNDANT when this axis is applied. This is the central guard against over-controlling. Examples:
+- "subsumes ax2 (temperature) — at matched HR, athlete behavioural compensation absorbs weather effect; explicit temperature control becomes redundant and only narrows sample."
+- "complements ax1 — ax1 controls effort, ax3 controls thermal stress when ax1 cannot be applied (high-intensity thermal-overlap regime); use as alternative, not as stack."
+- "no subsumption claims — axis is independent."
+
+If two axes are equally strong, mark both as Rank 1 and indicate they are alternatives, not joint controls.
+
+OUTPUT FORMAT: structured blocks, not narrative. Every field concrete — no vague language. If you cannot be concrete, the gate check failed; use the weaker TYPE.
+
+Wrap output in these markers:
+###CAUSAL_SUBSTRATE_START###
+TYPE: [FULL | SPARSE | DESCRIPTIVE]
+... structured fields per TYPE ...
+###CAUSAL_SUBSTRATE_END###
+
+There is no second block. Do NOT emit a one-liner directive. Downstream agents read the structured menu directly.
+
+TEMPLATE for TYPE=FULL:
+
+###CAUSAL_SUBSTRATE_START###
+TYPE: FULL
+
+OUTCOME
+- <variable name> (<column identifier>): direct/derived — <what it measures>
+
+REGIMES
+- <regime 1 name>: <concrete description — range, category values, or scope>
+- <regime 2 name>: <concrete description>
+- rationale: <why the seed implies comparing these>
+
+ENUMERATED CONFOUNDERS
+- <confounder 1 name>: <what it is> | status: PASSES / UNIDENTIFIABLE | reason: <why pass or fail; name failing condition if unidentifiable>
+- <confounder 2 name>: ...
+- <confounder 3 name>: ...
+(List ALL candidates enumerated, both passing and failing. Non-passing ones recorded for transparency and to prevent re-opening.)
+
+CANDIDATE MATCHING AXES (RANKED MENU — select from this menu, do NOT stack)
+- Rank 1: <variable> | proxies: <latent> | use for: <regime contrast> | granularity: subject/session/lap | subsumption: <which other axes become redundant when this is applied; "none" if independent> | limitations: <honest constraints>
+- Rank 2: <variable> | proxies: <latent> | use for: <regime contrast> | granularity: ... | subsumption: <complements rank1 when X / alternative to rank1 / etc> | limitations: ...
+- Rank 3: <variable> | proxies: <latent> | use for: <regime contrast> | granularity: ... | subsumption: ... | limitations: ...
+
+SELECTION GUIDANCE
+- Default: apply Rank 1 alone for the primary contrast.
+- Stack only when the SUBSUMPTION column explicitly says axes are independent or complementary on different dimensions.
+- When unsure, prefer the higher-ranked axis alone over a stack — over-controlling narrows sample without improving identification.
+
+PROXIES BY ROLE
+- <role class>: <observed variable> — <caveat about usage>
+- <additional roles if any>
+###CAUSAL_SUBSTRATE_END###
+
+TEMPLATE for TYPE=SPARSE:
+
+###CAUSAL_SUBSTRATE_START###
+TYPE: SPARSE
+
+RATIONALE
+<1-2 sentences explaining why NO enumerated confounder passes the gate.>
+
+ENUMERATED CONFOUNDERS
+- <confounder 1>: UNIDENTIFIABLE — <reason: which condition failed>
+- <confounder 2>: UNIDENTIFIABLE — <reason>
+- <confounder 3>: UNIDENTIFIABLE — <reason>
+(Record all enumerated candidates so SR can revisit if new data or variables emerge.)
+
+NOTEWORTHY VARIABLES
+- <variables (or simulation outputs) relevant even without full causal substrate>
+###CAUSAL_SUBSTRATE_END###
+
+TEMPLATE for TYPE=DESCRIPTIVE:
+
+###CAUSAL_SUBSTRATE_START###
+TYPE: DESCRIPTIVE
+
+RATIONALE
+<1-2 sentences: the seed asks for characterization/exploration, not causal comparison. Name the primary phenomenon being characterized.>
+###CAUSAL_SUBSTRATE_END###
+
+CRITICAL — guard against three failure modes:
+1. False FULL: LLMs tend to oblige requests for structure by producing FULL even when gate conditions fail. Honestly classify.
+2. False SPARSE: LLMs anchor on the first confounder that comes to mind. If that one fails the gate, continue enumerating.
+3. Stacking-by-default: a ranked menu with NO subsumption notes invites downstream agents to stack all controls jointly. Always fill SUBSUMPTION explicitly. If two axes really are independent, say so — but if one absorbs the other's effect through within-subject behavioural compensation (a common case for HR-matching absorbing weather), state that subsumption clearly so downstream agents do not stack."""
+
+    causal_substrate_user = """SEED QUESTION:
+{seed_question}
+
+ANALYTICAL PROFILE (from orientation, if available):
+{profile}
+
+DATA DICTIONARY (authoritative context for column semantics; may be empty):
+{data_dictionary}
+
+SCHEMA (DataFrame columns and types; may be empty in computation-only mode):
+{schema}
+
+Decompose the seed into its causal substrate. Do the following reasoning INTERNALLY (do NOT write it out):
+- Run the ENUMERATION STEP mentally: list candidate latent confounders that plausibly differ between the regimes (think of 3-6 candidates minimum if the seed is causal).
+- Apply the GATE CHECK mentally to each candidate.
+- Choose TYPE based on the classification rule — FULL if any candidate passes, SPARSE if none pass but the seed is causal, DESCRIPTIVE if the seed isn't causal.
+- For TYPE=FULL, build the RANKED CANDIDATE MATCHING AXES menu and fill SUBSUMPTION explicitly. The subsumption notes are the central guard against downstream agents stacking redundant controls.
+
+YOUR RESPONSE must contain ONLY the marker-wrapped block:
+###CAUSAL_SUBSTRATE_START### ... ###CAUSAL_SUBSTRATE_END### (following the relevant TEMPLATE)
+
+Do NOT include any preamble, headers, narration, reasoning trace, or prose outside the marker-wrapped block. The ENUMERATED CONFOUNDERS section within the FULL template captures the enumeration results; no separate narrative is needed. Begin your response with "###CAUSAL_SUBSTRATE_START###" on the first line.
+
+The causal substrate you produce will be pinned into Strategic Review, perspective rotation, and reframing probe contexts for the entire run. Cheap agents (Question Generator, Question Selector, RI, etc.) read a compacted view consisting of the TYPE line plus the CANDIDATE MATCHING AXES table — make those rows actionable, with concrete subsumption notes that tell cheap agents which axes are alternatives versus which combine cleanly."""
 
 
     # ══════════════════════════════════════════════════
@@ -1268,26 +1659,51 @@ SIMULATION FINDINGS SO FAR (read-only context for STATUS assessment):
 CURRENT INVESTIGATION DIRECTION:
 {arc_direction}
 
-TASK: Return ONLY the [PUBLISHED] entries that should appear in the research model.
-Do NOT return the full research model. Do NOT return simulation findings.
-Return ONLY bullet points starting with "- [PUBLISHED]".
+TASK: Return [PUBLISHED] entries plus a CALIBRATION assessment of how well the
+investigation's findings track the published evidence base.
 
-RULES:
-1. Maximum 8 [PUBLISHED] entries total (combining new and existing).
-2. Each entry: one bullet starting with "- [PUBLISHED]" followed by the claim,
-   ending with "STATUS: UNTESTED / CONFIRMED / CONTRADICTED"
-   STATUS refers to THIS investigation's simulation results only:
-   - UNTESTED: no simulation has tested this claim yet
-   - CONFIRMED: simulation results agree with the claim
-   - CONTRADICTED: simulation results disagree with the claim
-   If no simulation findings exist, ALL entries must be UNTESTED.
-3. Merge related findings. Prefer specific, actionable claims over general theory.
-4. Drop entries the investigation has moved past entirely.
-5. Preserve existing CONFIRMED/CONTRADICTED entries.
-6. Use bullet points only. No tables, no headers, no STATUS on separate lines.
+═══ PART 1: [PUBLISHED] ENTRIES ═══
 
-FORMAT (exactly this):
-- [PUBLISHED] Claim text here. (Author, Year). STATUS: UNTESTED
+Bullet points starting with "- [PUBLISHED]". Maximum 8 entries (new + existing).
+
+Each entry: one bullet, claim, citation, STATUS suffix where STATUS refers to
+THIS investigation's simulation results only:
+- UNTESTED: no simulation has tested this claim
+- CONFIRMED: simulation results agree
+- CONTRADICTED: simulation results disagree
+If no simulation findings exist, ALL entries must be UNTESTED.
+
+Merge related findings. Prefer specific actionable claims over general theory.
+Drop entries the investigation has moved past. Preserve existing
+CONFIRMED/CONTRADICTED entries. Bullet points only — no tables, no headers,
+no STATUS on separate lines.
+
+FORMAT:
+- [PUBLISHED] Claim text. (Author, Year). STATUS: UNTESTED
 - [PUBLISHED] Another claim. (Author, Year). STATUS: CONFIRMED — matches EF-3
 
-SEARCH_SUMMARY: [N findings: X CONFIRMED, Y CONTRADICTED, Z UNTESTED]"""
+═══ PART 2: CALIBRATION ═══
+
+After the bullets, emit a CALIBRATION line that summarises how the simulation's
+state currently relates to the published base. Choose ONE label and give a
+one-sentence reason:
+
+- CALIBRATION: ALIGNED — most testable published claims are CONFIRMED or have
+  consistent UNTESTED predictions.
+- CALIBRATION: NOVEL — the investigation produces findings outside the
+  published distribution AND a concrete cohort/context feature plausibly
+  differentiates this case (state which feature).
+- CALIBRATION: SUSPECT — ≥70% of testable published claims are CONTRADICTED
+  with no CONFIRMED, AND no concrete differentiating feature is identified.
+  This is a flag for the strategic reviewer to consider whether the current
+  methodological path is at fault.
+
+If fewer than 3 testable published entries exist, emit CALIBRATION: ALIGNED
+with the note "(insufficient testable entries to flag drift)".
+
+═══ OUTPUT FORMAT (strict order) ═══
+
+- [PUBLISHED] ... STATUS: ...
+- [PUBLISHED] ... STATUS: ...
+SEARCH_SUMMARY: [N findings: X CONFIRMED, Y CONTRADICTED, Z UNTESTED]
+CALIBRATION: [ALIGNED | NOVEL | SUSPECT] — [one-sentence reason]"""

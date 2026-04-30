@@ -3,11 +3,21 @@ Auto-explore module for autonomous recursive exploration.
 Handles the exploration loop, result evaluation, and adaptive branching.
 
 Key mechanisms:
-  - Finding Maturity: tracks significant findings through an analytical arc
-    (DETECTED → QUANTIFIED → DECOMPOSED → REGIME-TESTED → COMPLETE)
+  - Research model: 6 sections, 4 RI-maintained (Established Findings with
+    STATUS tags, Active Hypotheses, Attention Flags, Exploration Health) and
+    2 Opus-protected (Strategic Trajectory, Structural Landscape). Both
+    protected sections use save-before/re-splice-after to survive RI rewrites.
+  - STATUS tags on Established Findings: [ESTABLISHED] / [PROVISIONAL] /
+    [SHRINKS] / [CONTRADICTED], assigned at RI level and updated as evidence
+    accumulates. The briefing renders §2 directly from these tags.
+  - Structural Landscape: Opus-protected section accumulating identifiability,
+    coverage, foreclosed directions, and open questions. Seeded by orientation,
+    extended by strategic review as structural discoveries arrive. The briefing
+    renders §1/§3/§4 directly from this section.
   - Strategic Review: premium model runs every iteration to enforce commitment,
-    detect missed opportunities, surface untested connections, and maintain
-    a Strategic Trajectory narrative in the research model
+    detect missed opportunities, and maintain both Strategic Trajectory and
+    Structural Landscape. UPDATED_STRUCTURAL_LANDSCAPE is emitted only when
+    structural change has accumulated; absence preserves existing landscape.
   - Reframing Probe: when strategic review requests it (on any commitment type),
     premium model reads full analytical output (not digests) and looks for
     patterns the headline tests missed: distributional shifts on null results,
@@ -31,6 +41,13 @@ from logger_config import get_logger
 logger = get_logger(__name__)
 
 
+# Number of top-scored winning analyses to include with full untruncated
+# stdout in the synthesis input. Remaining winners with score >= 6 are
+# included via digests only. Lowering reduces context pressure at synthesis
+# time; raising gives the briefing generator more raw evidence to cite.
+TOP_K_FULL_RAW = 10
+
+
 class AutoExplorer:
     """
     Autonomous exploration engine that recursively explores analytical space.
@@ -49,13 +66,16 @@ class AutoExplorer:
         self.research_model = ""
         self.seed_question = ""
         self.commitment_history = []  # [(iteration, action)] for dashboard
-        self.model_impact_history = []
-        self.evaluator_score_history = []
-        self.biggest_gap_history = []
-        self.stagnation_count = 0
 
         # Orientation data profile
         self.data_profile = ""
+
+        # Causal Substrate (Phase 3 of orientation). Lives in research model
+        # as ## Causal Substrate section. Cheap agents read a compacted view
+        # of the substrate (TYPE line + CANDIDATE MATCHING AXES table)
+        # extracted by _research_model_for_cheap_agent(); premium agents read
+        # the full block via direct research_model access. Set at orientation
+        # time; may be refined by Strategic Review (rare).
 
         # ── Strategic review state ──
         self.last_review_iteration = 0
@@ -76,6 +96,9 @@ class AutoExplorer:
         self.search_model = None            # set from run.py; None = search disabled
         self.search_history = []            # [(iteration, query, summary)] for dashboard
         self._published_entries = []        # [PUBLISHED] entries, protected from RI
+        self._last_search_calibration = ""  # most recent CALIBRATION assessment from
+                                            # literature_integration: ALIGNED / NOVEL /
+                                            # SUSPECT — passed to next SR call
 
         # Model override for orientation, strategic review, and synthesis
         self.premium_model = None
@@ -91,6 +114,34 @@ class AutoExplorer:
     @chain_id.setter
     def chain_id(self, value):
         self.engine.chain_id = value
+
+    def _reset_state(self, seed_question):
+        """Reset all exploration state for a fresh run.
+
+        Mirrors __init__'s state initialization. Single source of truth so
+        a new state variable is added in ONE place (here plus __init__).
+        Called from run() when a fresh-run state.json doesn't exist.
+        """
+        self.insight_tree = {}
+        self.question_pool = []
+        self.research_model = ""
+        self.seed_question = seed_question
+        self.commitment_history = []
+        self.data_profile = ""
+        self.last_review_iteration = 0
+        self.strategic_next_direction = ""
+        self.current_arc_direction = ""
+        self._initial_trajectory = ""
+        self.last_probe_iteration = 0
+        self.probe_history = []
+        self.completed_original_arcs = set()
+        self.rotation_history = []
+        self.arc_history = []
+        self._arc_reference_code = ""
+        self._arc_reference_score = 0
+        self.search_history = []
+        self._published_entries = []
+        self._last_search_calibration = ""
 
     def _llm_stream_silent(self, messages, agent, model_override=None):
         """Run llm_stream in silent mode and return captured output."""
@@ -158,9 +209,9 @@ class AutoExplorer:
         if self.data_profile:
             exploration_state = f"**Analytical Profile:**\n{self.data_profile}\n\n{exploration_state}"
 
-        research_model_context = self.research_model if self.research_model else "(No model yet)"
-
-        # Build solutions block
+        # Cheap-agent read: substitute Causal Substrate block with compacted view
+        rm_for_cheap = self._research_model_for_cheap_agent()
+        research_model_context = rm_for_cheap if rm_for_cheap else "(No model yet)"
         solutions_parts = []
         for i, sol in enumerate(solutions_data, 1):
             has_code = bool(sol['code'] and sol['code'].strip())
@@ -182,8 +233,23 @@ class AutoExplorer:
 
         solutions_block = "\n---\n".join(solutions_parts)
 
+        # Most recent active node's tested_estimand — for seed-relevance scoring.
+        # The evaluator caps scores at 6 when a sophisticated analysis tests a
+        # narrowed estimand without seed-relevance gain.
+        recent_estimand = ""
+        if self.insight_tree:
+            active_recent = sorted(
+                [n for n in self.insight_tree.values() if n['status'] == 'active'],
+                key=lambda n: n['chain_id'],
+            )
+            if active_recent:
+                recent_estimand = active_recent[-1].get('tested_estimand', '')
+        if not recent_estimand:
+            recent_estimand = "(none recorded yet — first iteration or earlier RI did not emit field)"
+
         eval_prompt = self.engine.prompts.result_evaluator.format(
             seed_question=self.seed_question,
+            recent_estimand=recent_estimand,
             exploration_state=exploration_state,
             solutions_block=solutions_block,
             research_model=research_model_context,
@@ -254,7 +320,9 @@ class AutoExplorer:
         if follow_up_hint:
             hint_section = f"\n**Promising direction:** {follow_up_hint}\n"
 
-        model_context = self.research_model if self.research_model else "(No model yet — first iteration)"
+        # Cheap-agent read: substitute Causal Substrate block with one-liner guidance
+        rm_for_cheap = self._research_model_for_cheap_agent()
+        model_context = rm_for_cheap if rm_for_cheap else "(No model yet — first iteration)"
 
         # Build commitment instruction from strategic state
         if self.strategic_next_direction:
@@ -272,6 +340,7 @@ class AutoExplorer:
             )
 
         phase_prompt = self.engine.prompts.ideas_explorer_auto.format(
+            seed_question=self.seed_question,
             commitment_instruction=commitment_instruction,
             research_model=model_context,
         )
@@ -327,9 +396,9 @@ class AutoExplorer:
         if context_hint:
             context_section = f"\n**Promising direction from recent result:** {context_hint}\n"
 
-        research_model_context = self.research_model if self.research_model else "(No model yet)"
-
-        # Build commitment context for selector
+        # Cheap-agent read: substitute Causal Substrate block with one-liner guidance
+        rm_for_cheap = self._research_model_for_cheap_agent()
+        research_model_context = rm_for_cheap if rm_for_cheap else "(No model yet)"
         if self.strategic_next_direction:
             commitment_ctx = f"**Current commitment:** Pivoting to new territory — prefer breadth and diversity."
         elif self.current_arc_direction:
@@ -339,6 +408,7 @@ class AutoExplorer:
             commitment_ctx = "**Current commitment:** Early exploration — prefer breadth."
 
         selection_prompt = self.engine.prompts.question_selector.format(
+            seed_question=self.seed_question,
             exploration_history=exploration_history,
             questions=chr(10).join(formatted_questions) + pool_section,
             context_hint=context_section,
@@ -391,7 +461,7 @@ class AutoExplorer:
             if i not in selected_indices:
                 self.question_pool.append({
                     'question': q,
-                    'iteration_added': getattr(self, '_current_iteration', 0),
+                    'iteration_added': getattr(self, '_current_iteration', 0) + 1,
                 })
         self._trim_question_pool()
 
@@ -404,7 +474,12 @@ class AutoExplorer:
         if not questions_response or not questions_response.strip():
             return []
 
-        # Pattern to strip LLM-generated tags like [EXPLORE], [EXPLOIT], [REGIME-TEST], etc.
+        # Pattern to strip LLM-generated tags (e.g., [EXPLORE], [PURSUING]) that
+        # some models add despite instructions not to. Maturity-stage tags
+        # (DETECTED/QUANTIFIED/DECOMPOSED/REGIME-TESTED/COMPLETE) were relevant
+        # under the old Finding Maturity system and are no longer emitted by any
+        # current prompt; kept in the pattern as defensive insurance against
+        # old-prompt contamination on --continue from v5 state.
         _tag_pattern = re.compile(
             r'\[(?:EXPLORE|EXPLOIT|MAPPING|PURSUING|CONNECTION|'
             r'DETECTED|QUANTIFIED|DECOMPOSED?|REGIME[- ]TEST(?:ED)?|COMPLETE)\]\s*',
@@ -442,22 +517,34 @@ class AutoExplorer:
     def _interpret_and_update_model(self, winning_solution, quality_score):
         """Interpret the latest result and update the research model.
 
-        [PUBLISHED] entries are protected from RI modification — extracted before
-        the RI runs, re-inserted after. The RI sees them in input for reference
-        but cannot write them (the prompt tells it not to, and the splice code
-        enforces it regardless).
+        [PUBLISHED] entries, Strategic Trajectory, and Structural Landscape are
+        all protected from RI modification. [PUBLISHED] is extracted/re-spliced
+        here. Strategic Trajectory and Structural Landscape are extracted/re-spliced
+        at the caller (_interpret_and_update_model is invoked within a
+        save-before/re-splice-after block in run()).
 
         Returns:
-            (updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used)
+            (updated_model, model_impact, contradiction, arc_exhausted,
+             result_digest, method_used, tested_estimand)
+
+        tested_estimand is a one-sentence description of what THIS analysis
+        actually estimates and for which subset of the data — used by the
+        Strategic Review's scope-drift check.
         """
         if self.kill_signal:
-            return self.research_model, "LOW", False, False, "", ""
+            return self.research_model, "LOW", False, False, "", "", ""
 
         # ── EXTRACT [PUBLISHED] ENTRIES (protect from RI) ──
         self._extract_published_snapshot()
 
         result_summary = str(winning_solution['results']) if winning_solution['results'] else "No results"
-        current_model = self.research_model if self.research_model else "(No model yet — this is the first result. Initialize the model from scratch.)"
+        # Cheap-agent read: substitute Causal Substrate block with one-liner guidance.
+        # Note: RI's output goes through _splice_protected_section re-splice for
+        # Causal Substrate (alongside Trajectory and Landscape), so its view of
+        # the substrate being simplified doesn't propagate — the full substrate
+        # is re-spliced into self.research_model after this call.
+        rm_for_cheap = self._research_model_for_cheap_agent()
+        current_model = rm_for_cheap if rm_for_cheap else "(No model yet — this is the first result. Initialize the model from scratch.)"
 
         # Column list for Exploration Health cross-reference (always available)
         column_list = self.engine._get_column_list() if hasattr(self.engine, '_get_column_list') else "(columns not available)"
@@ -474,18 +561,15 @@ class AutoExplorer:
         interpret_messages = [{"role": "user", "content": interpret_prompt}]
         response = self._call_agent_with_retry(interpret_messages, 'Research Interpreter')
 
-        # Parse structured fields
+        # Parse structured fields. Every field has a sensible default so a
+        # truncated or malformed RI response falls back gracefully rather
+        # than wiping state.
         model_impact = self._parse_field(response, 'MODEL_IMPACT', default='MEDIUM',
                                           valid={'HIGH', 'MEDIUM', 'LOW'})
         contradiction = 'YES' in self._parse_field(response, 'CONTRADICTION', default='NO')
         arc_exhausted = 'YES' in self._parse_field(response, 'ARC_EXHAUSTED', default='NO')
 
-        # ── NEW: Parse MATURITY_ADVANCE (logged for observability) ──
-        maturity_advance = self._parse_field(response, 'MATURITY_ADVANCE', default='NONE')
-        if maturity_advance and maturity_advance != 'NONE':
-            logger.info(f"Finding maturity advanced: {maturity_advance}")
-
-        # Parse RESULT_DIGEST
+        # Parse RESULT_DIGEST (3-5 lines of key numbers)
         result_digest = ""
         if 'RESULT_DIGEST:' in response:
             digest_text = response.split('RESULT_DIGEST:')[1]
@@ -502,14 +586,29 @@ class AutoExplorer:
             if method_text and method_text.upper() not in ('', 'NONE', 'N/A'):
                 method_used = method_text
 
-        # Extract updated model
+        # Parse TESTED_ESTIMAND (one sentence describing what THIS analysis
+        # actually estimates and for which subset). Used by SR's scope-drift
+        # check to detect when the tested question has narrowed from the seed.
+        tested_estimand = ""
+        if 'TESTED_ESTIMAND:' in response:
+            te_text = response.split('TESTED_ESTIMAND:')[1]
+            # Take until the next field marker or blank-line boundary
+            for end_marker in ['UPDATED_MODEL:', 'METHOD_USED:', 'RESULT_DIGEST:', '\n\n\n']:
+                if end_marker in te_text:
+                    te_text = te_text.split(end_marker)[0]
+                    break
+            te_text = te_text.strip()
+            if te_text and te_text.upper() not in ('', 'NONE', 'N/A'):
+                tested_estimand = te_text[:500]  # cap defensively
+
+        # Extract updated model (validates structure, retries via fallback if truncated)
         updated_model = self._extract_and_validate_model(
             response, interpret_messages)
 
         # ── SPLICE [PUBLISHED] ENTRIES BACK IN ──
         updated_model = self._splice_published_entries(updated_model)
 
-        return updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used
+        return updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used, tested_estimand
 
     def _extract_published_snapshot(self):
         """Extract [PUBLISHED] entries from current research model and store them.
@@ -599,16 +698,115 @@ class AutoExplorer:
         return model_text.strip()
 
     @staticmethod
-    def _count_content_sections(text):
-        """Count research model sections, excluding Strategic Trajectory
-        (which is managed separately via extract/re-splice)."""
-        return sum(1 for line in text.split('\n')
-                   if line.startswith('## ') and 'Strategic Trajectory' not in line)
+    def _extract_orientation_landscape(profile_text):
+        """Extract the ###STRUCTURAL_LANDSCAPE_START### block from orientation.
 
-    # Expected content sections (excluding Strategic Trajectory which is managed separately):
-    # Active Hypotheses, Established Findings, Finding Maturity, Cross-Finding Connections,
-    # Attention Flags, Biggest Gap, Exploration Health
-    _EXPECTED_MODEL_SECTIONS = 7
+        The orientation prompt requires this block on every run; it seeds the
+        research model's Structural Landscape section. Returns empty string
+        if the block is missing (e.g., when running with a legacy orientation
+        prompt or if orientation output was mangled).
+        """
+        if not profile_text or '###STRUCTURAL_LANDSCAPE_START###' not in profile_text:
+            return ""
+        after = profile_text.split('###STRUCTURAL_LANDSCAPE_START###', 1)[1]
+        if '###STRUCTURAL_LANDSCAPE_END###' in after:
+            block = after.split('###STRUCTURAL_LANDSCAPE_END###', 1)[0]
+        else:
+            # Fallback: take until next marker or PROFILE_END
+            for end_marker in ('###KEY_CONSTRAINTS_END###', '###PROFILE_END###', '\n\n\n'):
+                if end_marker in after:
+                    block = after.split(end_marker, 1)[0]
+                    break
+            else:
+                block = after
+        return block.strip()
+
+    @staticmethod
+    def _strip_landscape_from_profile(profile_text):
+        """Remove the ###STRUCTURAL_LANDSCAPE_*### block from a profile.
+
+        Called after _extract_orientation_landscape has captured the block
+        into the research model. Removing it from data_profile prevents
+        downstream agents from seeing a stale Landscape alongside the live
+        one in the research model — the research model's Landscape is
+        updated by Strategic Review as the investigation discovers new
+        structural facts, while data_profile is frozen at orientation. Two
+        copies of the same section, one of them stale, creates conflicts
+        that the LLMs have to reconcile at every call. This helper ensures
+        a single source of truth: the research model owns the Landscape;
+        data_profile owns static context (KEY CONSTRAINTS + sections 1–6).
+
+        If the markers are not present (legacy profile, mangled output),
+        returns the input unchanged.
+        """
+        if not profile_text or '###STRUCTURAL_LANDSCAPE_START###' not in profile_text:
+            return profile_text
+        start = profile_text.find('###STRUCTURAL_LANDSCAPE_START###')
+        end = profile_text.find('###STRUCTURAL_LANDSCAPE_END###')
+        if end < 0 or end < start:
+            return profile_text
+        end += len('###STRUCTURAL_LANDSCAPE_END###')
+        # Trim any leading whitespace after the removal to avoid blank lines
+        before = profile_text[:start].rstrip()
+        after = profile_text[end:].lstrip('\n')
+        if before and after:
+            return before + '\n\n' + after
+        return before + after
+
+    @staticmethod
+    def _migrate_legacy_model(model_text):
+        """Strip removed sections from a pre-v6 research model.
+
+        Removes: Cross-Finding Connections, Finding Maturity, Biggest Gap.
+        Leaves other sections untouched. Safe to call on a model that
+        doesn't contain any of these sections (no-op).
+
+        The next RI call will rewrite the model in the new 4+2 shape;
+        this just ensures the RI prompt isn't confused by legacy sections
+        during the transition iteration.
+        """
+        import re as _re
+        legacy_sections = [
+            'Cross-Finding Connections',
+            'Finding Maturity',
+            'Biggest Gap',
+        ]
+        for section_name in legacy_sections:
+            section_header = f'## {section_name}'
+            if section_header not in model_text:
+                continue
+            # Find section start
+            before = model_text.split(section_header)[0]
+            after_section = model_text.split(section_header, 1)[1]
+            # Find where this section ends (next ## header or end-of-string)
+            next_header_idx = after_section.find('\n## ')
+            if next_header_idx > 0:
+                after = after_section[next_header_idx:]
+            else:
+                # Check for END_MODEL marker
+                end_idx = after_section.find('END_MODEL')
+                after = after_section[end_idx:] if end_idx > 0 else ""
+            model_text = before + after
+            # Tidy up possible double newlines
+            model_text = _re.sub(r'\n{3,}', '\n\n', model_text)
+        return model_text.strip()
+
+    @staticmethod
+    def _count_content_sections(text):
+        """Count RI-maintained research model sections, excluding
+        Opus-protected sections (Strategic Trajectory, Structural Landscape,
+        Causal Substrate) which are managed separately via extract/re-splice."""
+        return sum(1 for line in text.split('\n')
+                   if line.startswith('## ')
+                   and 'Strategic Trajectory' not in line
+                   and 'Structural Landscape' not in line
+                   and 'Causal Substrate' not in line)
+
+    # Expected RI-maintained content sections (excluding Opus-protected
+    # Strategic Trajectory, Structural Landscape, and Causal Substrate,
+    # which are spliced in separately):
+    #   Established Findings, Active Hypotheses, Attention Flags, Exploration Health
+    _EXPECTED_MODEL_SECTIONS = 4
 
     def _extract_and_validate_model(self, response, messages):
         """Extract UPDATED_MODEL from response, validate structure, retry on truncation."""
@@ -688,7 +886,12 @@ class AutoExplorer:
         return text.strip()
 
     def _build_review_context(self):
-        """Build the recent iteration context for the strategic review."""
+        """Build the recent iteration context for the strategic review.
+
+        Includes per-node TESTED_ESTIMAND so SR can detect scope drift —
+        the estimand the analysis actually addressed may have narrowed
+        from the seed without anyone noticing.
+        """
         if not self.insight_tree:
             return "(No iterations yet)"
 
@@ -704,12 +907,15 @@ class AutoExplorer:
             question = node['question']
             digest = node.get('result_digest', '')
             method = node.get('method_used', '')
+            estimand = node.get('tested_estimand', '')
 
             entry = f"- [{score}/10] Q: {question}"
             if digest:
                 entry += f"\n  Finding: {digest}"
             if method:
                 entry += f"\n  Method: {method}"
+            if estimand:
+                entry += f"\n  Tested estimand: {estimand}"
             parts.append(entry)
 
         return '\n'.join(parts)
@@ -733,6 +939,25 @@ class AutoExplorer:
         max_iters = getattr(self, '_max_iterations', 100)
         remaining = max(0, max_iters - iteration - 1)
 
+        # Latest tested estimand for the scope-drift check. The most recent
+        # active node's tested_estimand is the relevant comparison point
+        # against the seed.
+        recent_estimand = ""
+        if self.insight_tree:
+            active_recent = sorted(
+                [n for n in self.insight_tree.values() if n['status'] == 'active'],
+                key=lambda n: n['chain_id'],
+            )
+            if active_recent:
+                recent_estimand = active_recent[-1].get('tested_estimand', '')
+        if not recent_estimand:
+            recent_estimand = "(not recorded; treat as equivalent to seed)"
+
+        # Most recent literature CALIBRATION assessment, if any. Drives
+        # SR's Task 5 decision on whether contradicting findings should be
+        # treated as "potentially novel" or as a methodological flag.
+        search_cal = self._last_search_calibration if self._last_search_calibration else "(no recent search)"
+
         prompt = self.engine.prompts.strategic_review.format(
             seed_question=self.seed_question,
             iteration=iteration + 1,
@@ -741,6 +966,8 @@ class AutoExplorer:
             data_profile=self.data_profile if self.data_profile else "(No profile available)",
             research_model=self.research_model,
             recent_context=recent_context,
+            recent_estimand=recent_estimand,
+            search_calibration=search_cal,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -820,6 +1047,30 @@ class AutoExplorer:
             if 'END_TRAJECTORY' in traj_text:
                 traj_text = traj_text.split('END_TRAJECTORY')[0]
             updated_trajectory = traj_text.strip()
+
+        # ── Parse UPDATED_STRUCTURAL_LANDSCAPE (optional — omit preserves existing) ──
+        # Strategic Review emits this block ONLY when structural information
+        # has accumulated since the last review. Absence of the block means
+        # "no change" — preserve the existing landscape, do not wipe.
+        updated_landscape = ""
+        if 'UPDATED_STRUCTURAL_LANDSCAPE:' in response:
+            ls_text = response.split('UPDATED_STRUCTURAL_LANDSCAPE:')[1]
+            if 'END_STRUCTURAL_LANDSCAPE' in ls_text:
+                ls_text = ls_text.split('END_STRUCTURAL_LANDSCAPE')[0]
+            updated_landscape = ls_text.strip()
+
+        # ── Parse UPDATED_CAUSAL_SUBSTRATE (optional — rare refinement) ──
+        # Causal Substrate is authored once at orientation (Phase 3). Strategic
+        # Review may refine it ONLY when a proxy proves systematically
+        # unreliable or a regime assumption is empirically contradicted.
+        # Absence of this block (the common case) means "no change" — the
+        # original substrate stays. Emitting it is a last-resort correction.
+        updated_substrate = ""
+        if 'UPDATED_CAUSAL_SUBSTRATE:' in response:
+            cs_text = response.split('UPDATED_CAUSAL_SUBSTRATE:')[1]
+            if 'END_CAUSAL_SUBSTRATE' in cs_text:
+                cs_text = cs_text.split('END_CAUSAL_SUBSTRATE')[0]
+            updated_substrate = cs_text.strip()
 
         # ── Apply commitment ──
         completing_arc = self.current_arc_direction  # save before overwrite
@@ -936,37 +1187,276 @@ class AutoExplorer:
         if updated_trajectory:
             self._update_strategic_trajectory(updated_trajectory)
 
+        # ── Splice updated structural landscape into research model ──
+        # Emitted only when structural change has accumulated. Absence
+        # preserves existing landscape.
+        if updated_landscape:
+            self._update_structural_landscape(updated_landscape)
+            # Write live structural_map.md — lets dashboard surface the
+            # landscape as it grows, not only at end-of-run.
+            try:
+                self._write_live_structural_map()
+            except Exception as e:
+                logger.debug(f"Live structural_map write failed: {e}")
+
+        # ── Splice updated Causal Substrate (rare refinement path) ──
+        # Only fires when SR has explicit evidence that the original
+        # substrate is miscalibrated (e.g., a proxy variable is
+        # systematically unreliable, a regime assumption is contradicted,
+        # an axis previously listed as independent is shown to be subsumed).
+        # Absence preserves the original substrate authored at Phase 3.
+        # The cheap-agent compacted view is regenerated automatically on the
+        # next cheap-agent call via _research_model_for_cheap_agent() — no
+        # separate guidance-one-liner update needed.
+        if updated_substrate:
+            self._update_causal_substrate(updated_substrate)
+            logger.info(
+                f"Causal Substrate refined by Strategic Review "
+                f"({len(updated_substrate)} chars)"
+            )
+
         # ── Log missed opportunities ──
         if missed:
             logger.info(f"Strategic review missed opportunities: {missed[:200]}")
 
+    def _write_live_structural_map(self):
+        """Write structural_map.md based on current research_model state.
+
+        Called from strategic review after Structural Landscape updates and
+        at end-of-run from _write_briefing_artefacts. Safe to call when
+        Structural Landscape is empty (writes a placeholder note).
+        """
+        landscape = self._extract_model_section('Structural Landscape')
+        # Strip the DO-NOT-MODIFY placeholder if that's all we have
+        if landscape and '<<< DO NOT MODIFY' in landscape:
+            return  # placeholder only, nothing to render yet
+        if not landscape:
+            return
+
+        map_path = os.path.join(self.engine.output_dir, "structural_map.md")
+        with open(map_path, 'w') as f:
+            f.write("# Structural Landscape\n\n")
+            f.write(
+                "*Live view of the investigation's structural terrain — "
+                "identifiability, coverage, foreclosed directions, and open "
+                "questions. Accumulated during exploration and extended by "
+                "strategic review as structural discoveries arrive.*\n\n"
+            )
+            f.write(landscape)
+
     def _update_strategic_trajectory(self, new_trajectory):
         """Splice the premium model's trajectory into the research model."""
-        section_header = '## Strategic Trajectory'
+        self._splice_protected_section('Strategic Trajectory', new_trajectory)
+
+    def _update_structural_landscape(self, new_landscape):
+        """Splice new structural-landscape content into the research model.
+
+        Called after orientation (initial seeding) and after each strategic
+        review that emitted UPDATED_STRUCTURAL_LANDSCAPE. Uses the same
+        save-before/re-splice-after pattern as Strategic Trajectory.
+        """
+        self._splice_protected_section('Structural Landscape', new_landscape)
+
+    def _update_causal_substrate(self, new_substrate):
+        """Splice the Causal Substrate section into the research model.
+
+        Called once at orientation time (Phase 3). Strategic Review may
+        refine it rarely via UPDATED_CAUSAL_SUBSTRATE. Same Opus-protected
+        splice pattern as Strategic Trajectory and Structural Landscape.
+
+        The substrate lives in the research model so it is visible to
+        Opus-reading agents (Strategic Review, reframing probe, perspective
+        rotation, briefing generator). Cheap agents read a substituted
+        version via _research_model_for_cheap_agent() — the full substrate
+        is replaced with the one-liner guidance directive.
+        """
+        self._splice_protected_section('Causal Substrate', new_substrate)
+
+    def _research_model_for_cheap_agent(self):
+        """Return a version of the research model suitable for cheap agents.
+
+        Substitutes the full ## Causal Substrate block with a compacted view
+        consisting of the TYPE line, the CANDIDATE MATCHING AXES table, and
+        the SELECTION GUIDANCE block (if present). Other substrate sections
+        (OUTCOME, REGIMES, ENUMERATED CONFOUNDERS, PROXIES BY ROLE) are
+        dropped from the cheap-agent view because they encode reasoning that
+        cheap models tend to ignore or pattern-match superficially. The
+        full substrate remains available to premium agents (Strategic Review,
+        reframing probe, perspective rotation, briefing generator) via
+        direct self.research_model access.
+
+        For TYPE=SPARSE or TYPE=DESCRIPTIVE, no axes table exists, so the
+        cheap-agent view shows just the TYPE line followed by the RATIONALE
+        (one or two sentences). Cheap agents need to know the seed isn't
+        causal; they don't need the full enumeration of failed candidates.
+
+        If no substrate section exists in the research model, the model is
+        returned unchanged.
+        """
+        if not self.research_model:
+            return self.research_model
+
+        section_header = '## Causal Substrate'
+        if section_header not in self.research_model:
+            return self.research_model
+
+        # Locate the substrate body
+        before, after_section = self.research_model.split(section_header, 1)
+        next_header_idx = after_section.find('\n## ')
+        if next_header_idx > 0:
+            substrate_body = after_section[:next_header_idx]
+            after = after_section[next_header_idx:]
+        else:
+            end_idx = after_section.find('END_MODEL')
+            if end_idx > 0:
+                substrate_body = after_section[:end_idx]
+                after = after_section[end_idx:]
+            else:
+                substrate_body = after_section
+                after = ""
+
+        # Substrate is still a placeholder — keep as-is so the RI's "do not
+        # modify" placeholder remains visible to the cheap model.
+        if '<<< DO NOT MODIFY' in substrate_body:
+            return self.research_model
+
+        # Compact the substrate body. Strategy: extract the TYPE line, then
+        # extract specific named sections by header. Sections that don't
+        # exist in this substrate (e.g., SELECTION GUIDANCE in older
+        # substrates) are silently skipped.
+        compact = self._compact_substrate(substrate_body)
+
+        if not compact:
+            # Compaction failed — fall back to dropping the section entirely
+            # rather than show a malformed view.
+            if before:
+                return f"{before.rstrip()}{after.lstrip(chr(10))}"
+            return after.lstrip('\n')
+
+        replacement = f"{section_header}\n{compact}\n"
+        return f"{before}{replacement}{after}"
+
+    @staticmethod
+    def _compact_substrate(substrate_body):
+        """Extract the cheap-agent-relevant slices from a Causal Substrate body.
+
+        Returns: TYPE line + (CANDIDATE MATCHING AXES + SELECTION GUIDANCE
+        for FULL) OR (RATIONALE for SPARSE/DESCRIPTIVE).
+
+        Empty string if the body is structurally malformed.
+        """
+        lines = substrate_body.strip().split('\n')
+        if not lines:
+            return ""
+
+        # Recognised section headers in the substrate template. A header is
+        # an at-column-0 line that starts with one of these tokens (allowing
+        # trailing qualifiers in parens or after a colon).
+        SECTION_TOKENS = (
+            'TYPE:',
+            'OUTCOME',
+            'REGIMES',
+            'ENUMERATED CONFOUNDERS',
+            'IDENTIFIABLE CONFOUNDERS',
+            'CANDIDATE MATCHING AXES',
+            'SELECTION GUIDANCE',
+            'PROXIES BY ROLE',
+            'RATIONALE',
+            'NOTEWORTHY VARIABLES',
+        )
+
+        def _is_section_header(line):
+            """Header: not indented, starts with one of the recognised tokens."""
+            if not line or line[0] in (' ', '\t', '-', '|'):
+                return False
+            upper = line.upper().lstrip()
+            return any(upper.startswith(tok) for tok in SECTION_TOKENS)
+
+        def _matches_token(line, token):
+            return line.upper().lstrip().startswith(token.upper())
+
+        # Find TYPE line
+        type_line = ""
+        for line in lines:
+            if line.strip().startswith('TYPE:'):
+                type_line = line.strip()
+                break
+        if not type_line:
+            return ""
+        type_value = type_line.split(':', 1)[1].strip().upper()
+
+        # Decide which sections to extract
+        if type_value == 'FULL':
+            wanted = ['CANDIDATE MATCHING AXES', 'SELECTION GUIDANCE']
+        else:
+            # SPARSE or DESCRIPTIVE
+            wanted = ['RATIONALE']
+
+        # Walk the body once, collecting any wanted sections
+        body_lines = substrate_body.split('\n')
+        sections = {}  # token -> list of lines
+        current_token = None
+        for line in body_lines:
+            if _is_section_header(line):
+                # Determine which token this header is
+                matched = None
+                for tok in SECTION_TOKENS:
+                    if _matches_token(line, tok):
+                        matched = tok
+                        break
+                if matched in wanted:
+                    current_token = matched
+                    sections.setdefault(current_token, []).append(line)
+                else:
+                    current_token = None
+            elif current_token is not None:
+                sections[current_token].append(line)
+
+        # Trim trailing empty lines from each section
+        for tok, lines_list in sections.items():
+            while lines_list and not lines_list[-1].strip():
+                lines_list.pop()
+
+        # Assemble in the order specified by `wanted`
+        parts = [type_line]
+        for tok in wanted:
+            if tok in sections and sections[tok]:
+                parts.append('')
+                parts.extend(sections[tok])
+
+        return '\n'.join(parts)
+
+    def _splice_protected_section(self, section_name, new_content):
+        """Generic splicer for Opus-protected sections. Shared by both
+        Strategic Trajectory and Structural Landscape. Robust to:
+        - section missing → append at end
+        - duplicate headers from RI mangling → collapse before splicing
+        - trailing END_MODEL marker → preserve
+        """
+        import re as _re
+        section_header = f'## {section_name}'
 
         # Normalise: collapse any consecutive duplicate headers the RI may have emitted
-        import re
-        self.research_model = re.sub(
-            r'(## Strategic Trajectory[ \t]*\n)+', section_header + '\n',
+        self.research_model = _re.sub(
+            rf'(## {_re.escape(section_name)}[ \t]*\n)+', section_header + '\n',
             self.research_model
         )
 
         if section_header in self.research_model:
-            # Find the section and replace everything up to next ## or end
             before = self.research_model.split(section_header)[0]
             after_section = self.research_model.split(section_header)[1]
-            # Find next ## header
+            # Find next ## header at start of line
             next_header_idx = after_section.find('\n## ')
             if next_header_idx > 0:
                 after = after_section[next_header_idx:]
             else:
-                # Check for END_MODEL marker
+                # No subsequent section — check for END_MODEL marker
                 end_idx = after_section.find('END_MODEL')
                 after = after_section[end_idx:] if end_idx > 0 else ""
-            self.research_model = f"{before}{section_header}\n{new_trajectory}\n{after}"
+            self.research_model = f"{before}{section_header}\n{new_content}\n{after}"
         else:
-            # Append if section doesn't exist yet
-            self.research_model += f"\n\n{section_header}\n{new_trajectory}"
+            # Section doesn't exist yet — append at end
+            self.research_model += f"\n\n{section_header}\n{new_content}"
 
     # ══════════════════════════════════════════════
     # LITERATURE SEARCH HELPERS
@@ -1029,6 +1519,14 @@ class AutoExplorer:
 
             # Extract SEARCH_SUMMARY for logging
             summary = self._extract_search_summary(response)
+
+            # Extract CALIBRATION assessment (Mitigation 4: literature
+            # contradiction is a one-way valve unless we capture this).
+            # Stored on explorer state for the next Strategic Review's Task 5.
+            calibration = self._extract_calibration(response)
+            if calibration:
+                self._last_search_calibration = calibration
+                logger.info(f"Literature calibration: {calibration[:120]}")
 
             if not new_published:
                 logger.warning("Integration returned no [PUBLISHED] entries")
@@ -1110,6 +1608,20 @@ class AutoExplorer:
                 return line.split('SEARCH_SUMMARY:')[1].strip()
         return "findings integrated"
 
+    @staticmethod
+    def _extract_calibration(integrated_model):
+        """Extract CALIBRATION line from the integrated model response.
+
+        Returns the full calibration text including label and reason
+        (e.g., "SUSPECT — 9/13 contradicted with no concrete differentiator")
+        or empty string if no CALIBRATION line is present.
+        """
+        for line in integrated_model.split('\n'):
+            stripped = line.strip()
+            if stripped.upper().startswith('CALIBRATION:'):
+                return stripped.split(':', 1)[1].strip()
+        return ""
+
     # ══════════════════════════════════════════════
     # REFRAMING PROBE (premium model)
     # Fires when strategic review sets PROBE_NEEDED: YES
@@ -1140,7 +1652,8 @@ class AutoExplorer:
         if not arc_summary:
             arc_summary = "(Current arc not identified)"
 
-        # Why it matters: try recent findings first, then biggest gap, then seed
+        # Why it matters: recent established findings first, then the Structural
+        # Landscape open questions, then fall back to the seed question.
         why_it_matters = ""
         # Recent established findings give context for positive-finding probes
         findings = self._extract_model_section('Established Findings')
@@ -1150,9 +1663,11 @@ class AutoExplorer:
             if finding_lines:
                 why_it_matters = "Recent findings:\n" + "\n".join(finding_lines[-3:])
         if not why_it_matters or len(why_it_matters) < 20:
-            gap = self._extract_model_section('Biggest Gap')
-            if gap and len(gap) > 10:
-                why_it_matters = gap
+            # Fallback: the Structural Landscape's Open Questions section
+            # captures what the investigation knows it can't resolve.
+            landscape = self._extract_model_section('Structural Landscape')
+            if landscape and '<<< DO NOT MODIFY' not in landscape and len(landscape) > 30:
+                why_it_matters = landscape[:600]
         if not why_it_matters or len(why_it_matters) < 10:
             why_it_matters = self.seed_question
 
@@ -1202,11 +1717,17 @@ class AutoExplorer:
         arc_summary, why_it_matters, full_results = context
         self.last_probe_iteration = iteration
 
+        # Opus agent: receives full Causal Substrate block for Rung-3 reasoning
+        # about whether a result stripped signal between the substrate's regimes
+        # by over-normalizing on a matching axis.
+        substrate = self._extract_model_section('Causal Substrate') or "(no substrate)"
+
         prompt = self.engine.prompts.reframing_probe.format(
             seed_question=self.seed_question,
             arc_summary=arc_summary,
             why_it_matters=why_it_matters,
             full_results=full_results,
+            causal_substrate=substrate,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -1279,11 +1800,14 @@ class AutoExplorer:
             if start_iter <= iteration:
                 arc_start = start_iter
 
-        # Filter nodes to this arc's iteration range
+        # Filter nodes to this arc's iteration range. iteration_added is
+        # 1-based (matches arc_history's start_iter and the human-readable
+        # iteration count); `iteration` here is the 0-based loop index, so
+        # the upper bound is iteration+1 for an inclusive 1-based comparison.
         arc_nodes = [
             node for node in sorted(self.insight_tree.values(), key=lambda n: n['chain_id'])
             if node.get('iteration_added', 0) >= arc_start
-            and node.get('iteration_added', 0) <= iteration
+            and node.get('iteration_added', 0) <= iteration + 1
             and node['status'] == 'active'
         ]
 
@@ -1321,6 +1845,11 @@ class AutoExplorer:
                 prior_perspectives.append(perspectives[0]['name'])
         prior_perspectives_text = ', '.join(prior_perspectives) if prior_perspectives else "(none yet)"
 
+        # Opus agent: receives full Causal Substrate for Rung-3 reasoning
+        # about which causal roles change across perspectives (matching axis
+        # vs nuisance vs outcome vs anchor).
+        substrate = self._extract_model_section('Causal Substrate') or "(no substrate)"
+
         prompt = self.engine.prompts.perspective_rotation.format(
             seed_question=self.seed_question,
             arc_name=arc_name,
@@ -1328,6 +1857,7 @@ class AutoExplorer:
             arc_findings=arc_findings,
             available_columns=columns,
             previously_selected=prior_perspectives_text,
+            causal_substrate=substrate,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -1447,10 +1977,12 @@ class AutoExplorer:
             return seed_question, ""
 
         profile = self.data_profile if self.data_profile else "(No profile available)"
+        research_model = self.research_model if self.research_model else "(Research model empty — no orientation Landscape available)"
 
         prompt = self.engine.prompts.seed_decomposition.format(
             seed_question=seed_question,
             data_profile=profile,
+            research_model=research_model,
             max_iterations=max_iterations,
         )
 
@@ -1530,28 +2062,7 @@ class AutoExplorer:
                 last_solution_chain = None
                 last_follow_up_angle = None
 
-                self.insight_tree = {}
-                self.question_pool = []
-                self.research_model = ""
-                self.seed_question = seed_question
-                self.commitment_history = []
-                self.model_impact_history = []
-                self.evaluator_score_history = []
-                self.biggest_gap_history = []
-                self.stagnation_count = 0
-                self.data_profile = ""
-                self.last_review_iteration = 0
-                self.strategic_next_direction = ""
-                self.current_arc_direction = ""
-                self.last_probe_iteration = 0
-                self.probe_history = []
-                self.completed_original_arcs = set()
-                self.rotation_history = []
-                self.arc_history = []
-                self._arc_reference_code = ""
-                self._arc_reference_score = 0
-                self.search_history = []
-                self._published_entries = []
+                self._reset_state(seed_question)
 
                 start_iteration = 0
 
@@ -1594,6 +2105,72 @@ class AutoExplorer:
                 if self.data_profile:
                     self.engine.data_profile = self.data_profile
                     logger.info(f"Orientation complete: {len(self.data_profile)} chars")
+                    # Extract the STRUCTURAL_LANDSCAPE block and inject it
+                    # into the research model IMMEDIATELY so that seed
+                    # decomposition and iteration 0's agents see it. If we
+                    # deferred injection to after the first RI call (the old
+                    # behaviour), seed decomposition and iteration 0 would
+                    # run against an empty Landscape — losing awareness of
+                    # foreclosed directions at the exact moment the initial
+                    # strategic trajectory is being chosen.
+                    initial_landscape = self._extract_orientation_landscape(self.data_profile)
+                    if initial_landscape:
+                        logger.info(
+                            f"Initial structural landscape: "
+                            f"{len(initial_landscape)} chars — seeding research model"
+                        )
+                        # _update_structural_landscape appends to empty research
+                        # model; subsequent RI calls' re-splice-after pattern
+                        # (around line 2007) will preserve it.
+                        self._update_structural_landscape(initial_landscape)
+                    # NOTE: data_profile still contains the Landscape block at
+                    # this point. It is deliberately left in place so that
+                    # seed decomposition and iteration 0 agents (Code Gen,
+                    # Question Gen, Evaluator, RI) see the initial Landscape
+                    # — the research model is still empty or unreliable until
+                    # the first RI call produces a proper skeleton. The
+                    # Landscape is stripped from data_profile at the end of
+                    # iteration 0 (once both Landscape and Trajectory are
+                    # safely spliced into the research model), so that from
+                    # iteration 1 onwards agents see a single source of
+                    # truth: research model owns the live Landscape (updated
+                    # by Strategic Review); data_profile owns static context.
+
+            # ── PHASE 3: CAUSAL SUBSTRATE (fresh runs only) ──
+            # Runs regardless of whether orientation ran or whether a
+            # dataset is loaded. The substrate's TYPE field (FULL / SPARSE
+            # / DESCRIPTIVE) honestly reports whether the seed supports
+            # Rung-3 matching-axis design reasoning. The structured
+            # substrate is spliced into the research model as
+            # ## Causal Substrate; premium agents read the full block,
+            # cheap agents read a compacted view (TYPE + CANDIDATE MATCHING
+            # AXES + SELECTION GUIDANCE for FULL; TYPE + RATIONALE for
+            # SPARSE/DESCRIPTIVE) extracted at every cheap-agent call by
+            # _research_model_for_cheap_agent().
+            if not resumed_state and not self.kill_signal:
+                logger.info("Running Phase 3: Causal Substrate")
+                try:
+                    substrate_text = self.engine.run_causal_substrate(
+                        seed_question,
+                        profile=self.data_profile,
+                        model_override=self.premium_model,
+                    )
+                except Exception as e:
+                    logger.warning(f"Causal substrate failed: {e}")
+                    substrate_text = ""
+
+                if substrate_text:
+                    self._update_causal_substrate(substrate_text)
+                    type_line = substrate_text.split('\n', 2)[0].strip()
+                    logger.info(
+                        f"Causal substrate seeded ({len(substrate_text)} chars, "
+                        f"{type_line}); cheap agents read compacted view"
+                    )
+                else:
+                    logger.info(
+                        "Causal substrate produced no output — downstream "
+                        "will treat as SPARSE (no matching-axis guidance)"
+                    )
 
             # ── PRE-LOOP LITERATURE SEARCH (computation mode, fresh runs only) ──
             if (self.search_model and not resumed_state and not self.kill_signal
@@ -1721,10 +2298,6 @@ class AutoExplorer:
                             )
                     _is_seed = False
 
-                self.evaluator_score_history.append(scores[selected_index])
-                if len(self.evaluator_score_history) > 15:
-                    self.evaluator_score_history = self.evaluator_score_history[-15:]
-
                 # ── ENRICH QA PAIRS WITH FINDING SUMMARIES ──
                 # Attach evaluator-generated summaries to qa_pairs so the code
                 # generator gets high-quality context via format_qa_pairs.
@@ -1763,13 +2336,21 @@ class AutoExplorer:
                                 f"{len(winning_code)} chars)")
 
                 # ── INTERPRET & UPDATE MODEL ──
-                # Save Strategic Trajectory before update — cheap model must not corrupt it
+                # Save Opus-protected sections before update — cheap model must
+                # not corrupt them. All three are spliced back after the update.
                 _saved_trajectory = self._extract_model_section('Strategic Trajectory')
                 if _saved_trajectory and '<<< DO NOT MODIFY' in _saved_trajectory:
                     _saved_trajectory = ""  # placeholder, not real content yet
+                _saved_landscape = self._extract_model_section('Structural Landscape')
+                if _saved_landscape and '<<< DO NOT MODIFY' in _saved_landscape:
+                    _saved_landscape = ""  # placeholder, not real content yet
+                _saved_substrate = self._extract_model_section('Causal Substrate')
+                if _saved_substrate and '<<< DO NOT MODIFY' in _saved_substrate:
+                    _saved_substrate = ""  # placeholder, not real content yet
 
                 with style.spinner("Updating research model"):
-                    updated_model, model_impact, contradiction, arc_exhausted, result_digest, method_used = \
+                    (updated_model, model_impact, contradiction, arc_exhausted,
+                     result_digest, method_used, tested_estimand) = \
                         self._interpret_and_update_model(
                             winning_solution,
                             scores[selected_index],
@@ -1779,29 +2360,54 @@ class AutoExplorer:
                     self.insight_tree[new_node_id]['result_digest'] = result_digest
                 if new_node_id in self.insight_tree and method_used:
                     self.insight_tree[new_node_id]['method_used'] = method_used
+                if new_node_id in self.insight_tree and tested_estimand:
+                    self.insight_tree[new_node_id]['tested_estimand'] = tested_estimand
 
                 self.research_model = updated_model
 
-                # ── PROTECT STRATEGIC TRAJECTORY ──
-                # The model updater (cheap model) regenerates the full research model.
-                # It may mangle the Strategic Trajectory despite "DO NOT MODIFY" instructions.
-                # Structurally re-splice the trajectory we saved before the update.
+                # ── PROTECT OPUS-OWNED SECTIONS ──
+                # The RI (cheap model) regenerates the full research model. It
+                # may mangle protected sections despite the DO-NOT-MODIFY
+                # instructions. Re-splice all three sections we saved before
+                # the update. Order matters: landscape first, then substrate,
+                # then trajectory — this keeps section-boundary resolution
+                # stable across successive splices (each splice locates "next
+                # ## header" by searching forward from its section header).
+                if _saved_landscape:
+                    self._update_structural_landscape(_saved_landscape)
+                if _saved_substrate:
+                    self._update_causal_substrate(_saved_substrate)
                 if _saved_trajectory:
                     self._update_strategic_trajectory(_saved_trajectory)
 
-                # On iteration 0, splice the initial trajectory from seed decomposition
+                # On iteration 0, splice the initial trajectory (produced by
+                # seed decomposition) into the research model. The initial
+                # Structural Landscape was already seeded into the research
+                # model at orientation time — it is preserved across the RI
+                # call by the _saved_landscape re-splice above.
                 if self._initial_trajectory:
                     self._update_strategic_trajectory(self._initial_trajectory)
                     self._initial_trajectory = ""  # consumed
-                if len(self.research_model) > 6000:
-                    self.research_model += (
-                        "\n\n**NOTE: Model getting long — consolidate on next update.**"
-                    )
-                self.model_impact_history.append(model_impact)
-                if len(self.model_impact_history) > 10:
-                    self.model_impact_history = self.model_impact_history[-10:]
 
-                self._update_gap_stability(updated_model)
+                # End of iteration 0: the research model now carries both the
+                # initial Structural Landscape and the initial Strategic
+                # Trajectory. It is now safe to strip the Landscape block
+                # from data_profile — from iteration 1 onwards the research
+                # model is the single source of truth for identifiability,
+                # coverage, foreclosed directions, and open questions.
+                # Keeping the Landscape in data_profile would pin a frozen
+                # copy into every agent's context, competing with the live
+                # copy that Strategic Review updates.
+                if iteration == 0 and self.data_profile \
+                        and '###STRUCTURAL_LANDSCAPE_START###' in self.data_profile:
+                    stripped_profile = self._strip_landscape_from_profile(self.data_profile)
+                    logger.info(
+                        f"End of iteration 0: stripped Landscape block from "
+                        f"data_profile ({len(self.data_profile)} → "
+                        f"{len(stripped_profile)} chars)"
+                    )
+                    self.data_profile = stripped_profile
+                    self.engine.data_profile = stripped_profile
 
                 # ── STRATEGIC REVIEW (premium model) ──
                 if iteration > 0 and not self.kill_signal:
@@ -1918,14 +2524,22 @@ class AutoExplorer:
                 current_image = None
 
             # ── POST-LOOP ──
-            with style.spinner("Generating synthesis report"):
+            with style.spinner("Generating briefing"):
                 synthesis_text = self._generate_synthesis(seed_question)
 
             if not synthesis_text:
-                print(f"  {style.YELLOW}✗ Synthesis failed{style.RESET}")
+                print(f"  {style.YELLOW}✗ Briefing generation failed{style.RESET}")
                 synthesis_text = ""
+            else:
+                # Write companion artefacts (findings_index.md,
+                # structural_map.md) immediately — before chart generation —
+                # so they are available even if chart generation fails.
+                self._write_briefing_artefacts(synthesis_text)
 
-            # Generate charts for key findings (premium model)
+            # Generate charts for key findings (premium model).
+            # The skip-keywords list in _generate_synthesis_charts has been
+            # updated for the new briefing section structure; see that method
+            # for details on which sections are chart-eligible.
             if synthesis_text and self.premium_model:
                 synthesis_text = self._generate_synthesis_charts(synthesis_text)
 
@@ -1947,7 +2561,8 @@ class AutoExplorer:
 
             self.engine.output_manager.write_final_outputs(
                 research_model=self.research_model,
-                synthesis_text=synthesis_text,
+                briefing_text=synthesis_text,
+                insight_tree=self.insight_tree,
                 cost_tracker=self.engine.cost_tracker,
                 run_logger=self.engine.run_logger,
             )
@@ -1962,7 +2577,12 @@ class AutoExplorer:
             self.engine.MAX_ERROR_CORRECTIONS = original_max_errors
 
     def _generate_synthesis(self, seed_question):
-        """Generate final synthesis report."""
+        """Generate final handoff briefing.
+
+        Produces the narrative-free, operational briefing via the premium
+        model. The companion artefacts (findings_index.md, structural_map.md)
+        are written separately by _write_briefing_artefacts.
+        """
         if not self.insight_tree:
             return None
 
@@ -1978,59 +2598,81 @@ class AutoExplorer:
 
         import datetime
         today = datetime.date.today().strftime("%Y-%m-%d")
-        prompt = self.engine.prompts.exploration_synthesis.format(
+        prompt = self.engine.prompts.briefing_generation.format(
             today_date=today,
             synthesis_context=synthesis_context,
-            task=f"Synthesize all findings from the exploration seeded by: {seed_question}",
+            task=f"Produce a handoff briefing for the investigation seeded by: {seed_question}",
         )
 
         messages = [{"role": "user", "content": prompt}]
 
-        # Synthesis is the payoff of the entire run — retry indefinitely
-        # with exponential backoff (10→20→40→80s cap) until a response is received.
+        # Briefing is the payoff of the entire run — retry indefinitely
+        # with exponential backoff (10->20->40->80s cap) until a response arrives.
         attempt = 0
         backoff = 10
         while True:
             attempt += 1
             response = self._call_agent_with_retry(
-                messages, 'Synthesis Generator', model_override=self.premium_model)
+                messages, 'Briefing Generator', model_override=self.premium_model)
             if response and response.strip():
                 if attempt > 1:
-                    logger.info(f"Synthesis succeeded on attempt {attempt}")
+                    logger.info(f"Briefing succeeded on attempt {attempt}")
                 return response
 
-            logger.warning(f"Synthesis attempt {attempt} failed, retrying in {backoff}s...")
-            print(f"  {style.YELLOW}⟳ Synthesis attempt {attempt} failed — retrying in {backoff}s...{style.RESET}")
+            logger.warning(f"Briefing attempt {attempt} failed, retrying in {backoff}s...")
+            print(f"  {style.YELLOW}⟳ Briefing attempt {attempt} failed — retrying in {backoff}s...{style.RESET}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 80)
 
     def _generate_synthesis_charts(self, synthesis_text):
-        """Generate one publication-quality chart per key finding section.
+        """Generate one publication-quality chart per finding / key section.
 
-        For each finding section, extracts the chain_id citations, retrieves
-        the original analysis code that produced those numbers, and passes it
-        to the premium model to adapt into a publication chart. This ensures
-        charts use the exact same methodology as the original analysis.
+        Two paths through the briefing structure:
 
-        Returns updated synthesis text with embedded chart references.
+          - §2 Findings (H2): parsed into H3 sub-sections. Each H3 finding
+            becomes a chart candidate, filtered by STATUS tag (CONTRADICTED
+            findings are skipped — visualising an overturned claim misleads).
+            Charts are inserted BEFORE the `**CONFOUND-STATUS:**` line of
+            each finding, visually attaching to the claim they support.
+
+          - Other H2 sections: filtered via `skip_keywords`. Under the new
+            briefing structure, all non-§2 H2 sections (Scope, Landscape,
+            Foreclosed, Open, Entry Points, Methodological Notes) are
+            covered by skip keywords, so they produce no charts. Legacy
+            synthesis outputs still work through this path.
+
+        Returns updated briefing text with embedded chart references.
         """
         if not synthesis_text or not self.premium_model:
             return synthesis_text
 
-        # Sections that should NOT get charts
+        # Sections that should NOT get charts at H2 level.
+        # Original keywords kept for backward compatibility with legacy
+        # synthesis. 'findings' is intentionally NOT in this list: the §2
+        # Findings section gets H3-per-finding treatment below, not H2 skip.
         skip_keywords = [
+            # legacy synthesis
             'rejected', 'tested and rejected', 'caveats', 'caveat',
-            'limitation', 'methodology', 'conclusion', 'next step',
+            'limitation', 'methodolog', 'conclusion', 'next step',
             'recommended', 'open question', 'what is stable',
             'stable, what', 'executive summary', 'cross-cutting',
+            # briefing structure (all non-§2 H2 sections)
+            'investigation scope', 'structural landscape',
+            'foreclosed', 'suggested entry', 'entry points',
         ]
 
-        # Parse sections
+        # STATUS tags that should NOT get charts at H3 level.
+        # CONTRADICTED findings are text-best: visualising the overturned
+        # claim misleads; the corrected estimate is the thing to cite.
+        # BLOCKED findings are identifiability outcomes (data cannot resolve
+        # the seed-relevant question) — they have no key numbers to chart.
+        skip_statuses = {'CONTRADICTED', 'BLOCKED'}
+
+        # ── Parse briefing into H2 sections ──
         lines = synthesis_text.split('\n')
         sections = []
         current_title = None
         current_lines = []
-
         for line in lines:
             if line.startswith('## ') and not line.startswith('### '):
                 if current_title is not None:
@@ -2045,41 +2687,82 @@ class AutoExplorer:
         if not sections:
             return synthesis_text
 
-        # Filter to chart-worthy sections
-        chart_sections = []
+        # ── Build list of chart candidates ──
+        # Each candidate is (level, title, text) where level is 'h2' or 'h3'.
+        # This distinction is needed at insertion time (different anchor
+        # patterns and insertion rules per level).
+
+        def is_findings_section(title):
+            """Detect §2 Findings — enforced by the briefing prompt."""
+            return '§2' in title and 'finding' in title.lower()
+
+        def parse_h3_subsections(section_text):
+            """Split an H2 section's text into (h3_title, h3_text) pairs."""
+            subs = []
+            curr_title = None
+            curr_lines = []
+            for line in section_text.split('\n'):
+                if line.startswith('### '):
+                    if curr_title is not None:
+                        subs.append((curr_title, '\n'.join(curr_lines)))
+                    curr_title = line[4:].strip()
+                    curr_lines = [line]
+                elif curr_title is not None:
+                    curr_lines.append(line)
+            if curr_title is not None:
+                subs.append((curr_title, '\n'.join(curr_lines)))
+            return subs
+
+        def extract_status(finding_text):
+            """Read STATUS: TAG from **STATUS: TAG** line."""
+            m = re.search(r'\*\*STATUS:\s*([A-Z][A-Z_-]+)\*\*', finding_text)
+            return m.group(1) if m else None
+
+        chart_sections = []  # (level, title, text)
         for title, text in sections:
-            if any(kw in title.lower() for kw in skip_keywords):
-                continue
-            if len(text) < 200:
-                continue
-            chart_sections.append((title, text))
+            if is_findings_section(title):
+                # §2: iterate H3 findings, filter by STATUS
+                for h3_title, h3_text in parse_h3_subsections(text):
+                    status = extract_status(h3_text)
+                    if status in skip_statuses:
+                        logger.info(
+                            f"Synthesis chart: skipping '{h3_title[:50]}' "
+                            f"(STATUS={status})")
+                        continue
+                    if len(h3_text) < 200:
+                        continue
+                    chart_sections.append(('h3', h3_title, h3_text))
+            else:
+                # Non-§2 H2: apply skip_keywords
+                if any(kw in title.lower() for kw in skip_keywords):
+                    continue
+                if len(text) < 200:
+                    continue
+                chart_sections.append(('h2', title, text))
 
         if not chart_sections:
             return synthesis_text
 
-        # Create charts directory
+        # ── Generate charts ──
         charts_dir = os.path.join(self.engine.output_dir, "synthesis_charts")
         os.makedirs(charts_dir, exist_ok=True)
 
         schema = self.engine._get_df_schema()
-        chart_map = {}  # title → relative image path
+        chart_map = {}  # (level, title) -> relative image path
 
-        for idx, (title, section_text) in enumerate(chart_sections):
+        for idx, (level, title, section_text) in enumerate(chart_sections):
             slug = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')[:40]
             chart_filename = f"{idx+1:02d}_{slug}.png"
             chart_path = os.path.join(charts_dir, chart_filename)
 
-            # Extract chain_ids cited in this section [[chain_id]]
             cited_ids = re.findall(r'\[\[(\d+)\]\]', section_text)
-
-            # Retrieve original code from the primary cited analysis
             original_code = self._get_analysis_code(cited_ids)
 
             if not original_code:
-                logger.info(f"Synthesis chart: no source code found for '{title[:40]}'")
+                logger.info(
+                    f"Synthesis chart: no source code found for '{title[:50]}'")
                 continue
 
-            # Build prompt with original code
             error_hints = self.engine.message_manager.format_error_patterns(
                 static_hints=self.engine._load_pitfalls())
             prompt = self.engine.prompts.synthesis_chart.format(
@@ -2099,18 +2782,18 @@ class AutoExplorer:
                     code, llm_response = self.engine._call_llm_for_code(
                         messages, self.premium_model, agent="Synthesis Chart")
                     if not code:
-                        logger.info(f"Synthesis chart: no code for '{title[:40]}'")
+                        logger.info(f"Synthesis chart: no code for '{title[:50]}'")
                         continue
 
                     results, error, plots = self.engine.executor.execute(
                         code, self.engine.df, charts_dir)
 
-                    # Error correction: up to 2 retries
                     retries = 0
                     while error and retries < 2:
                         retries += 1
-                        logger.info(f"Synthesis chart retry {retries} for '{title[:40]}': "
-                                     f"{error.strip().split(chr(10))[-1][:100]}")
+                        logger.info(
+                            f"Synthesis chart retry {retries} for '{title[:50]}': "
+                            f"{error.strip().split(chr(10))[-1][:100]}")
                         fix_msg = (
                             f"The chart code produced an error:\n{error}\n\n"
                             f"Fix the code. Return the COMPLETE corrected code "
@@ -2129,35 +2812,66 @@ class AutoExplorer:
                             break
 
                     if error:
-                        logger.info(f"Synthesis chart failed for '{title[:40]}' after "
-                                     f"{retries + 1} attempts")
+                        logger.info(
+                            f"Synthesis chart failed for '{title[:50]}' after "
+                            f"{retries + 1} attempts")
                         continue
 
                     if plots:
                         import shutil
                         shutil.move(plots[0], chart_path)
-                        chart_map[title] = f"synthesis_charts/{chart_filename}"
+                        chart_map[(level, title)] = f"synthesis_charts/{chart_filename}"
                         logger.info(f"Synthesis chart saved: {chart_filename}")
 
             except Exception as e:
-                logger.info(f"Synthesis chart failed for '{title[:40]}': {e}")
+                logger.info(f"Synthesis chart failed for '{title[:50]}': {e}")
                 continue
 
         if not chart_map:
             return synthesis_text
 
-        # Embed chart references into synthesis text
+        # ── Embed chart references into briefing text ──
+        # H2 charts: insert after the section's first paragraph (legacy).
+        # H3 charts: insert BEFORE the **CONFOUND-STATUS:** line, so the
+        # chart visually attaches to the claim it supports.
         updated = synthesis_text
-        for title, img_path in chart_map.items():
-            header = f"## {title}"
+
+        for (level, title), img_path in chart_map.items():
             img_md = f"\n\n![{title}]({img_path})\n"
-            header_pos = updated.find(header)
-            if header_pos < 0:
-                continue
-            para_end = updated.find('\n\n', header_pos + len(header))
-            if para_end < 0:
-                para_end = header_pos + len(header)
-            updated = updated[:para_end] + img_md + updated[para_end:]
+
+            if level == 'h3':
+                header = f"### {title}"
+                header_pos = updated.find(header)
+                if header_pos < 0:
+                    continue
+                # Bound the search to stay inside this finding (don't leak
+                # into the next finding or the next H2 section).
+                next_h3 = updated.find('\n### ', header_pos + len(header))
+                next_h2 = updated.find('\n## ', header_pos + len(header))
+                bounds = [p for p in (next_h3, next_h2) if p >= 0]
+                block_end = min(bounds) if bounds else len(updated)
+                # Try CONFOUND-STATUS first (preferred insertion point)
+                confound_pos = updated.find('**CONFOUND-STATUS:', header_pos)
+                if 0 <= confound_pos < block_end:
+                    insert_pos = confound_pos
+                else:
+                    # Fallback: before the '---' separator at end of finding
+                    hr_pos = updated.find('\n---', header_pos)
+                    if 0 <= hr_pos < block_end:
+                        insert_pos = hr_pos
+                    else:
+                        insert_pos = block_end
+                updated = updated[:insert_pos] + img_md + "\n" + updated[insert_pos:]
+            else:
+                # H2: legacy behaviour — insert after first paragraph
+                header = f"## {title}"
+                header_pos = updated.find(header)
+                if header_pos < 0:
+                    continue
+                para_end = updated.find('\n\n', header_pos + len(header))
+                if para_end < 0:
+                    para_end = header_pos + len(header)
+                updated = updated[:para_end] + img_md + updated[para_end:]
 
         print(f"  {style.GREEN}✓{style.RESET} {len(chart_map)} synthesis charts generated")
         return updated
@@ -2202,6 +2916,165 @@ class AutoExplorer:
         return ""
 
     # ══════════════════════════════════════════════
+    # BRIEFING ARTEFACTS
+    # After briefing generation, two companion files
+    # are written alongside briefing.md:
+    #   findings_index.md  — mechanical, from insight_tree
+    #   structural_map.md  — §1 sliced out of the briefing
+    # HTML renderings (with citation links) are produced
+    # by OutputManager via write_final_outputs.
+    # ══════════════════════════════════════════════
+
+    @staticmethod
+    def _extract_briefing_section(briefing_text, section_number):
+        """Extract the content of `## §N. ...` from the briefing text.
+
+        Returns the section body (without the header line itself), or
+        empty string if the section can't be found.
+
+        Robust to minor header variations — looks for the `§N.` prefix
+        in a `## ` line.
+        """
+        if not briefing_text:
+            return ""
+
+        # Find the start: a line beginning with `## ` containing `§N.`
+        pattern_start = re.compile(
+            rf'^##\s+§\s*{section_number}\.\s*[^\n]*\n',
+            re.MULTILINE,
+        )
+        start_match = pattern_start.search(briefing_text)
+        if not start_match:
+            return ""
+
+        body_start = start_match.end()
+
+        # Find the end: next `## ` header at column 0, or end of document
+        pattern_next = re.compile(r'^##\s+', re.MULTILINE)
+        next_match = pattern_next.search(briefing_text, body_start)
+        if next_match:
+            body_end = next_match.start()
+        else:
+            body_end = len(briefing_text)
+
+        return briefing_text[body_start:body_end].strip()
+
+    def _build_findings_index(self):
+        """Build findings_index.md content from the insight tree.
+
+        Mechanical — no LLM call. One entry per active (winning) analysis,
+        in chronological order by chain_id. Runner-up analyses are NOT
+        included.
+        """
+        active = sorted(
+            [n for n in self.insight_tree.values() if n.get('status') == 'active'],
+            key=lambda n: n['chain_id'],
+        )
+
+        lines = [
+            "# Findings Index",
+            "",
+            "All winning analyses from the investigation, in chronological order. "
+            "Each entry shows the evaluator score, analytical method (when recorded), "
+            "iteration number, and the chain_id link that opens the full analysis.",
+            "",
+            f"**Total winning analyses:** {len(active)}",
+            "",
+            "---",
+            "",
+        ]
+
+        for n in active:
+            score = n.get('quality_score', 0)
+            chain_id = n.get('chain_id', '?')
+            method = n.get('method_used', '')
+            summary = n.get('finding_summary', '') or '(no summary)'
+            iter_num = n.get('iteration_added', '')
+            question = n.get('question', '')
+
+            # Header line: score, iteration, chain_id link
+            header_bits = [f"**[{score}/10]**"]
+            if iter_num:
+                header_bits.append(f"iter {iter_num}")
+            header_bits.append(f"[[{chain_id}]]")
+            if method:
+                header_bits.append(f"_{method}_")
+            lines.append(" · ".join(header_bits))
+
+            # Question (trimmed)
+            if question:
+                q_trim = question[:200] + ('…' if len(question) > 200 else '')
+                lines.append(f"*Q: {q_trim}*")
+
+            # Finding summary
+            lines.append(summary)
+            lines.append("")
+
+        return '\n'.join(lines)
+
+    def _write_briefing_artefacts(self, briefing_text):
+        """Write findings_index.md and structural_map.md alongside briefing.
+
+        findings_index.md is mechanical from the insight tree (winners only,
+        no runner-ups).
+
+        structural_map.md comes from the research model's Structural Landscape
+        section, which has been accumulated across the run (seeded by
+        orientation, extended by strategic review). If the research model
+        has no Structural Landscape content (e.g., an old state.json from
+        before the refactor, or a run where neither orientation nor strategic
+        review contributed), fall back to extracting §1 from the briefing.
+
+        HTML versions are produced by OutputManager via write_final_outputs,
+        which reads the MDs written here.
+        """
+        # 1. findings_index.md — mechanical from insight tree
+        index_content = self._build_findings_index()
+        index_path = os.path.join(self.engine.output_dir, "findings_index.md")
+        try:
+            with open(index_path, 'w') as f:
+                f.write(index_content)
+            logger.info(f"Findings index written to {index_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write findings_index.md: {e}")
+
+        # 2. structural_map.md — primary source: research model's Structural Landscape
+        landscape = self._extract_model_section('Structural Landscape')
+        # Discard placeholder banner (present when Opus never wrote content)
+        if landscape and '<<< DO NOT MODIFY' in landscape:
+            landscape = ""
+
+        if landscape:
+            # Write from live research model state
+            try:
+                self._write_live_structural_map()
+                logger.info("Structural map written from research model")
+            except Exception as e:
+                logger.warning(f"Failed to write structural_map.md from model: {e}")
+        else:
+            # Fallback: extract §1 from briefing text (old behaviour)
+            section_1_body = self._extract_briefing_section(briefing_text, section_number=1)
+            if section_1_body:
+                map_path = os.path.join(self.engine.output_dir, "structural_map.md")
+                try:
+                    with open(map_path, 'w') as f:
+                        f.write("# Structural Landscape\n\n")
+                        f.write(
+                            "*Extracted from the briefing §1 (fallback — "
+                            "research model had no accumulated Structural "
+                            "Landscape).*\n\n"
+                        )
+                        f.write(section_1_body)
+                    logger.info(f"Structural map written to {map_path} (fallback from briefing)")
+                except Exception as e:
+                    logger.warning(f"Failed to write structural_map.md: {e}")
+            else:
+                logger.info(
+                    "Structural map not written — no Structural Landscape in "
+                    "research model and could not locate §1 in briefing text"
+                )
+
+    # ══════════════════════════════════════════════
     # HELPER METHODS
     # ══════════════════════════════════════════════
 
@@ -2226,31 +3099,6 @@ class AutoExplorer:
         AutoExplorer._node_counter += 1
         return f"node_{int(time.time() * 1000)}_{AutoExplorer._node_counter}"
 
-    def _extract_biggest_gap(self, model_text):
-        """Extract the Biggest Gap section from the research model."""
-        return self._extract_model_section('Biggest Gap') if model_text else ""
-
-    def _update_gap_stability(self, updated_model):
-        """Track whether the Biggest Gap has changed."""
-        current_gap = self._extract_biggest_gap(updated_model)
-        if not current_gap:
-            return False
-
-        self.biggest_gap_history.append(current_gap)
-        if len(self.biggest_gap_history) > 5:
-            self.biggest_gap_history = self.biggest_gap_history[-5:]
-
-        if len(self.biggest_gap_history) < 2:
-            return False
-
-        prev_words = set(self.biggest_gap_history[-2].lower().split())
-        curr_words = set(current_gap.lower().split())
-        if not prev_words or not curr_words:
-            return False
-
-        overlap = len(prev_words & curr_words) / max(len(prev_words | curr_words), 1)
-        return overlap > 0.70
-
     def _add_node_to_tree(self, question, result_summary, quality_score, chain_id):
         node_id = self._generate_node_id()
         if result_summary:
@@ -2269,7 +3117,8 @@ class AutoExplorer:
             'finding_summary': '',
             'result_digest': '',
             'method_used': '',
-            'iteration_added': getattr(self, '_current_iteration', 0),
+            'tested_estimand': '',
+            'iteration_added': getattr(self, '_current_iteration', 0) + 1,
         }
         return node_id
 
@@ -2354,9 +3203,20 @@ class AutoExplorer:
     # ══════════════════════════════════════════════
 
     def _save_checkpoint(self, iteration, last_solution_chain, last_follow_up_angle):
-        """Save complete exploration state to disk."""
+        """Save complete exploration state to disk.
+
+        Version history:
+          v6: removed legacy telemetry fields (model_impact_history etc.)
+          v7: added causal_substrate_guidance (now removed in v8)
+          v8: removed causal_substrate_guidance (cheap-agent view derived
+              from substrate body at call time); added
+              _last_search_calibration (literature CALIBRATION assessment).
+              insight_tree nodes now carry tested_estimand.
+          v9: insight-tree iteration_added is now 1-based (matches
+              arc_history, chain_ids, briefing/dashboard display).
+        """
         state = {
-            "version": 5,
+            "version": 9,
             "iterations_completed": iteration,
             "explorer": {
                 "insight_tree": self.insight_tree,
@@ -2364,10 +3224,6 @@ class AutoExplorer:
                 "research_model": self.research_model,
                 "seed_question": self.seed_question,
                 "commitment_history": self.commitment_history,
-                "model_impact_history": self.model_impact_history,
-                "evaluator_score_history": self.evaluator_score_history,
-                "biggest_gap_history": self.biggest_gap_history,
-                "stagnation_count": self.stagnation_count,
                 "node_counter": AutoExplorer._node_counter,
                 "data_profile": self.data_profile,
                 "last_review_iteration": self.last_review_iteration,
@@ -2382,6 +3238,7 @@ class AutoExplorer:
                 "arc_reference_score": self._arc_reference_score,
                 "search_history": self.search_history,
                 "published_entries": getattr(self, '_published_entries', []),
+                "last_search_calibration": self._last_search_calibration,
             },
             "message_manager": {
                 "qa_pairs": self.engine.message_manager.qa_pairs,
@@ -2409,23 +3266,84 @@ class AutoExplorer:
             logger.debug(f"Dashboard write skipped: {e}")
 
     def _restore_checkpoint(self, state):
-        """Restore exploration state from a loaded checkpoint dict."""
+        """Restore exploration state from a loaded checkpoint dict.
+
+        Migrations:
+          - pre-v6: strip legacy research-model sections (Cross-Finding
+            Connections, Finding Maturity, Biggest Gap).
+          - pre-v7: legacy data_profile may carry the Structural Landscape
+            block; strip it (now lives in research model only).
+          - pre-v8: drop causal_substrate_guidance field if present (the
+            cheap-agent view is now derived from the substrate body at
+            call time); ensure insight_tree nodes have tested_estimand
+            (defaults to empty string for pre-v8 nodes).
+        """
         ex = state['explorer']
         self.insight_tree = ex['insight_tree']
         self.question_pool = ex['question_pool']
         self.research_model = ex['research_model']
         self.seed_question = ex.get('seed_question', '')
         self.commitment_history = ex.get('commitment_history', [])
-        self.model_impact_history = ex['model_impact_history']
-        self.evaluator_score_history = ex.get('evaluator_score_history', [])
-        self.biggest_gap_history = ex.get('biggest_gap_history', [])
-        self.stagnation_count = ex.get('stagnation_count', 0)
+        # Legacy telemetry fields (model_impact_history, evaluator_score_history,
+        # stagnation_count, biggest_gap_history) removed in v6 — silently
+        # ignore if present in old state.
         AutoExplorer._node_counter = ex.get('node_counter', 0)
         self.data_profile = ex.get('data_profile', '')
+        # Migration: older runs stored the full orientation output (including
+        # the Structural Landscape block) in data_profile. The Landscape now
+        # lives only in the research model; strip any legacy copy here so
+        # resumed runs behave identically to fresh ones.
+        if self.data_profile and '###STRUCTURAL_LANDSCAPE_START###' in self.data_profile:
+            original_len = len(self.data_profile)
+            self.data_profile = self._strip_landscape_from_profile(self.data_profile)
+            logger.info(
+                f"Legacy data_profile: stripped Landscape block "
+                f"({original_len} → {len(self.data_profile)} chars)"
+            )
         self.last_review_iteration = ex.get('last_review_iteration',
                                              ex.get('last_connection_iteration', 0))
         self.strategic_next_direction = ex.get('strategic_next_direction', '')
         self.current_arc_direction = ex.get('current_arc_direction', '')
+
+        # ── Migrate legacy research model shape (pre-v6) ──
+        # Strip removed sections: Cross-Finding Connections, Finding Maturity,
+        # Biggest Gap. The new RI prompt emits neither; keeping them in the
+        # model would confuse the first RI call after resume. Structural
+        # Landscape is allowed to remain empty — strategic review will
+        # populate it when structural discoveries arrive.
+        version = state.get('version', 0)
+        if version < 6 and self.research_model:
+            self.research_model = self._migrate_legacy_model(self.research_model)
+
+        # v7 → v8 migration: ensure insight_tree nodes have the new
+        # tested_estimand field. Pre-v8 nodes don't have it; default to
+        # empty string. Strategic Review's scope-drift check treats empty
+        # as "equivalent to seed" (i.e., conservative — no drift detected
+        # for legacy nodes).
+        if version < 8:
+            for node in self.insight_tree.values():
+                node.setdefault('tested_estimand', '')
+            # causal_substrate_guidance is dropped silently from legacy state.
+            # The cheap-agent view is now extracted from the substrate body
+            # in research_model at every cheap-agent call.
+            if 'causal_substrate_guidance' in ex:
+                logger.info(
+                    "Legacy v7 checkpoint: dropping causal_substrate_guidance "
+                    "(cheap-agent view now derived from substrate body)"
+                )
+
+        # v8 → v9 migration: iteration_added stored the 0-based loop index;
+        # v9+ stores the 1-based iteration count to match arc_history,
+        # chain_ids, and briefing/dashboard display. Bump every node by +1
+        # so resumed runs and dashboards show consistent iteration numbers.
+        if version < 9:
+            for node in self.insight_tree.values():
+                node['iteration_added'] = node.get('iteration_added', 0) + 1
+            logger.info(
+                f"Legacy checkpoint: migrated {len(self.insight_tree)} "
+                f"insight-tree nodes to 1-based iteration_added"
+            )
+
         self.last_probe_iteration = ex.get('last_probe_iteration', 0)
         self.probe_history = ex.get('probe_history', [])
         self.completed_original_arcs = set(ex.get('completed_original_arcs', []))
@@ -2435,6 +3353,7 @@ class AutoExplorer:
         self._arc_reference_score = ex.get('arc_reference_score', 0)
         self.search_history = ex.get('search_history', [])
         self._published_entries = ex.get('published_entries', [])
+        self._last_search_calibration = ex.get('last_search_calibration', '')
         self.engine.data_profile = self.data_profile
 
         mm = state['message_manager']
@@ -2452,14 +3371,20 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
                            seed_question, data_profile=''):
     """Build structured synthesis input from exploration state.
 
-    Section order: Context → Findings Index → Research Model → Evidence.
+    Section order: Context -> Findings Index -> Research Model -> Evidence.
     The Research Model comes before Evidence so the synthesis model reads
     the strategic narrative before drilling into raw numbers.
 
-    Evidence is score-gated:
-      8+: full results (ground truth for key findings)
-      6-7: finding_summary only (context without noise)
-      ≤5:  omitted (kept in Findings Index for completeness)
+    Evidence is structured as:
+      - Top TOP_K_FULL_RAW winning analyses by score: full untruncated
+        stdout (head/tail compressed if over 6KB). These are the centrepiece
+        findings whose raw numbers the briefing will most likely need to
+        cite verbatim.
+      - Remaining active winners with score >= 6: finding_summary and
+        result_digest only (no raw stdout). Enough for citation-faithful
+        briefing when raw detail isn't needed.
+      - Score <= 5 winners: omitted from Section D, but remain in Section B
+        (Findings Index) for completeness.
     """
     full_results_store = full_results_store or {}
     active = sorted(
@@ -2473,39 +3398,63 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
     parts = []
 
     # Section A: Framing
-    parts.append("═══════════════════════════════════════")
+    parts.append("===========================================")
     parts.append("SECTION A: EXPLORATION CONTEXT")
-    parts.append("═══════════════════════════════════════\n")
+    parts.append("===========================================\n")
     parts.append(f"**Original question:** {seed_question}\n")
     if data_profile:
         parts.append(f"**Dataset profile:**\n{data_profile}\n")
-    parts.append(f"**Exploration scope:** {len(active)} analyses completed\n")
+    else:
+        parts.append("**Mode:** computation-only (no dataset, no orientation profile)\n")
+    parts.append(f"**Exploration scope:** {len(active)} winning analyses completed\n")
 
-    # Section B: Findings Index (all analyses, one line each)
-    parts.append("═══════════════════════════════════════")
+    # Section B: Findings Index (all active analyses, one line each)
+    parts.append("===========================================")
     parts.append("SECTION B: COMPLETE FINDINGS INDEX")
-    parts.append("═══════════════════════════════════════\n")
+    parts.append("===========================================\n")
 
     for n in active:
         fs = n.get('finding_summary', '') or '(no summary)'
-        parts.append(f"[{n['quality_score']}] [[{n['chain_id']}]] {fs}")
+        method = n.get('method_used', '')
+        method_tag = f" [{method}]" if method else ""
+        parts.append(f"[{n['quality_score']}]{method_tag} [[{n['chain_id']}]] {fs}")
 
-    # Section C: Research Model (read before evidence — provides the map)
-    parts.append("\n═══════════════════════════════════════")
+    # Section C: Research Model (read before evidence - provides the map)
+    parts.append("\n===========================================")
     parts.append("SECTION C: RESEARCH MODEL")
-    parts.append("═══════════════════════════════════════\n")
+    parts.append("===========================================\n")
     parts.append(research_model or "(No research model available)")
 
-    # Section D: Evidence (score-gated)
-    high = [n for n in active if n['quality_score'] >= 8]
-    mid = [n for n in active if 6 <= n['quality_score'] <= 7]
+    # Section D: Evidence (top-K full raw + mid-tier digests)
+    # Pick top-K by score, break ties by higher chain_id (more recent).
+    top_k = sorted(
+        active,
+        key=lambda n: (n['quality_score'], n['chain_id']),
+        reverse=True,
+    )[:TOP_K_FULL_RAW]
+    top_k_ids = {n['chain_id'] for n in top_k}
 
-    parts.append("\n═══════════════════════════════════════")
-    parts.append(f"SECTION D: EVIDENCE (score 8+: full results, score 6-7: summaries)")
-    parts.append("═══════════════════════════════════════\n")
+    # Mid-tier: remaining active winners with score >= 6 not in top-K.
+    # Threshold matches the previous mid band so reductions in context
+    # pressure come from cutting top-tier volume, not mid-tier coverage.
+    mid_tier = [
+        n for n in active
+        if n['quality_score'] >= 6 and n['chain_id'] not in top_k_ids
+    ]
 
-    # Score 8+: full results
-    for n in high:
+    parts.append("\n===========================================")
+    parts.append(
+        f"SECTION D: EVIDENCE "
+        f"(top {len(top_k)} by score: full results; "
+        f"remaining score >= 6: digests only)"
+    )
+    parts.append("===========================================\n")
+
+    # Top-K: full results (head/tail compressed if long)
+    # Present in chronological order within the top-K band so the reader
+    # can follow the investigation's arc.
+    top_k_chron = sorted(top_k, key=lambda n: n['chain_id'])
+    for n in top_k_chron:
         chain_key = str(n['chain_id'])
         result_text = full_results_store.get(
             chain_key, n.get('result_summary', 'Results not available')
@@ -2517,20 +3466,35 @@ def format_synthesis_input(insight_tree, full_results_store, research_model,
             f"[[{n['chain_id']}]] Score: {n['quality_score']}/10\n"
             f"Question: {n['question']}\n"
             f"Results:\n{result_text}\n"
-            f"{'─' * 5}"
+            f"{'-' * 5}"
         )
 
-    # Score 6-7: finding summary only
-    if mid:
-        parts.append(f"\n{'─' * 20}\nScore 6-7 analyses (summaries only — see Findings Index for IDs):\n")
-        for n in mid:
+    # Mid-tier: digest-only entries (finding_summary + result_digest)
+    if mid_tier:
+        parts.append(
+            f"\n{'-' * 20}\n"
+            f"Digest-only evidence "
+            f"(score >= 6, not in top-{TOP_K_FULL_RAW} - cite via Findings Index IDs):\n"
+        )
+        mid_chron = sorted(mid_tier, key=lambda n: n['chain_id'])
+        for n in mid_chron:
             fs = n.get('finding_summary', '')
-            if not fs:
-                fs = n.get('result_digest', '')
-            if not fs:
-                fs = n.get('result_summary', 'No summary')
-                if len(fs) > 200:
-                    fs = fs[:200] + '...'
-            parts.append(f"[[{n['chain_id']}]] [{n['quality_score']}/10] {n['question']}\n  → {fs}")
+            digest = n.get('result_digest', '')
+            # Combine finding summary and result digest if both present.
+            # Both are LLM-curated and compact.
+            if fs and digest:
+                body = f"{fs}\n  digest: {digest}"
+            elif digest:
+                body = digest
+            elif fs:
+                body = fs
+            else:
+                # Fallback only - should be rare for score >= 6 winners
+                body = n.get('result_summary', 'No summary')
+                if len(body) > 200:
+                    body = body[:200] + '...'
+            parts.append(
+                f"[[{n['chain_id']}]] [{n['quality_score']}/10] {n['question']}\n  -> {body}"
+            )
 
     return '\n'.join(parts)

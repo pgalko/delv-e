@@ -26,7 +26,7 @@ def write_dashboard(output_dir, explorer, engine, iteration, max_iterations):
         max_iterations: total iterations planned
     """
     try:
-        data = _extract_data(explorer, engine, iteration, max_iterations)
+        data = _extract_data(explorer, engine, iteration, max_iterations, output_dir)
         html = _render_html(data)
         path = os.path.join(output_dir, "dashboard.html")
         tmp = path + ".tmp"
@@ -37,7 +37,7 @@ def write_dashboard(output_dir, explorer, engine, iteration, max_iterations):
         logger.warning(f"Dashboard write failed: {e}")
 
 
-def _extract_data(explorer, engine, iteration, max_iterations):
+def _extract_data(explorer, engine, iteration, max_iterations, output_dir):
     """Extract all dashboard data from explorer and engine state."""
 
     # --- Iteration data from insight tree ---
@@ -112,25 +112,30 @@ def _extract_data(explorer, engine, iteration, max_iterations):
     # --- Parse research model ---
     rm = explorer.research_model or ''
     established = _parse_section(rm, '## Established Findings')
-    connections = _parse_section(rm, '## Cross-Finding Connections')
-    maturity_lines = _parse_section(rm, '## Finding Maturity')
     health_lines = _parse_section(rm, '## Exploration Health')
-    gap_lines = _parse_section(rm, '## Biggest Gap')
+    landscape_lines = _parse_section(rm, '## Structural Landscape')
 
-    # Parse health metrics
+    # Parse health metrics (new minimal shape: Breadth + Unexplored)
     breadth = 'UNKNOWN'
-    topics = 0
     for line in health_lines:
         if 'Breadth:' in line:
             breadth = line.split('Breadth:')[-1].strip()
-        m = re.search(r'Topics investigated:\s*(\d+)', line)
-        if m:
-            topics = int(m.group(1))
+    # topics is legacy but kept in output dict for template compatibility
+    topics = len(established)
 
-    biggest_gap = ' '.join(gap_lines)[:200] if gap_lines else 'None identified'
+    # STATUS tag counts from Established Findings
+    status_counts = {'ESTABLISHED': 0, 'PROVISIONAL': 0, 'SHRINKS': 0, 'CONTRADICTED': 0}
+    for line in established:
+        for tag in status_counts:
+            if f'[{tag}]' in line:
+                status_counts[tag] += 1
+                break
 
-    # Count confirmed connections
-    confirmed = sum(1 for c in connections if 'confirmed' in c.lower() or 'tested' in c.lower())
+    # Structural landscape summary — compact preview for the dashboard card
+    if landscape_lines and not any('<<< DO NOT MODIFY' in l for l in landscape_lines):
+        landscape_preview = ' '.join(landscape_lines)[:200]
+    else:
+        landscape_preview = 'Not yet populated'
 
     # --- Agent call counts ---
     agent_counts = {}
@@ -190,12 +195,10 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'hold_bands': hold_bands,
         'pivot_iters': pivot_iters,
         'established': established,
-        'connections': connections,
-        'confirmed_connections': confirmed,
-        'maturity_lines': maturity_lines,
+        'status_counts': status_counts,
         'breadth': breadth,
         'topics': topics,
-        'biggest_gap': biggest_gap,
+        'landscape_preview': landscape_preview,
         'n_arcs': len(heatmap_arcs),
         'agent_counts': agent_counts,
         'total_cost': total_cost,
@@ -213,6 +216,7 @@ def _extract_data(explorer, engine, iteration, max_iterations):
         'heatmap_arcs': heatmap_arcs,
         'probe_iters': probe_iters,
         'rot_iters': rot_iters,
+        'output_dir': output_dir,
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -258,21 +262,36 @@ def _render_html(d):
 
     # Status pill
     if d['is_complete']:
+        # Check which artefacts actually exist before linking to them —
+        # avoids 404s when e.g. structural_map.md couldn't be extracted.
+        output_dir = d.get('output_dir', '')
+        artefact_buttons = ['<a href="briefing.html" class="report-btn">View Briefing</a>']
+        if output_dir and os.path.exists(os.path.join(output_dir, 'findings_index.html')):
+            artefact_buttons.append(
+                '<a href="findings_index.html" class="report-btn report-btn-alt">Findings Index</a>'
+            )
+        if output_dir and os.path.exists(os.path.join(output_dir, 'structural_map.html')):
+            artefact_buttons.append(
+                '<a href="structural_map.html" class="report-btn report-btn-alt">Structural Map</a>'
+            )
         status_html = (
-            '<span class="status-pill status-complete">Complete</span>'
-            ' <a href="synthesis_report.html" class="report-btn">View Report</a>'
+            '<span class="status-pill status-complete">Complete</span> '
+            + ' '.join(artefact_buttons)
         )
     else:
         status_html = '<span class="status-pill status-running">Running</span>'
 
     # Metric cards
-    maturity_note = ''
-    if d['maturity_lines']:
-        if any('COMPLETE' in l.upper() for l in d['maturity_lines']):
-            maturity_note = 'all COMPLETE maturity'
-        else:
-            active = sum(1 for l in d['maturity_lines'] if l.strip())
-            maturity_note = f'{active} in progress'
+    # Status-tag breakdown from Established Findings (replaces old maturity note)
+    sc = d.get('status_counts', {})
+    total_tagged = sum(sc.values())
+    if total_tagged > 0:
+        bits = []
+        if sc.get('ESTABLISHED'): bits.append(f"{sc['ESTABLISHED']} est.")
+        if sc.get('PROVISIONAL'): bits.append(f"{sc['PROVISIONAL']} prov.")
+        if sc.get('SHRINKS'): bits.append(f"{sc['SHRINKS']} shrinks")
+        if sc.get('CONTRADICTED'): bits.append(f"{sc['CONTRADICTED']} contr.")
+        maturity_note = ' · '.join(bits)
     else:
         maturity_note = f'{d["significant"]} scored 7+'
 
@@ -315,7 +334,7 @@ def _render_html(d):
         'Result Evaluator', 'Question Selector', 'Error Corrector',
         'Strategic Review', 'Reframing Probe', 'Perspective Rotation',
         'Literature Search', 'Literature Integration',
-        'Seed Decomposition', 'Synthesis Generator'
+        'Seed Decomposition', 'Briefing Generator', 'Synthesis Chart'
     ]
     max_calls = max(d['agent_counts'].values()) if d['agent_counts'] else 1
     agent_html = ''
@@ -325,7 +344,7 @@ def _render_html(d):
             continue
         pct = round(count / max_calls * 100)
         label = agent.lower().replace('_', ' ')
-        is_premium = agent in ('Strategic Review', 'Reframing Probe', 'Perspective Rotation', 'Seed Decomposition', 'Synthesis Generator')
+        is_premium = agent in ('Strategic Review', 'Reframing Probe', 'Perspective Rotation', 'Seed Decomposition', 'Briefing Generator', 'Synthesis Chart')
         is_search = agent in ('Literature Search', 'Literature Integration')
         bar_color = ('var(--cyan)' if is_search else
                      'var(--purple)' if is_premium else
@@ -529,6 +548,8 @@ def _render_html(d):
   .status-complete {{ background: var(--blue-bg); color: var(--blue-fg); }}
   .report-btn {{ display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 500; padding: 4px 14px; border-radius: 20px; background: var(--green-bg); color: var(--green-fg); text-decoration: none; margin-left: 8px; transition: opacity 0.15s; }}
   .report-btn:hover {{ opacity: 0.8; }}
+  .report-btn-alt {{ background: transparent; border: 1px solid var(--border); color: var(--fg2); font-size: 11px; padding: 3px 10px; }}
+  .report-btn-alt:hover {{ background: var(--bg2); color: var(--fg); opacity: 1; }}
   .meta-bar {{ padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; gap: 24px; flex-wrap: wrap; font-size: 12px; color: var(--fg2); }}
   .meta-bar span {{ display: flex; align-items: center; gap: 4px; }}
   .meta-label {{ color: var(--fg3); }}
@@ -623,9 +644,9 @@ def _render_html(d):
       <div class="metric-sub">{maturity_note}</div>
     </div>
     <div class="metric">
-      <div class="metric-label">Connections tested</div>
-      <div class="metric-value">{len(d['connections'])}</div>
-      <div class="metric-sub">{d['confirmed_connections']} confirmed</div>
+      <div class="metric-label">Structural Landscape</div>
+      <div class="metric-value">{sum(d.get('status_counts', {}).values())}</div>
+      <div class="metric-sub">tagged findings</div>
     </div>
     <div class="metric">
       <div class="metric-label">Mean score</div>
@@ -706,12 +727,12 @@ def _render_html(d):
           </div>
         </div>
         <div class="health-row">
-          <span class="health-label">Topics investigated</span>
-          <span class="health-val">{d['topics']}</span>
+          <span class="health-label">Findings</span>
+          <span class="health-val">{d['topics']} established</span>
         </div>
         <div class="health-row">
-          <span class="health-label">Biggest gap</span>
-          <span class="health-val" style="max-width: 280px; text-align: right; font-size: 11px; line-height: 1.3; font-weight: 400; color: var(--fg2);">{_escape(d['biggest_gap'][:150])}</span>
+          <span class="health-label">Landscape</span>
+          <span class="health-val" style="max-width: 280px; text-align: right; font-size: 11px; line-height: 1.3; font-weight: 400; color: var(--fg2);">{_escape(d['landscape_preview'][:150])}</span>
         </div>
       </div>
     </div>

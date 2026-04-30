@@ -636,53 +636,74 @@ class ExplorationEngine:
     # ──────────────────────────────────────────────
 
     def run_orientation(self, seed_question, model_override=None):
-        """Run the orientation phase: profile the dataset's analytical landscape.
+        """Run the orientation phase in two steps:
 
-        Returns the data profile string, or empty string on failure.
-        Uses the same code generation + retry + fallback pattern as _process_question.
+        Phase 1 (compute) — generates and executes Python code that emits a
+          structured FACTS block (one `key = value` per line, inside
+          ###FACTS_START### / ###FACTS_END### markers). No prose is produced
+          by the code; every numeric claim comes from an f-string
+          interpolation over a DataFrame computation.
+
+        Phase 2 (narrate) — a pure LLM call (no code execution) that reads
+          the FACTS block and the data dictionary (if provided) and writes
+          the analytical profile as prose. Every numeric value in the profile
+          must trace back to a fact in FACTS or a direct quote from the
+          dictionary.
+
+        The two-phase split exists because single-call orientation allows the
+        LLM to embed hallucinated numbers inside triple-quoted string
+        literals — the "47 sessions" class of bug. With two phases, numbers
+        in Phase 2's output cannot exist unless Phase 1 computed them.
+
+        Returns the profile string (Phase 2 output), or the FACTS block
+        wrapped as a degraded profile on Phase 2 failure, or "" if Phase 1
+        produces no output.
         """
         if self.df is None:
             return ""
 
         schema = self._get_df_schema()
+        model = model_override or self.models.get_model_name("Code Generator")[0]
 
-        system_msg = self.prompts.orientation_system
-        user_msg = self.prompts.orientation_user.format(
+        has_dict = bool(self.data_dictionary_text)
+        dict_for_compute = (
+            self.data_dictionary_text if has_dict else "(No data dictionary provided.)"
+        )
+
+        # ──────────────────────────────────────────────────────────
+        # PHASE 1: COMPUTE — emit structured FACTS
+        # ──────────────────────────────────────────────────────────
+        self.output_manager.print_wrapper(
+            style.agent("Orientation (Phase 1: compute)", model),
+            chain_id=self.chain_id,
+        )
+
+        compute_system = self.prompts.orientation_compute_system
+        compute_user = self.prompts.orientation_compute_user.format(
             schema=schema,
             seed_question=seed_question,
-            data_dictionary=(
-                self.data_dictionary_text
-                if self.data_dictionary_text
-                else "(No data dictionary provided for this dataset. Infer constraints empirically from the schema and your own analysis; flag anything that looks surprising. Skip the KEY CONSTRAINTS section entirely in the profile.)"
-            ),
+            data_dictionary=dict_for_compute,
         )
         messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
+            {"role": "system", "content": compute_system},
+            {"role": "user", "content": compute_user},
         ]
 
-        model = model_override or self.models.get_model_name("Code Generator")[0]
-        self.output_manager.print_wrapper(
-            style.agent("Orientation", model), chain_id=self.chain_id
-        )
-
-        # Code generation: try → retry with nudge → model fallback (shared method)
-        with style.spinner("Profiling dataset"):
+        with style.spinner("Computing facts"):
             code, llm_response = self._call_llm_for_code(messages, model)
 
         if not code:
             self.output_manager.print_wrapper(
-                style.error_msg("Orientation: no code generated"),
+                style.error_msg("Orientation Phase 1: no code generated"),
                 chain_id=self.chain_id,
             )
             return ""
 
-        # Execute
         analysis_dir = os.path.join(self.output_dir, "orientation")
         os.makedirs(analysis_dir, exist_ok=True)
         results, error, plots = self.executor.execute(code, self.df, analysis_dir)
 
-        # Error correction loop (same pattern as _process_question)
+        # Error correction loop — same pattern as _process_question
         initial_error = error
         retries = 0
         while error and retries < self.MAX_ERROR_CORRECTIONS:
@@ -708,7 +729,7 @@ class ExplorationEngine:
             messages.append({"role": "assistant", "content": llm_response or ""})
             messages.append({"role": "user", "content": fix_msg})
 
-            with style.spinner("Fixing orientation code"):
+            with style.spinner("Fixing orientation compute code"):
                 try:
                     llm_response = self.llm_client.call(
                         messages=messages,
@@ -718,7 +739,7 @@ class ExplorationEngine:
                         agent="Error Corrector",
                     )
                 except Exception as e:
-                    logger.warning(f"Orientation error correction failed: {e}")
+                    logger.warning(f"Orientation Phase 1 error correction failed: {e}")
                     break
             code = extract_code(llm_response or "")
             if code:
@@ -726,85 +747,293 @@ class ExplorationEngine:
             else:
                 break
 
-        # Record successfully-corrected error patterns
         if retries > 0 and results and initial_error:
             self.message_manager.record_error_pattern(initial_error)
 
         if not results:
             self.output_manager.print_wrapper(
-                style.error_msg("Orientation failed — continuing without data profile"),
+                style.error_msg("Orientation Phase 1 failed — continuing without data profile"),
                 chain_id=self.chain_id,
             )
             return ""
 
-        # Extract PROFILE block
-        profile = ""
-        start_marker = "###PROFILE_START###"
-        end_marker = "###PROFILE_END###"
-        s_idx = results.find(start_marker)
-        e_idx = results.find(end_marker)
-
+        # Extract FACTS block
+        facts_start = "###FACTS_START###"
+        facts_end = "###FACTS_END###"
+        s_idx = results.find(facts_start)
+        e_idx = results.find(facts_end)
         if s_idx >= 0 and e_idx > s_idx:
-            profile = results[s_idx + len(start_marker):e_idx].strip()
+            facts = results[s_idx + len(facts_start):e_idx].strip()
         else:
-            # Fall back to RESULTS markers or raw output
-            s_idx = results.find("###RESULTS_START###")
-            e_idx = results.find("###RESULTS_END###")
-            if s_idx >= 0 and e_idx > s_idx:
-                profile = results[s_idx + len("###RESULTS_START###"):e_idx].strip()
+            # Phase 1 didn't emit markers — treat stdout as raw facts
+            logger.warning(
+                "Orientation Phase 1: FACTS markers missing — using raw stdout"
+            )
+            facts = results.strip()
+
+        if len(facts) > 20000:
+            facts = facts[:20000] + "\n[...facts truncated]"
+
+        code_lines = len(code.strip().split('\n'))
+        self.output_manager.print_wrapper(
+            style.success(
+                f"Phase 1 complete: {code_lines} lines of code, {len(facts)} chars of facts"
+            ),
+            chain_id=self.chain_id,
+        )
+
+        # Write Phase 1 analysis.md now (code + stdout), even if Phase 2 fails.
+        self.output_manager.write_analysis_md(
+            analysis_dir, "ORIENTATION Phase 1: FACTS computation",
+            code, results, error, plots,
+            self._iteration, self._max_iterations, self.chain_id,
+        )
+
+        # ──────────────────────────────────────────────────────────
+        # PHASE 2: NARRATE — prose profile constrained by FACTS
+        # ──────────────────────────────────────────────────────────
+        self.output_manager.print_wrapper(
+            style.agent("Orientation (Phase 2: narrate)", model),
+            chain_id=self.chain_id,
+        )
+
+        narrate_system = self.prompts.orientation_narrate_system
+        narrate_user = self.prompts.orientation_narrate_user.format(
+            facts=facts,
+            data_dictionary=self.data_dictionary_text if has_dict else "(none)",
+            schema=schema,
+            seed_question=seed_question,
+        )
+        narrate_messages = [
+            {"role": "system", "content": narrate_system},
+            {"role": "user", "content": narrate_user},
+        ]
+
+        profile = ""
+        with style.spinner("Narrating profile"):
+            try:
+                profile_raw = self.llm_client.call(
+                    messages=narrate_messages,
+                    model=model,
+                    max_tokens=8000,
+                    temperature=0,
+                    agent="Orientation Narrator",
+                )
+            except Exception as e:
+                logger.warning(f"Orientation Phase 2 failed: {e}")
+                profile_raw = ""
+
+        if profile_raw:
+            # Extract PROFILE block from Phase 2 output
+            start_marker = "###PROFILE_START###"
+            end_marker = "###PROFILE_END###"
+            ps = profile_raw.find(start_marker)
+            pe = profile_raw.find(end_marker)
+            if ps >= 0 and pe > ps:
+                profile = profile_raw[ps + len(start_marker):pe].strip()
             else:
-                profile = results.strip()[:3000]
+                # Phase 2 returned prose without markers — use as-is
+                logger.warning(
+                    "Orientation Phase 2: PROFILE markers missing — using raw output"
+                )
+                profile = profile_raw.strip()
+
+        if not profile:
+            # Phase 2 failed entirely — fall back to FACTS wrapped as a
+            # minimal profile. Downstream agents will see structured facts
+            # instead of prose, which is degraded but not broken.
+            logger.warning(
+                "Orientation Phase 2 produced no output — falling back to raw FACTS"
+            )
+            profile = (
+                "###STRUCTURAL_LANDSCAPE_START###\n"
+                "(Phase 2 narration failed; structured facts follow in sections 1–6.)\n"
+                "###STRUCTURAL_LANDSCAPE_END###\n\n"
+                "## 1. COMPUTED FACTS (Phase 2 unavailable)\n\n"
+                f"{facts}\n"
+            )
 
         # Truncate if excessively long
         if len(profile) > 12000:
             profile = profile[:12000] + "\n[...truncated]"
 
         # Display
-        code_lines = len(code.strip().split('\n'))
         self.output_manager.print_wrapper(
-            style.success(f"Orientation: {code_lines} lines, profile {len(profile)} chars"),
+            style.success(f"Phase 2 complete: profile {len(profile)} chars"),
             chain_id=self.chain_id,
         )
-        self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
-        for line in profile.split('\n')[:25]:
-            self.output_manager.print_wrapper(style.result_line(line), chain_id=self.chain_id)
-        if profile.count('\n') > 25:
-            self.output_manager.print_wrapper(
-                style.result_line(style.dim(f"... ({profile.count(chr(10)) - 25} more lines)")),
-                chain_id=self.chain_id,
-            )
-        self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
 
-        # Write analysis.md for the orientation
-        self.output_manager.write_analysis_md(analysis_dir, "ORIENTATION: Dataset analytical profile", code, results, error, plots, self._iteration, self._max_iterations, self.chain_id)
+        # Write Phase 2 output to its own analysis.md alongside Phase 1's
+        narrate_dir = os.path.join(self.output_dir, "orientation_narrate")
+        os.makedirs(narrate_dir, exist_ok=True)
+        self.output_manager.write_analysis_md(
+            narrate_dir, "ORIENTATION Phase 2: prose profile from FACTS",
+            "(no code — pure LLM narration)", profile_raw or "(no output)",
+            None, [], self._iteration, self._max_iterations, self.chain_id,
+        )
 
         return profile
 
-    def run_literature_search(self, query, search_model, mode='midstream',
-                              brief_context=''):
+    # ──────────────────────────────────────────────
+    # Causal Substrate (Phase 3 of orientation)
+    # ──────────────────────────────────────────────
+
+    def run_causal_substrate(self, seed_question, profile="", model_override=None):
+        """Phase 3 orientation: decompose the seed into its causal substrate.
+
+        A pure LLM call (no code execution). Takes the seed question, the
+        profile from Phase 2 (if orientation ran), the data dictionary (if
+        provided), and the schema (if a dataset is loaded). Produces a
+        structured Causal Substrate with TYPE ∈ {FULL, SPARSE, DESCRIPTIVE}
+        plus, for FULL, a RANKED CANDIDATE MATCHING AXES menu with explicit
+        SUBSUMPTION notes.
+
+        Cheap agents do not receive a one-line directive. Instead they read
+        a compacted view of the substrate (TYPE line + CANDIDATE MATCHING
+        AXES table) that the explorer extracts at every cheap-agent call.
+        Premium agents read the full block via direct research-model access.
+
+        This step runs independently of whether orientation ran, whether a
+        dataset is loaded, or whether a dictionary is provided.
+
+        Returns substrate_text — the structured block (without delimiter
+        markers) for insertion into the research model. On failure, returns
+        "" — downstream treats as SPARSE.
+        """
+        model = model_override or self.models.get_model_name("Code Generator")[0]
+
+        # Build inputs with defensive defaults for computation-only / no-dict cases
+        schema_text = self._get_df_schema() if self.df is not None else "(no dataset loaded — computation-only mode)"
+        profile_text = profile if profile else "(no orientation profile available)"
+        dict_text = self.data_dictionary_text if self.data_dictionary_text else "(no data dictionary provided)"
+
+        self.output_manager.print_wrapper(
+            style.agent("Orientation (Phase 3: causal substrate)", model),
+            chain_id=self.chain_id,
+        )
+
+        system = self.prompts.causal_substrate_system
+        user = self.prompts.causal_substrate_user.format(
+            seed_question=seed_question,
+            profile=profile_text,
+            data_dictionary=dict_text,
+            schema=schema_text,
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+        raw = ""
+        with style.spinner("Decomposing causal substrate"):
+            try:
+                raw = self.llm_client.call(
+                    messages=messages,
+                    model=model,
+                    max_tokens=8000,
+                    temperature=0,
+                    agent="Causal Substrate",
+                )
+            except Exception as e:
+                logger.warning(f"Causal substrate call failed: {e}")
+                raw = ""
+
+        if not raw:
+            logger.warning("Causal substrate produced no output — treating as SPARSE")
+            return ""
+
+        # Extract the CAUSAL_SUBSTRATE block. If START is present but END is
+        # missing (truncation or LLM forgot the closing marker), fall back to
+        # taking everything from START to end of text. Guidance markers no
+        # longer exist; the substrate block is the only structured output.
+        substrate = self._extract_marker_block(
+            raw, "###CAUSAL_SUBSTRATE_START###", "###CAUSAL_SUBSTRATE_END###"
+        )
+        if not substrate and "###CAUSAL_SUBSTRATE_START###" in raw:
+            logger.warning(
+                "Causal substrate END marker missing — attempting fallback extraction "
+                "(likely response truncation or malformed output)"
+            )
+            tail = raw.split("###CAUSAL_SUBSTRATE_START###", 1)[1]
+            # Take everything to end of response (no other recognised boundary
+            # exists now that GUIDANCE_ONE_LINER markers are gone).
+            substrate = tail.strip()
+            if substrate:
+                logger.info(
+                    f"Fallback recovered {len(substrate)} chars of substrate"
+                )
+
+        if not substrate:
+            logger.warning("Causal substrate markers missing — treating as SPARSE")
+            return ""
+
+        # Display what we got
+        n_lines = substrate.count('\n') + 1
+        type_line = substrate.split('\n', 2)[0].strip() if substrate else ""
+        self.output_manager.print_wrapper(
+            style.success(
+                f"Phase 3 complete: {type_line} ({len(substrate)} chars, {n_lines} lines)"
+            ),
+            chain_id=self.chain_id,
+        )
+
+        # Write Phase 3 output as analysis.md for audit
+        substrate_dir = os.path.join(self.output_dir, "orientation_causal_substrate")
+        os.makedirs(substrate_dir, exist_ok=True)
+        self.output_manager.write_analysis_md(
+            substrate_dir, "ORIENTATION Phase 3: Causal Substrate",
+            "(no code — pure LLM reasoning)", substrate,
+            None, [], self._iteration, self._max_iterations, self.chain_id,
+        )
+
+        return substrate
+
+    @staticmethod
+    def _extract_marker_block(text, start_marker, end_marker):
+        """Extract content between two markers. Returns "" if either is missing."""
+        if not text or start_marker not in text:
+            return ""
+        after = text.split(start_marker, 1)[1]
+        if end_marker not in after:
+            return ""
+        block = after.split(end_marker, 1)[0]
+        return block.strip()
+
+
+    def run_literature_search(self, query, search_model, mode='midstream', brief_context=''):
         """Run a web search for published research and return synthesised results.
 
         Args:
-            query: search query string
-            search_model: Anthropic model string (e.g. 'anthropic:claude-sonnet-4-6')
-            mode: 'preloop' (broad domain review) or 'midstream' (specific finding)
-            brief_context: short summary of current investigation state (midstream only)
+            query: Search query string. In pre-loop mode this is the seed question.
+            search_model: Anthropic model string, e.g. ``anthropic:claude-sonnet-4-6``.
+                ``LLMClient.search_call`` may internally route to its configured
+                low-cost search model, but the provider must still be Anthropic.
+            mode: ``'preloop'`` for a broad literature review, or ``'midstream'``
+                for targeted validation/calibration of an in-flight finding.
+            brief_context: Short summary of the current investigation state for
+                mid-stream searches.
 
         Returns:
-            Synthesised search results text, or empty string on failure.
+            Synthesised search results text, or an empty string on failure.
         """
+        if not query or not str(query).strip():
+            return ""
+        if not search_model:
+            return ""
+
         if mode == 'preloop':
             prompt = self.prompts.literature_search_preloop.format(
-                seed_question=query)
+                seed_question=str(query).strip()
+            )
         else:
             prompt = self.prompts.literature_search_midstream.format(
-                brief_context=brief_context,
-                query=query)
+                brief_context=brief_context or "(No investigation context yet.)",
+                query=str(query).strip(),
+            )
 
         messages = [{"role": "user", "content": prompt}]
 
-        # Pre-loop gets more searches (broader domain review)
-        # Mid-stream gets fewer (targeted validation)
+        # Pre-loop gets more searches (broader domain review); mid-stream is targeted.
         max_uses = 8 if mode == 'preloop' else 3
 
         try:

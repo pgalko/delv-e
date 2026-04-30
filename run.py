@@ -69,6 +69,8 @@ def main():
                              "authoritative context; propagated to all agents via "
                              "the profile. Orientation-only — CG does not see the "
                              "verbatim file.")
+    parser.add_argument("--auto-stop", action="store_true",
+                        help="Allow early termination when strategic review or the mechanical backstop judges the investigation complete.")
     args = parser.parse_args()
 
     # ── Resolve dataset vs question ambiguity ──
@@ -216,6 +218,7 @@ def main():
         interactive=args.question is None,
         resumed_state=resumed_state,
         orientation=args.orientation,
+        auto_stop=args.auto_stop,
     )
 
 

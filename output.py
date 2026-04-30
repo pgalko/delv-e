@@ -155,24 +155,52 @@ class OutputManager:
     # Final output writing
     # ──────────────────────────────────────────────
 
-    def write_final_outputs(self, research_model, synthesis_text=None,
-                            cost_tracker=None, run_logger=None):
-        """Write final research model, synthesis report, and cost summary."""
+    def write_final_outputs(self, research_model, briefing_text=None,
+                            insight_tree=None, cost_tracker=None,
+                            run_logger=None,
+                            # Backward-compat for any caller still passing
+                            # the old kwarg name:
+                            synthesis_text=None):
+        """Write final research model, briefing, and supporting artefacts.
+
+        Writes these artefacts to the output directory:
+          - research_model.md
+          - briefing.md + briefing.html        (replaces synthesis_report.*)
+          - findings_index.md + findings_index.html  (MD written to disk
+              by AutoExplorer before this call; HTML rendered here)
+          - structural_map.md + structural_map.html  (same — MD on disk
+              already, HTML rendered here)
+          - cost.txt
+
+        Each HTML artefact has its [[chain_id]] citations rewritten as
+        clickable links to per-analysis HTML pages, which are generated
+        once up front (shared across all three artefacts).
+        """
+        # Honour backward-compat alias
+        if briefing_text is None and synthesis_text is not None:
+            briefing_text = synthesis_text
+
+        # 1. Research model (unchanged)
         model_path = os.path.join(self.output_dir, "research_model.md")
         with open(model_path, "w") as f:
             f.write("# Final Research Model\n\n")
             f.write(research_model or "(empty)")
 
-        if synthesis_text:
-            synth_path = os.path.join(self.output_dir, "synthesis_report.md")
-            with open(synth_path, "w") as f:
-                f.write(synthesis_text)
+        # 2. Briefing + companion artefacts
+        if briefing_text:
+            briefing_md_path = os.path.join(self.output_dir, "briefing.md")
+            with open(briefing_md_path, "w") as f:
+                f.write(briefing_text)
 
+            # HTML rendering: briefing + the two companion artefacts.
+            # The companion MDs were written by AutoExplorer
+            # (_write_briefing_artefacts). We read them here for HTML.
             try:
-                self._write_synthesis_html(synthesis_text)
+                self._write_briefing_html_artefacts(briefing_text)
             except Exception as e:
-                logger.warning(f"Synthesis HTML generation failed: {e}")
+                logger.warning(f"Briefing HTML generation failed: {e}")
 
+        # 3. Cost summary (unchanged)
         if cost_tracker:
             cost_path = os.path.join(self.output_dir, "cost.txt")
             with open(cost_path, "w") as f:
@@ -183,14 +211,91 @@ class OutputManager:
                         f.write("\n" + agent_summary + "\n")
 
     # ──────────────────────────────────────────────
-    # Synthesis HTML rendering
+    # Briefing + companion artefacts HTML rendering
     # ──────────────────────────────────────────────
 
-    def _write_synthesis_html(self, synthesis_text):
-        """Render synthesis markdown as a styled, self-contained HTML report."""
-        cited_ids = set(re.findall(r'\[\[(\d+)\]\]', synthesis_text))
-        analysis_links = {}
+    def _write_briefing_html_artefacts(self, briefing_text):
+        """Render briefing + companion artefacts as clickable HTML.
 
+        Produces three HTML files:
+          - briefing.html         (top nav links to dashboard + companions)
+          - findings_index.html   (nav back to briefing)
+          - structural_map.html   (nav back to briefing)
+
+        Per-analysis HTML pages are generated once from the union of all
+        [[chain_id]] citations found across the three artefact MDs, so they
+        are shared and rendered only once regardless of how many artefacts
+        cite the same analysis.
+        """
+        # 1. Gather all chain_ids cited across all three artefacts so the
+        #    per-analysis pages cover every citation in every artefact.
+        all_cited_ids = set(re.findall(r'\[\[(\d+)\]\]', briefing_text))
+
+        findings_index_path = os.path.join(self.output_dir, "findings_index.md")
+        structural_map_path = os.path.join(self.output_dir, "structural_map.md")
+
+        findings_index_md = ""
+        structural_map_md = ""
+        if os.path.exists(findings_index_path):
+            try:
+                with open(findings_index_path) as f:
+                    findings_index_md = f.read()
+                all_cited_ids.update(re.findall(r'\[\[(\d+)\]\]', findings_index_md))
+            except Exception as e:
+                logger.debug(f"findings_index.md unreadable: {e}")
+
+        if os.path.exists(structural_map_path):
+            try:
+                with open(structural_map_path) as f:
+                    structural_map_md = f.read()
+                all_cited_ids.update(re.findall(r'\[\[(\d+)\]\]', structural_map_md))
+            except Exception as e:
+                logger.debug(f"structural_map.md unreadable: {e}")
+
+        # 2. Build per-analysis HTML pages once, shared by all artefacts.
+        analysis_links = self._build_analysis_pages(all_cited_ids)
+
+        # 3. Render each artefact MD -> HTML with citations rewritten to
+        #    clickable links where the analysis page exists.
+        self._render_artefact_html(
+            md_text=briefing_text,
+            title="Investigation Briefing",
+            output_filename="briefing.html",
+            analysis_links=analysis_links,
+            is_briefing=True,
+        )
+
+        if findings_index_md:
+            self._render_artefact_html(
+                md_text=findings_index_md,
+                title="Findings Index",
+                output_filename="findings_index.html",
+                analysis_links=analysis_links,
+                is_briefing=False,
+            )
+
+        if structural_map_md:
+            self._render_artefact_html(
+                md_text=structural_map_md,
+                title="Structural Landscape",
+                output_filename="structural_map.html",
+                analysis_links=analysis_links,
+                is_briefing=False,
+            )
+
+        logger.info(f"Briefing + companion artefacts written to {self.output_dir}")
+
+    def _build_analysis_pages(self, cited_ids):
+        """Render per-analysis HTML pages for a set of cited chain_ids.
+
+        For each chain_id that has an analysis.md on disk, render its
+        matching analysis.html (with embedded plots) in the same directory.
+        Returns a dict {chain_id_str: relative_href} so callers can rewrite
+        [[chain_id]] citations into clickable links.
+
+        Analysis HTML pages have a "← Back to Briefing" link at the top.
+        """
+        analysis_links = {}
         for cid in cited_ids:
             pattern = os.path.join(self.output_dir, "exploration", "*", str(cid), "analysis.md")
             matches = glob.glob(pattern)
@@ -220,7 +325,24 @@ class OutputManager:
             except Exception as e:
                 logger.debug(f"Analysis HTML failed for {cid}: {e}")
 
-        html_body = synthesis_text
+        return analysis_links
+
+    def _render_artefact_html(self, md_text, title, output_filename,
+                              analysis_links, is_briefing=False):
+        """Render a markdown artefact to styled HTML with clickable citations.
+
+        Args:
+            md_text: markdown source text
+            title: page title (shown in <title> and header)
+            output_filename: destination filename (within self.output_dir)
+            analysis_links: dict {chain_id_str: relative_href} for rewriting
+            is_briefing: if True, top nav shows companion-artefact links +
+                PDF export; if False, top nav links back to the briefing.
+        """
+        html_body = md_text
+
+        # Rewrite [[chain_id]] citations to clickable links where the
+        # analysis page exists; remaining [[N]] become styled dead refs.
         for cid, href in analysis_links.items():
             html_body = html_body.replace(
                 f'[[{cid}]]',
@@ -228,19 +350,25 @@ class OutputManager:
             )
         html_body = re.sub(r'\[\[(\d+)\]\]', r'<span class="cite-dead">[\1]</span>', html_body)
 
+        # Convert markdown -> HTML
         html_body = self._md_to_html(html_body)
 
+        # Chart image class (applies to briefing only but harmless elsewhere)
         html_body = re.sub(
             r'<img src="(synthesis_charts/[^"]+)" alt="([^"]*)"',
             r'<img src="\1" alt="\2" class="chart-img"',
             html_body
         )
 
-        full_html = self._synthesis_html_template(html_body)
-        out_path = os.path.join(self.output_dir, "synthesis_report.html")
+        full_html = self._artefact_html_template(
+            body_html=html_body,
+            title=title,
+            is_briefing=is_briefing,
+        )
+
+        out_path = os.path.join(self.output_dir, output_filename)
         with open(out_path, 'w') as f:
             f.write(full_html)
-        logger.info(f"Synthesis HTML written to {out_path}")
 
     # ──────────────────────────────────────────────
     # Markdown → HTML converter
@@ -359,14 +487,39 @@ class OutputManager:
     # ──────────────────────────────────────────────
 
     @staticmethod
-    def _synthesis_html_template(body_html):
-        """Full HTML page template for the synthesis report."""
+    def _artefact_html_template(body_html, title, is_briefing=False):
+        """Full HTML page template for briefing + companion artefacts.
+
+        One template serves all three artefacts (briefing, findings index,
+        structural map). The small amount of branching is in the <header>
+        navigation:
+          - Briefing page: links to dashboard, the two companion artefacts,
+            and PDF export
+          - Companion pages: link back to the briefing
+        The CSS block is identical across all three.
+        """
+        if is_briefing:
+            nav_html = (
+                '  <a href="dashboard.html" class="back-link">← Dashboard</a>\n'
+                '  <span class="nav-sep">·</span>\n'
+                '  <a href="findings_index.html" class="back-link">Findings Index</a>\n'
+                '  <span class="nav-sep">·</span>\n'
+                '  <a href="structural_map.html" class="back-link">Structural Map</a>'
+            )
+            footer_pdf = (
+                '  <div class="pdf-wrap"><button class="pdf-btn" onclick="window.print()">'
+                '⬇ Export PDF</button></div>'
+            )
+        else:
+            nav_html = '  <a href="briefing.html" class="back-link">← Back to Briefing</a>'
+            footer_pdf = ''
+
         return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>delv-e Synthesis Report</title>
+<title>delv-e — {title}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap');
   :root {{
@@ -384,8 +537,10 @@ class OutputManager:
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 16px; line-height: 1.7; }}
   .container {{ max-width: 820px; margin: 0 auto; padding: 40px 24px 80px; }}
-  .back-link {{ display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--fg3); text-decoration: none; margin-bottom: 24px; font-family: var(--mono); }}
+  .nav-bar {{ display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-bottom: 24px; font-family: var(--mono); font-size: 13px; }}
+  .back-link {{ display: inline-flex; align-items: center; gap: 6px; color: var(--fg3); text-decoration: none; }}
   .back-link:hover {{ color: var(--fg2); }}
+  .nav-sep {{ color: var(--fg3); }}
   h1 {{ font-size: 28px; font-weight: 600; line-height: 1.3; margin-bottom: 8px; }}
   h2 {{ font-size: 22px; font-weight: 600; margin-top: 48px; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }}
   h3 {{ font-size: 17px; font-weight: 600; margin-top: 32px; margin-bottom: 12px; }}
@@ -411,7 +566,7 @@ class OutputManager:
   @media print {{
     body {{ background: white; color: #1A1A18; font-size: 11pt; }}
     .container {{ max-width: 100%; padding: 0; }}
-    .back-link, .pdf-wrap, .footer {{ display: none; }}
+    .nav-bar, .pdf-wrap, .footer {{ display: none; }}
     a.cite-link {{ color: #2563EB; text-decoration: none; }}
     h1 {{ font-size: 22pt; }}
     h2 {{ font-size: 16pt; page-break-after: avoid; margin-top: 28pt; }}
@@ -427,9 +582,11 @@ class OutputManager:
 </head>
 <body>
 <div class="container">
-  <a href="dashboard.html" class="back-link">← Dashboard</a>
+  <div class="nav-bar">
+{nav_html}
+  </div>
   {body_html}
-  <div class="pdf-wrap"><button class="pdf-btn" onclick="window.print()">⬇ Export PDF</button></div>
+{footer_pdf}
   <div class="footer">Generated by delv-e · Deep Exploratory Learning &amp; Visualization Engine</div>
 </div>
 </body>
@@ -477,7 +634,7 @@ class OutputManager:
 </head>
 <body>
 <div class="container">
-  <a href="../../../synthesis_report.html" class="back-link">← Back to Report</a>
+  <a href="../../../briefing.html" class="back-link">← Back to Briefing</a>
   {body_html}
   {img_html}
 </div>

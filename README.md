@@ -1,8 +1,10 @@
 # delv-e
 
-Autonomous data investigation powered by LLMs. Give it a dataset and a question — or just a question — and it recursively generates hypotheses, writes and executes analysis code, evaluates results, and adapts its exploration strategy based on what it discovers. Works with datasets (CSV, Excel, Parquet) or in computation-only mode for simulations, mathematical exploration, and numerical experiments.
+Autonomous data investigation powered by LLMs, designed as a **pre-filter for deeper analytical work**. Give it a dataset and a question — or just a question — and it recursively generates hypotheses, writes and executes analysis code, and accumulates a structured record of what is and is not answerable with the available evidence. The output is a handoff briefing: a structural map of the investigation's terrain, findings tagged by confidence, directions that have been foreclosed with evidence, and questions that remain open. The briefing is intended as input to a subsequent phase of investigation (human or AI), not as a final publication.
 
-The system implements a two-tier model architecture inspired by the division of labor observed in the [Knuth/Stappers/Claude collaboration](https://www-cs-faculty.stanford.edu/~knuth/papers/claude-cycles.pdf) and [analysed by Vishal Misra](https://medium.com/@vishalmisra/knuth-just-showed-us-where-to-put-the-human-013c0330ef0a) through the lens of Pearl's Causal Hierarchy. Cheap, fast models handle high-throughput pattern matching: writing code, scoring results, generating questions. A premium model provides strategic oversight every iteration, maintaining commitment to productive arcs, detecting when to pivot, naming the next direction, and preserving a narrative of *why* the exploration changed course. The goal is to approximate the role a human expert plays in guided AI exploration, without requiring one.
+Works with datasets (CSV, Excel, Parquet) or in computation-only mode for simulations, mathematical exploration, and numerical experiments.
+
+The system implements a three-rung division of labor inspired by the [Knuth/Stappers/Claude collaboration](https://www-cs-faculty.stanford.edu/~knuth/papers/claude-cycles.pdf) and [analysed by Vishal Misra](https://medium.com/@vishalmisra/knuth-just-showed-us-where-to-put-the-human-013c0330ef0a) through the lens of Pearl's Causal Hierarchy. Cheap, fast models handle high-throughput pattern matching. A premium model provides strategic oversight every iteration. A final premium-model pass renders the accumulated state into a handoff briefing. The role the system does *not* attempt to play is the Rung-3 counterfactual reasoning that would convert "provisional finding" into "proven construction" — that work remains for whoever picks up the briefing.
 
 ## Quick Start
 
@@ -21,7 +23,7 @@ python run.py data.csv "What factors drive churn?" \
     --premium-model anthropic:claude-opus-4-6 \
     --iterations 50
 
-# Run with a data dictionary (recommended for datasets with non-obvious semantics)
+# Run with a data dictionary (strongly recommended for domain-specific data)
 python run.py data.csv "What factors drive churn?" \
     --data-dictionary data_dictionary.md \
     --premium-model anthropic:claude-opus-4-6 \
@@ -35,163 +37,240 @@ python run.py "Simulate the evolution of cooperation using iterated Prisoner's D
     --iterations 50
 ```
 
+## What delv-e is (and isn't) for
+
+**delv-e is a hypothesis-search pre-filter.** It explores quickly, tries many angles, and accumulates a structured map of the analytical terrain: what's identifiable with the available evidence, what's blocked and by what mechanism, what's been foreclosed with diagnostics, what remains open. The handoff briefing is meant to be read by a downstream investigator who will take the work further.
+
+**delv-e is not a deliverable.** The briefing is not a report to publish. It is a structured hand-off that saves a downstream investigator from re-discovering foreclosed directions, lets them see where identifiability is blocked and why, and points them at the highest-value entry points. The investigator is expected to bring domain knowledge, theoretical framing, or additional data that delv-e does not have.
+
+A concrete shape of what this looks like in practice: on a multi-site dataset with per-site metadata, delv-e might discover that two variables of interest (say, a measurement-regime parameter and a site-level categorical attribute) are 1:1 confounded — each site has exactly one value of the attribute. It would foreclose several approaches that look natural (controlling for the attribute in a pooled regression, stratifying analyses by attribute) with specific diagnostics (VIF, coefficient reversals under fixed effects), and identify the one or two identification strategies that remain tractable given the data structure. It would not solve the underlying scientific question — that requires domain knowledge delv-e has no channel to receive, or data the run did not have access to. What the briefing does is save the next investigator from re-discovering the block, hand them the entry points, and make their first hour productive instead of exploratory.
+
 ## Design Philosophy
 
 When Claude Opus 4.6 solved an open combinatorics problem for Donald Knuth in March 2026, it didn't work alone. Filip Stappers coached the model through 31 explorations, forcing it to document progress, redirecting unproductive strategies, and maintaining the arc of the investigation across context losses. Knuth then proved why the construction works. Three participants, three distinct roles.
 
-Vishal Misra [framed this](https://medium.com/@vishalmisra/knuth-just-showed-us-where-to-put-the-human-013c0330ef0a) through Judea Pearl's Causal Hierarchy. Claude's contribution was **Rung 1**: extraordinary associative pattern matching within each exploration. Stappers' contribution was **Rung 2**: intervention, changing the tools, redirecting strategy, maintaining coherence across the model's context losses. Knuth's was **Rung 3**: counterfactual reasoning, proving the construction works for values never computed.
+Vishal Misra framed this through Pearl's Causal Hierarchy. Claude's contribution was **Rung 1**: extraordinary associative pattern matching within each exploration. Stappers' contribution was **Rung 2**: intervention, changing tools, redirecting strategy, maintaining coherence across context losses. Knuth's was **Rung 3**: counterfactual reasoning that proves the construction works for values never computed.
 
-delv-e attempts to replicate this division of labor without a human in the loop:
+delv-e implements Rungs 1 and 2 as an autonomous system and **deliberately stops short of Rung 3**, producing a briefing that a Rung-3 investigator can pick up:
 
-**Rung 1: cheap models at speed.** The code generator, evaluator, question generator, and research model updater are all fast, inexpensive models doing what LLMs do best: pattern matching, code writing, and structured summarization. They run 5-6 calls per iteration.
+**Rung 1: cheap models at speed.** Code generation, question generation, result evaluation, and research-model interpretation are handled by fast, inexpensive models doing what LLMs do best: pattern matching, code writing, structured summarization. They run 4-5 calls per iteration.
 
-**Rung 2: premium model as strategic overseer.** A stronger model runs a strategic review every iteration. It reads the full research model (including a Strategic Trajectory it exclusively maintains), recent result digests with analytical methods used, and the dataset profile. It decides whether to hold commitment on the current arc, pivot to a new direction, or abandon an exhausted line of inquiry. When it pivots, it names the specific next direction as a binding constraint that the question generator must follow. This is the Stappers role: maintaining the arc of the investigation with the authority to redirect.
+**Rung 2: premium model as strategic overseer.** A stronger model runs a strategic review every iteration. It reads the research model and the data profile, decides whether to hold commitment on the current arc, pivot to a new direction, or abandon an exhausted line. When it pivots, it names the specific next direction as a binding constraint that the question generator must follow. The premium model also maintains two structurally-protected sections of the research model that the cheap models cannot touch: the Strategic Trajectory (why pivots happened, what's committed) and the Structural Landscape (what's identifiable, what's blocked, what's foreclosed, what remains open). These sections accumulate across the run and become the primary source material for the final handoff briefing. This is the Stappers role: strategic coherence with override authority and a memory of what's been decided.
 
-The strategic review also identifies missed opportunities (columns or techniques the cheaper models have overlooked) and surfaces untested cross-finding connections through the trajectory. Its Strategic Trajectory section, a narrative record of why pivots happened and what the current commitment is, is structurally protected from corruption by the cheaper model that updates the rest of the research model.
+**Rung 2, final pass: briefing rendering.** When exploration ends, the premium model renders the accumulated research model into a handoff briefing with a fixed seven-section structure: scope, structural landscape, findings with STATUS tags, foreclosed directions, open questions, suggested entry points, methodological notes. This is *rendering*, not re-derivation — the structural content has been accumulated across the run, and the briefing's job is to present it cleanly to the downstream investigator rather than synthesize it from scratch.
 
-On any iteration, the strategic review assesses whether a **reframing probe** is warranted. This can happen on a pivot (suspicious null where the test may be wrong), on a hold (positive finding that could be reframed more sharply), or on an abandon (arc completing where distributional patterns in the raw numbers may have been missed). When the review flags PROBE_NEEDED, the premium model receives the full uncompressed analytical output from the last three analyses, and is asked: what pattern, threshold, or distributional feature in these numbers does the headline test not capture? If it finds an alternative framing, that becomes the binding direction for the next iteration. This mechanism exists because the reframings that produce the most valuable analytical insights typically emerge from looking at raw numbers with fresh eyes, not from reading compressed digests.
-
-When an original arc completes, a **perspective rotation** generates 2-3 fundamentally different analytical lenses on the same phenomenon, ranked from most to least promising. An arc that investigated "what factors cause outcome Y to decline" (mechanistic perspective) might spawn perspectives like "how frequently do positive vs negative events occur" (event counting) or "has the system's capacity to convert input into outcome changed" (efficiency analysis). These are not deeper investigations of the same kind but different kinds of questions about the same subject. The top-ranked perspective is automatically pursued for 1-2 iterations under normal commitment rules: if findings are strong, the system keeps pursuing; if weak, it abandons quickly and moves to the next planned arc. Perspective arcs do not spawn further rotations, preventing recursive proliferation. The remaining perspectives are discarded — the next arc completion generates fresh perspectives relevant to that arc. The mechanism addresses a structural blind spot: the system naturally deepens each topic through one analytical lens but never switches lenses unless forced to.
-
-**Rung 3: synthesis.** After all exploration iterations complete, the premium model generates a narrative synthesis report that integrates findings across the entire run, resolves contradictions, and draws conclusions about conditions not directly tested. The synthesis follows a tension-first narrative structure: a paradox-driven title, rejected alternative explanations, key findings ordered by causal logic with declarative section titles, cross-cutting patterns that unify multiple findings, open questions separated from methodological caveats, and a scannable stable/changing/declining summary. A post-synthesis visualization pass generates publication-quality charts for each key finding, adapted from the original analysis code that produced those findings to ensure the charts faithfully represent the methodology. The final output is a styled HTML report with clickable citation links to the original analyses, embedded charts, dark mode support, and PDF export.
-
-The key insight from the article: strategic coherence requires a capable model with full context and override authority, while high-throughput exploration is best handled by faster, cheaper models doing what they're good at. The fix for divergence is structural division of labor.
+**Rung 3 is deliberately absent.** The briefing does not attempt to prove, generalize beyond what was tested, or bring domain knowledge the system has no channel to receive. That work is the downstream investigator's job. The briefing is structured to make their first hour productive.
 
 ## How It Works
 
-Before the main loop, an **orientation phase** profiles the dataset's analytical landscape: column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. This produces a compact brief pinned into every agent's context for the entire run. When a data dictionary is provided via `--data-dictionary`, orientation also reads it as authoritative context for column semantics and known caveats, and emits a KEY CONSTRAINTS block at the top of the profile that propagates those constraints to all downstream agents (see [Data Dictionary](#data-dictionary) below). In computation-only mode, orientation is skipped — the system begins directly with seed decomposition.
+Before the main loop, an **orientation phase** (premium model) profiles the dataset's analytical landscape — column coverage, group sizes, confounders, power boundaries. Critically, orientation also produces an initial **Structural Landscape** block: identifiability constraints, coverage asymmetries, and any directions the structural diagnostics already foreclose. This seeds the research model's Structural Landscape section, which strategic review will extend as structural discoveries accumulate during exploration.
 
-Then a **seed decomposition** step (premium model) converts the user's research agenda into a focused first analysis and an initial Strategic Trajectory. A broad multi-part question becomes a specific first task with a logical sequence of investigation arcs scaled to the iteration budget.
+When a data dictionary is provided via `--data-dictionary`, orientation reads it as authoritative context and emits a KEY CONSTRAINTS block in the profile (see [Data Dictionary](#data-dictionary)).
+
+In computation-only mode, orientation is skipped — the system begins directly with seed decomposition.
+
+A **seed decomposition** step (premium model) converts the user's research agenda into a focused first analysis and an initial Strategic Trajectory.
 
 Each iteration:
 
-1. **Generate questions**: LLM proposes analytical questions guided by the research model and the Strategic Trajectory. When the strategic review has issued a HOLD, questions deepen the current arc. On PIVOT or ABANDON, a binding direction constraint focuses all questions on the new arc
-2. **Write & execute code**: code model writes Python, runs it against your DataFrame. A `pitfalls.txt` file of known API issues (scipy changes, pandas deprecations, type traps) is loaded fresh on every code generation call. Runtime error patterns (library-specific AttributeErrors) are recorded and injected into future prompts to prevent repeated failures
-3. **Evaluate results**: LLM scores parallel solutions, selects the best, and generates finding summaries
-4. **Update research model**: living document of hypotheses, findings, maturity tracking, cross-finding connections, and exploration health
-5. **Strategic review**: premium model reads the full research model, recent results, and data profile. Issues a commitment — HOLD, PIVOT, or ABANDON — with the authority to redirect the entire investigation. Can request a reframing probe or trigger a perspective rotation when an arc completes. Can signal EARLY_STOP when the investigation is genuinely complete (see Auto-Stop below)
+1. **Generate questions**: Cheap model proposes analytical questions guided by the research model. Questions that would re-try foreclosed directions are explicitly avoided; questions that would resolve open identifiability gaps are preferred.
+2. **Write & execute code**: Cheap code model writes Python, runs it against your DataFrame. A `pitfalls.txt` file of known API issues is loaded fresh on every call. Runtime error patterns are recorded and injected into future prompts to prevent repeated failures.
+3. **Evaluate results**: Cheap model scores parallel solutions, selects the best, and generates finding summaries. Clean foreclosures of blocked approaches (with specific diagnostics) are scored as high-value findings, not as failures.
+4. **Update research model**: Cheap model (Research Interpreter) rewrites the four RI-maintained sections of the research model. Established Findings are tagged with a STATUS prefix that the cheap model is responsible for maintaining across iterations as evidence accumulates.
+5. **Strategic review**: Premium model reads the full research model and recent results. Issues a commitment — HOLD, PIVOT, or ABANDON. Updates the Strategic Trajectory. When structural discoveries have accumulated since the last review, extends the Structural Landscape. When it judges a second look at raw results would be valuable, triggers a reframing probe.
 
-A live dashboard (`output/dashboard.html`) updates after each iteration. Open it in a browser to monitor progress, scores, findings, and exploration health in real time.
+A live dashboard (`output/dashboard.html`) updates after each iteration. Open it in a browser to monitor progress, scores, the accumulated structural map, and finding STATUS breakdown in real time.
 
 ![delv-e dashboard](assets/dashboard.png)
 
+### The Research Model
+
+The research model is the central shared state, read by every agent and updated every iteration. It has six sections:
+
+**RI-maintained (cheap model)**:
+
+- **Established Findings** (max 10): confirmed facts with `[STATUS]` prefix tags and quantitative anchors. Four STATUS tags, assigned and maintained by the RI:
+  - `[ESTABLISHED]` — survived multiple lines of analysis, confound-controlled where available
+  - `[PROVISIONAL]` — signal present but a specific identifiability or coverage gap remains
+  - `[SHRINKS]` — initially apparent effect deflated under controls; progression of estimates is reported
+  - `[CONTRADICTED]` — earlier finding reversed by a later analysis; both estimates cited
+- **Active Hypotheses** (max 4): testable claims the next analysis could strengthen or refute.
+- **Attention Flags**: findings where a later analysis produced a different direction or >30% magnitude change. Drives STATUS retagging.
+- **Exploration Health**: minimal — Breadth assessment (LOW/MEDIUM/HIGH) and an Unexplored list of column/variable groups not yet touched.
+
+**Opus-maintained (structurally protected from cheap-model corruption)**:
+
+- **Strategic Trajectory**: commitment state, arc history, what direction has highest expected value next. The premium model's strategic memory.
+- **Structural Landscape**: the investigation's terrain. Four sub-sections:
+  - *Identifiability* — what's separable from what, with diagnostic evidence
+  - *Coverage* — where the evidence thins
+  - *Foreclosed Directions* — approaches tried and ruled out, with DO-NOT operational guidance
+  - *Open Questions* — structural questions the investigation cannot resolve with available data
+
+Both protected sections use a save-before-RI / re-splice-after-RI pattern: before each RI call, they are extracted; after the RI rewrites the model, they are spliced back. The cheap model literally cannot corrupt them regardless of what it emits.
+
 ### Commitment System
 
-The strategic review issues one of three commitments every iteration. This commitment determines the character of the next iteration's questions and analyses:
+The strategic review issues one of three commitments every iteration:
 
 | Commitment | Meaning | Effect |
 |---|---|---|
-| **HOLD** | Current arc is productive | Deepen: questions target the same finding's next maturity stage |
-| **PIVOT** | New direction identified | Redirect: next_direction becomes binding constraint for question generation |
-| **ABANDON** | Current arc exhausted | Move on: system transitions to a new arc or the next planned direction |
+| **HOLD** | Current arc is productive | Deepen: questions drill into the same finding |
+| **PIVOT** | New direction identified | Redirect: next_direction becomes a binding constraint |
+| **ABANDON** | Current arc exhausted | Move on: system transitions to a new arc |
 
-The commitment is enforced structurally until the next strategic review changes it. Commitment control lives entirely in the premium model, preventing the oscillation that occurs when a cheap model pattern-matches "this looks like it needs breadth" one iteration and "this looks like it needs depth" the next.
+The commitment is enforced structurally until the next strategic review changes it. Commitment control lives entirely in the premium model, preventing the oscillation that occurs when a cheap model pattern-matches "needs breadth" one iteration and "needs depth" the next.
 
-The dashboard displays the commitment posture as a colored bar on each iteration: cyan for EXPLORING (first iteration of an arc), yellow for HOLD, green for PIVOT, red for ABANDON. Commitment history is recorded in the checkpoint for analysis.
+The dashboard displays commitment posture as a colored bar per iteration: cyan for EXPLORING, yellow for HOLD, green for PIVOT, red for ABANDON. Commitment history is recorded in the checkpoint.
 
-### Finding Maturity
+### Reframing Probe
 
-Significant findings (score 7+) are tracked through an analytical arc:
+On any iteration, the strategic review can request a **reframing probe** — a premium-model second look at the raw analytical output (not the compressed digest) from the last three analyses. The probe receives full uncompressed stdout and is asked: what pattern, threshold, or distributional feature does the headline test not capture? If it finds an alternative framing, that becomes the binding direction for the next iteration. This mechanism exists because the most valuable reframings typically come from reading raw numbers with fresh eyes, not from compressed digests.
 
-| Stage | What it means | Next step |
-|---|---|---|
-| **DETECTED** | Signal found, direction known | Quantify: rate, magnitude, significance |
-| **QUANTIFIED** | Effect size precisely established | Decompose: subgroups, percentiles, time periods |
-| **DECOMPOSED** | Distribution characterised | Regime-test: structural breaks, rolling windows |
-| **REGIME-TESTED** | Temporal stability checked | Connect: test interactions with other findings |
-| **COMPLETE** | Operationally interpretable | Graduate; eligible for cross-finding connections |
+Expected frequency: roughly 5-8 times per 100 iterations.
 
-The maturity tracker prevents premature abandonment. The system stays committed until the active finding reaches maturity or is contradicted.
+### Perspective Rotation
 
-### Cross-Finding Connections
-
-The strategic review (premium model) monitors untested interactions between established findings as part of its every-iteration assessment. When it identifies promising untested pairs, it surfaces them through two channels:
-
-- **NEXT AFTER COMMITMENT** in the Strategic Trajectory, queuing connection tests as the next investigation arc
-- **NEXT_DIRECTION** on pivot, making a specific connection test the binding constraint for the next arc
-
-Connection types the system looks for: compounding (do they amplify each other?), mediating (does one explain the other?), conditional (does one modify the other?), and contradicting (do they point in opposite directions?). Results are tracked in the research model and graduated to established findings when confirmed.
+When an original arc completes (ABANDON with ARC_COMPLETE), a **perspective rotation** generates 2-3 fundamentally different analytical lenses on the same phenomenon, ranked from most to least promising. An arc that investigated "what factors cause Y to decline" might spawn perspectives like "how frequently do positive vs negative events occur" or "has the system's capacity to convert input into outcome changed." The top-ranked perspective is automatically pursued for 1-2 iterations. Perspective arcs do not spawn further rotations. This mechanism addresses a structural blind spot: the system naturally deepens each topic through one lens but never switches lenses unless forced.
 
 ### Auto-Stop
 
-When `auto_stop=True`, the system can terminate before `max_iterations` when it determines the investigation is genuinely complete. Two independent signals trigger early termination (either is sufficient):
+When `--auto-stop` is enabled, the system can terminate before `max_iterations` on two signals:
 
-1. **Strategic review explicit request.** The premium model sets `EARLY_STOP: YES` when all finding maturity items are complete, no unexplored territory remains, and recent iterations have been unproductive. This requires all four conditions: no unexplored territory, all maturity items complete or stalled, 5+ consecutive ABANDONs, and the biggest gap requires external data.
+1. **Strategic review explicit request**: the premium model sets EARLY_STOP: YES when there is no unexplored territory, all major findings are tagged ESTABLISHED or resolved as SHRINKS/CONTRADICTED, the last 5+ iterations have been unproductive ABANDONs, and Structural Landscape open questions require external data.
+2. **Mechanical backstop**: 8 consecutive ABANDONs with mean score < 6.0 forces termination regardless of the review's recommendation.
 
-2. **Mechanical backstop.** If the last 8 consecutive commitments are ABANDON and the mean score during that streak is below 6.0, the system stops regardless of the strategic review's recommendation.
-
-Auto-stop never triggers before iteration 15, ensuring the investigation has time to establish findings before assessing completeness. When triggered, the system prints "Investigation complete — proceeding to synthesis" and falls through to the same post-loop sequence: synthesis generation, chart generation, HTML report, and final dashboard write.
+Never triggers before iteration 15. Default off — full iteration budget is always used unless explicitly opted in.
 
 ```bash
-# Enable auto-stop
 python run.py data.csv "Analyze trends" --iterations 100 --auto-stop
 ```
 
-Default is `auto_stop=False` — the full iteration budget is always used unless explicitly opted in.
-
 ### Data Dictionary
 
-When `--data-dictionary PATH` points to a markdown file, delv-e treats its contents as authoritative context for column meanings and known caveats. This matters whenever the schema alone cannot express everything an analyst needs to know — event-specific columns (a PB time that means marathon for some athletes and half-marathon for others), categorical values with non-obvious semantics (`location_status` being `ethiopia` / `abroad` / `no_gps` rather than a simple boolean), sparse columns with structured missingness (specific IDs having all-NaN rows by design), or derived columns that look numeric but carry constraints about comparability. Without a dictionary, the Question Generator will sometimes propose questions that violate these constraints — correlating event-heterogeneous PBs across athletes, or treating missingness as random when it is structured.
+When `--data-dictionary PATH` points to a markdown file, delv-e treats its contents as authoritative context for column meanings and known caveats. This matters whenever the schema alone cannot express everything an analyst needs to know — event-specific or entity-specific columns (a metric whose definition varies across subjects in ways the column name doesn't reveal), categorical values with non-obvious semantics, sparse columns with structured missingness, derived columns that carry constraints about comparability. Without a dictionary, the Question Generator will sometimes propose questions that violate these constraints.
 
-**The dictionary feeds orientation, not the Code Generator.** The architecture is single-channel: dictionary → orientation → profile → all downstream agents. Orientation reads the dictionary as authoritative input and is required to emit a **KEY CONSTRAINTS** block at the top of the profile, restating the dictionary's non-obvious rules as numbered guardrails with specifics preserved verbatim (exact IDs, column names, cutoffs, categorical values). Each constraint ends with a "→" practical action. This block is what every downstream agent sees — the dictionary itself is not pinned to the Code Generator, Question Generator, Evaluator, or Strategic Reviewer.
+**The dictionary feeds orientation, not the Code Generator.** Single-channel architecture: dictionary → orientation → profile → all downstream agents. Orientation is required to emit a KEY CONSTRAINTS block at the top of the profile, restating the dictionary's non-obvious rules as numbered guardrails with specifics preserved verbatim. Each constraint ends with a "→" practical action.
 
-This design keeps the architecture simple (one context channel, not two), avoids duplicating constraints across agents where they might drift out of sync, and makes orientation the single quality lever: if findings cite dictionary constraints correctly, the chain is working; if not, improving the orientation prompt fixes it everywhere at once.
+**File format**: a plain markdown file, read verbatim. Conventionally useful sections: a one-paragraph overview, a "Must-read constraints" list, a column reference organized by role, and any source-data quirks. Soft cap: 20 KB.
 
-**File format.** A plain markdown file. delv-e reads it verbatim — no preprocessing, no schema required — but conventionally useful sections include:
-
-- A one-paragraph overview of the dataset
-- A "Must-read constraints" section with numbered non-obvious rules (event-specificity, categorical value meanings, known NaN patterns, columns that look comparable but aren't)
-- A column reference organized by role (identifiers, time, metrics, derived, covariates)
-- Source-data quirks baked into the ETL
-
-Soft cap: 20 KB. If the file exceeds this, the tail is truncated with a warning; the orientation still runs. For most datasets, 2–4 KB is the right size — enough to capture the caveats a new analyst would need, short enough that the orientation can internalize and restate the key rules precisely.
+**When to use**: datasets with domain-specific semantics (clinical studies, sports science, financial instruments), event-heterogeneous comparability, categorical values encoding things beyond what names suggest, structured missingness. For generic datasets with self-explanatory columns, a dictionary adds little.
 
 ```bash
-# Use a data dictionary alongside the seed question
 python run.py data.csv "<question>" \
     --data-dictionary data_dictionary.md \
     --iterations 50 --auto-stop
 ```
 
-**Interaction with `--no-orientation`.** Orientation is normally the only consumer of the dictionary. If both `--data-dictionary` and `--no-orientation` are passed, the dictionary is passed through verbatim as the profile (with a one-line note) so its constraints still reach downstream agents. This is a fallback, not a recommended mode — orientation adds empirical grounding (coverage patterns, actual group sizes, observed confounds) that the dictionary alone cannot provide.
-
-**When to use a dictionary.** Datasets with domain-specific semantics (clinical studies, sports science, financial instruments, scientific instrumentation), datasets with event-heterogeneous comparability (per-athlete, per-patient, per-instrument metrics), datasets where categorical values encode something beyond what the names suggest, and datasets where column missingness is structured rather than random. For generic datasets where column names are self-explanatory and missingness is exchangeable, a dictionary adds little — the schema's types and sample values already convey the useful content.
-
 ### Literature Search
 
-When `--search-model` is provided with an Anthropic model, the system can search published literature and integrate findings into the research model. This prevents rediscovering established results and helps validate novel findings.
+When `--search-model` is provided with an Anthropic model, the system can search published literature and integrate findings into the research model. Prevents rediscovering established results; helps validate novel findings.
 
-**Pre-loop search** (computation-only mode): Before the first iteration, the system searches for established research on the seed question and integrates `[PUBLISHED]` findings into the research model. This fills the role that orientation plays for dataset mode — grounding the investigation in existing knowledge.
+**Pre-loop search** (computation-only mode): before the first iteration, searches for established research on the seed question and integrates `[PUBLISHED]` findings. Fills the role orientation plays for dataset mode — grounding the investigation.
 
-**Mid-stream search**: The strategic review can request a search at any iteration by outputting `SEARCH_NEEDED: <specific query>`. This typically happens when pivoting into an unfamiliar domain, when a surprising finding might already be established, or when nearing synthesis and top findings should be validated. Published findings are integrated into the research model with STATUS annotations (UNTESTED, CONFIRMED, or CONTRADICTED) relative to the system's own simulation results.
+**Mid-stream search**: the strategic review can request a search at any PIVOT or ABANDON iteration by outputting `SEARCH_NEEDED: <query>`. Typically fires when pivoting into an unfamiliar domain, when a surprising finding might already be established, or when nearing completion and top findings should be validated.
 
-Literature claims enter the research model as `[PUBLISHED]` entries alongside the system's own findings. They are treated as testable predictions, not assumptions — when simulation results contradict published claims, this is flagged as potentially novel rather than as an error.
+`[PUBLISHED]` entries are structurally protected from RI modification (like Strategic Trajectory and Structural Landscape). They enter as testable predictions, not assumptions — when simulation results contradict published claims, this is flagged as potentially novel rather than treated as error.
 
 ```bash
-# Enable search (must be an Anthropic model)
 python run.py "Simulate evolution of cooperation" \
     --search-model anthropic:claude-sonnet-4-6
-
-# Search with dataset (mid-stream only, no pre-loop)
-python run.py data.csv "Analyze trends" \
-    --search-model anthropic:claude-sonnet-4-6
-
-# Non-Anthropic search model — warning, search disabled
-python run.py "Simulate aging" --search-model ollama:qwen3
-# → "Search requires an Anthropic model. Search disabled for this run."
 ```
 
-Search adds ~$0.50-1.20 per 100-iteration run (8-12 searches at ~$0.05-0.10 each). Default is disabled — no cost unless explicitly opted in.
+Adds ~$0.50-1.20 per 100-iteration run. Default disabled.
 
 ### Error Patterns and Pitfalls
 
-The code generator benefits from two sources of error prevention:
+**Static pitfalls** (`pitfalls.txt`): user-maintained file of known code-generation traps. Loaded fresh on every code-generation call, so edits take effect mid-run without restart.
 
-**Static pitfalls** (`pitfalls.txt`): A user-maintained file of known code generation traps. Loaded fresh on every code generation call, so edits take effect mid-run without restart. Ships with 10 entries covering scipy API changes, pandas deprecations, stats gotchas, and type traps. Add your own as you discover patterns.
+**Runtime error patterns**: when code execution fails, library-specific errors (AttributeErrors, ImportErrors) are recorded and injected into all future code-generation prompts. Generic errors are filtered out.
 
-**Runtime error patterns**: When code execution fails, the system records library-specific errors (e.g., `AttributeError: module 'scipy.stats' has no attribute 'diptest'`) and injects them into all future code generation prompts. Only meaningful errors are kept — AttributeErrors on library-specific classes, plus all ModuleNotFoundError/ImportError. Generic errors (ndarray, DataFrame, NoneType) are filtered out.
+Both sources are appended to the code-generator's prompt to prevent errors recurring across iterations.
 
-Both sources are combined and appended to the code generator's prompt, preventing the same errors from recurring across iterations.
+## Output
+
+The primary deliverables are three handoff artefacts, with chain_id citations linking back to the individual analyses that produced each number:
+
+```
+output/
+├── briefing.md                 # Primary handoff — 7-section structured briefing
+├── briefing.html               # Styled HTML version with clickable citations
+├── findings_index.md           # All winning analyses with scores, methods, summaries
+├── findings_index.html         # Styled HTML version
+├── structural_map.md           # Structural Landscape (live-written during run)
+├── structural_map.html         # Styled HTML version
+├── synthesis_charts/           # Publication-quality charts per finding in §2
+│   ├── 01_first_finding_name.png
+│   └── ...
+├── research_model.md           # Final research model (all 6 sections)
+├── dashboard.html              # Live dashboard
+├── run_log.json                # Full log of every LLM call
+├── state.json                  # Checkpoint for --continue
+├── dataframe.parquet           # Preserved DataFrame (dataset mode)
+├── cost.txt                    # Cost breakdown by agent
+├── orientation/
+│   └── analysis.md             # Dataset analytical profile
+└── exploration/
+    ├── 01/
+    │   ├── _summary.md         # Iteration evaluation + commitment
+    │   └── 1773198695/
+    │       ├── analysis.md     # Question + code + output
+    │       ├── analysis.html   # Styled HTML with back-link to briefing
+    │       └── plot_001.png
+    └── ...
+```
+
+### The Briefing
+
+`briefing.md` follows a fixed seven-section structure:
+
+- **§0 Investigation Scope** — what was asked, what was available, what this briefing covers
+- **§1 Structural Landscape** — rendered from the research model's accumulated landscape: identifiability (often as a table), coverage asymmetries, available identification strategies, blocked approaches
+- **§2 Findings** — each as its own H3 block with STATUS tag, key numbers with citations, CONFOUND-STATUS, and NEXT actions. Ordered by substantive importance for the downstream investigator
+- **§3 Foreclosed Directions** — evidence-backed dead ends, each with a DO-NOT operational instruction
+- **§4 Open Questions** — things the investigation could not resolve with available evidence, each with BLOCKER and WOULD-RESOLVE-WITH
+- **§5 Suggested Entry Points** — ranked concrete starting directions for the next phase, with RATIONALE and FIRST STEP
+- **§6 Methodological Notes** — filtering, sample sizes, method-dependent results
+
+Every numerical claim includes a `[[chain_id]]` citation that becomes a clickable link in the HTML version, opening the original analysis with its code, output, and plots. Each analysis page has a "← Back to Briefing" link.
+
+`findings_index.md` is a complete one-line-per-analysis catalogue: score, iteration, chain_id, method, question, finding summary. `structural_map.md` is the Structural Landscape rendered as a standalone artefact — written live during the run, updated each time strategic review extends the landscape, so it's visible on the dashboard as it grows.
+
+Charts in `synthesis_charts/` are publication-quality matplotlib figures generated for each non-CONTRADICTED H3 finding in §2. Each chart is adapted from the original analysis code that produced the finding, ensuring the numbers on the chart match the numbers in the text.
+
+## Memory Architecture
+
+LLMs have no memory between calls. delv-e manages context through five layers:
+
+**Data Profile** produced by orientation. An analytical brief (capped at 12 KB, ~3K tokens) covering coverage, groups, confounders, and — critically — a KEY CONSTRAINTS block when a dictionary is provided and an initial Structural Landscape block that seeds the research model. Pinned into every agent's context for the entire run.
+
+**Research Model** — six sections, read by every agent, updated every iteration. Four sections maintained by the cheap Research Interpreter. Two sections (Strategic Trajectory, Structural Landscape) maintained exclusively by the premium strategic review and structurally protected from cheap-model corruption via extract-before / re-splice-after. The cheap model literally cannot corrupt them regardless of what it emits.
+
+**Insight Tree** — every analysis is a node with question, code, results, score, and summaries. Agents see a tiered view: recent entries with RI-curated key numbers, older entries compressed to one-sentence summaries. Nothing is deleted; the system manages visibility, not existence.
+
+**Q&A Pairs** — a summary-based format for the Code Generator: recent pairs (last 40) with finding summaries and chain IDs. Keeps tactical context present without overwhelming the prompt.
+
+**Full Results Store** — untruncated results from every analysis, never shown during exploration. Read only by the briefing generator, which receives top-10 winning analyses at full detail plus digest-only summaries for the remaining score-≥6 winners.
+
+### Context Budget for Cheap Agents
+
+The research model is the central shared state. Its shape was optimized in the November 2026 refactor to reduce cheap-model load: removed sections (Finding Maturity's 5-stage tracker, Cross-Finding Connections, Biggest Gap) that served the old narrative-synthesis path but added noise for cheap agents. The result is that cheap agents see less structural clutter and more actionable guidance (Structural Landscape's Foreclosed Directions list tells them what not to re-try; Open Questions list tells them what's valuable to resolve).
+
+## Cost
+
+| Configuration | ~Cost per 10 iterations |
+|---|---|
+| All Haiku | $0.50-1.50 |
+| Haiku agents + Opus code | $2-4 |
+| OpenRouter OSS (kimi/glm) | $0.50-1.00 |
+| All Ollama (local) | Free |
+| Ollama + Opus premium | ~$1.00 (orientation + strategic review + briefing) |
+
+The strategic review (premium model) runs every iteration but is lightweight — roughly 6K input tokens and 600 output tokens per call. Over 100 iterations this adds roughly $7 at Opus pricing. Briefing generation adds ~$0.50 and chart generation adds ~$0.50-0.80 (one premium-model call per non-CONTRADICTED H3 finding). Total premium model cost for a 100-iteration run is typically $8-10.
+
+A data dictionary adds negligible cost — it enters the prompt only during orientation (one call per run).
+
+Check `output/cost.txt` after each run for exact breakdown by agent.
 
 ## Usage
 
@@ -207,13 +286,13 @@ The dataset is optional. If the first argument is not a file path, it is treated
 | `--parallel N` | 2 | Parallel solutions per iteration |
 | `--output DIR` | output/ | Output directory |
 | `--continue` | | Resume from previous run's checkpoint |
-| `--no-orientation` | | Skip the orientation phase (data profiling) |
+| `--no-orientation` | | Skip the orientation phase |
 | `--auto-stop` | | Allow early termination when investigation is complete |
-| `--data-dictionary PATH` | none | Markdown file with column semantics and caveats; consumed by orientation (see [Data Dictionary](#data-dictionary)) |
-| `--agent-model` | anthropic:claude-haiku-4-5-20251001 | Model for agents (evaluator, QG, RI, selector) |
+| `--data-dictionary PATH` | none | Markdown file with column semantics and caveats |
+| `--agent-model` | anthropic:claude-haiku-4-5-20251001 | Cheap model for evaluator, QG, RI, selector |
 | `--code-model` | anthropic:claude-haiku-4-5-20251001 | Model for code generation |
-| `--premium-model` | same as code-model | Model for orientation, strategic review, and synthesis |
-| `--search-model` | disabled | Anthropic model for literature search (e.g. `anthropic:claude-sonnet-4-6`) |
+| `--premium-model` | same as code-model | Model for orientation, strategic review, briefing, seed decomposition |
+| `--search-model` | disabled | Anthropic model for literature search |
 
 ### Providers
 
@@ -226,24 +305,22 @@ Model format: `provider:model_name`
 | OpenRouter | `openrouter:moonshotai/kimi-k2.5` | `OPEN_ROUTER_API_KEY` |
 | Ollama | `ollama:qwen3:30b` | Local Ollama server |
 
-OpenRouter provides access to hundreds of models (DeepSeek, Qwen, Kimi, GLM, Gemini, Llama, etc.) via a single API key. See [openrouter.ai/models](https://openrouter.ai/models) for available models and pricing.
-
 ### Examples
 
 ```bash
 # All Haiku (cheapest cloud option)
 python run.py data.csv "Analyze trends" --iterations 15
 
-# Quick 3-iteration run, skip orientation
+# Quick 3-iteration scan, skip orientation
 python run.py data.csv "What's the class balance?" --iterations 3 --no-orientation
 
-# With a data dictionary for a domain-specific dataset
+# Domain-specific dataset with dictionary
 python run.py clinical_trial.csv "What predicts response to treatment?" \
     --data-dictionary trial_dictionary.md \
     --premium-model anthropic:claude-opus-4-6 \
     --iterations 50 --auto-stop
 
-# 100 iterations with auto-stop
+# Full 100-iteration run with auto-stop
 python run.py data.csv "What drives peak snowpack decline?" \
     --agent-model openrouter:moonshotai/kimi-k2.5 \
     --code-model openrouter:moonshotai/kimi-k2.5 \
@@ -269,20 +346,9 @@ python run.py "Simulate the evolution of cooperation using iterated Prisoner's D
 # Number theory exploration
 python run.py "Explore the distribution of twin prime gaps up to 10^8" \
     --iterations 50
-
-# Dynamical systems
-python run.py "Model predator-prey dynamics with 5 species and environmental shocks" \
-    --agent-model ollama:glm-5.1:cloud \
-    --code-model ollama:kimi-k2.5:cloud \
-    --premium-model anthropic:claude-opus-4-6 \
-    --iterations 100
-
-# Monte Carlo optimisation
-python run.py "Find optimal warehouse placement for 50 delivery points with stochastic demand" \
-    --iterations 30
 ```
 
-The intelligence loop — research model, strategic review, question generation, synthesis — works identically in both modes. The only difference is how each iteration's investigation step executes: against a dataset or as standalone computation.
+The intelligence loop — research model, strategic review, question generation, briefing rendering — works identically in both modes. The only difference is how each iteration's analysis step executes.
 
 ## Resuming Runs
 
@@ -290,117 +356,27 @@ Checkpoint saved after every iteration. Resume with `--continue`:
 
 ```bash
 # Initial run
-python run.py shoes.csv "Analyze shoe efficiency" --iterations 25
+python run.py data.csv "Analyze X" --iterations 25
 
 # Continue with a new direction (iterations are additive)
-python run.py shoes.csv "Pursue the cardiovascular paradox" --continue --iterations 30
+python run.py data.csv "Pursue the Y paradox" --continue --iterations 30
 ```
 
-The seed question on `--continue` becomes the first analysis in the resumed run. The DataFrame, research model, insight tree, commitment history, and all context are preserved. You can switch models between runs.
-
-## Output
-
-```
-output/
-├── dashboard.html               # Live dashboard with "View Report" button
-├── synthesis_report.md          # Final synthesis in markdown
-├── synthesis_report.html        # Styled HTML report with charts and citation links
-├── synthesis_charts/            # Publication-quality charts for key findings
-│   ├── 01_supply_retention_gap.png
-│   ├── 02_ne_wind_quadrupled.png
-│   └── ...
-├── research_model.md            # Hypotheses, findings, maturity, connections, gaps
-├── run_log.json                 # Full log of every LLM call
-├── state.json                   # Checkpoint for --continue
-├── dataframe.parquet            # Preserved DataFrame
-├── cost.txt                     # Cost breakdown by agent
-├── orientation/
-│   └── analysis.md              # Dataset analytical profile
-└── exploration/
-    ├── 01/
-    │   ├── _summary.md          # Iteration evaluation + commitment decision
-    │   └── 1773198695/
-    │       ├── analysis.md      # Question + code + output
-    │       ├── analysis.html    # Styled HTML with "← Back to Report" link
-    │       └── plot_001.png
-    ├── 02/
-    └── ...
-```
-
-### Synthesis Report
-
-The synthesis report is generated after all exploration iterations complete (or when auto-stop triggers). It produces three artifacts:
-
-**synthesis_report.md** — The raw markdown synthesis with `[[chain_id]]` citation markers.
-
-**synthesis_report.html** — A self-contained styled HTML report. Citation markers become clickable links to individual analysis pages showing the original code, output, and plots. Each analysis page has a "← Back to Report" link. The report includes a "← Dashboard" link at the top and an "⬇ Export PDF" button at the bottom. Dark mode supported via `prefers-color-scheme`.
-
-**synthesis_charts/** — One publication-quality matplotlib chart per key finding section. Charts are generated by the premium model, which receives the original analysis code that produced the finding and adapts it into a visualization. This ensures charts use the same filters, groupings, and calculations as the original analysis — numbers on the chart match numbers in the text. Charts are embedded inline in the HTML report.
-
-The dashboard shows a green "View Report" button when the run completes, linking directly to the HTML synthesis report.
-
-## Memory Architecture
-
-LLMs have no memory between calls. delv-e manages context through five layers:
-
-**Data Profile** produced by the orientation phase before iteration 1. An analytical brief (capped at 12 KB, ~3K tokens) covering column coverage, group sizes, confounders, power boundaries, derivable variables, and sparse-column artifacts. The orientation is aware of coverage-driven correlation artifacts (e.g., two sparse columns appearing correlated because they're both only recorded during the same operational period). When a data dictionary is provided via `--data-dictionary`, the profile also leads with a KEY CONSTRAINTS block carrying the dictionary's non-obvious rules forward verbatim. The complete profile is pinned into every agent's context for the entire run.
-
-**Insight Tree** where every analysis is a node with question, results, score, and summaries. Agents see a tiered view: recent entries with RI-curated key numbers (result_digest), older entries compressed to one-sentence summaries (finding_summary from the evaluator). Nothing is deleted. The system manages visibility, not existence. Non-winning solutions from parallel evaluation are stored as runner-ups for completeness but are not revisited.
-
-**Research Model**, a structured document updated after every iteration and read by every agent:
-- *Active Hypotheses* (max 4): testable claims the next analysis could change
-- *Established Findings* (max 10): confirmed facts with quantitative anchors
-- *Finding Maturity* (max 5): significant findings tracked through DETECTED, QUANTIFIED, DECOMPOSED, REGIME-TESTED, COMPLETE, each with a specific next analytical step
-- *Cross-Finding Connections* (max 5): tested and untested interactions between findings
-- *Attention Flags*: findings where later analyses produced contradictory results
-- *Biggest Gap*: the most important thing not yet investigated (flags when stuck)
-- *Exploration Health*: honest self-assessment of breadth, recent topic concentration, and unexplored territory. This section informs strategic direction: when the research model reports low breadth, the strategic review pivots to new territory
-- *Strategic Trajectory*: maintained exclusively by the premium model's strategic review. Records why pivots happened, what the current commitment is, and what direction has the highest expected value next. The cheap model updater is structurally prevented from modifying this section. The trajectory is extracted before each model update and re-spliced after, ensuring the premium model's strategic memory is never corrupted by the cheaper model
-
-**Q&A Pairs** where the Code Generator sees a summary-based format: recent pairs (last 40) with finding summaries and chain IDs, providing tactical context without overwhelming the prompt. The dataset column list is injected separately to help the code generator reference correct column names.
-
-**Full Results Store** holding untruncated results from every analysis, never shown to agents during exploration. Used only by the Synthesis Generator, which receives all active findings (score-weighted) plus the full research model. Orientation, seed decomposition, and synthesis use the premium model via `--premium-model`. The strategic review also uses the premium model on every iteration, reading the full research model, the data profile, and recent result digests (including analytical method used) to maintain strategic coherence. In a 100-iteration run the premium model accounts for ~115 calls (100 strategic reviews + orientation + seed decomposition + synthesis + ~5 reframing probes + ~8 perspective rotations + ~8 synthesis charts) while the remaining ~535 use cheaper models. The per-review cost is low (~6K input tokens, ~600 output tokens) because the review reads structured summaries, not raw results.
-
-### Context Management
-
-The system uses two schema modes: a full schema for the Code Generator, and a slim schema (column names, types, and unique counts only) for all other agents. For datasets with more than 50 columns, `head()` and `describe()` are omitted from the full schema. This reduces code generator input by up to 70% on wide datasets.
-
-The Question Generator uses a two-tier format for historical questions: the 30 most recent in full, older questions compressed to 120-character snippets. This keeps the QG informed of exploration history without unbounded prompt growth.
-
-The evaluator generates one-sentence summaries for all parallel solutions (not just the winner), giving every node in the insight tree an LLM-curated finding_summary. The Research Interpreter generates a 3-5 line result_digest of key numbers for winning nodes only.
-
-## Cost
-
-| Configuration | ~Cost per 10 iterations |
-|---|---|
-| All Haiku | $0.50-1.50 |
-| Haiku agents + Opus code | $2-4 |
-| OpenRouter OSS (kimi/glm) | $0.50-1.00 |
-| All Ollama (local) | Free |
-| Ollama + Opus premium | ~$1.00 (orientation + strategic review + synthesis) |
-
-The strategic review (premium model) runs every iteration but is lightweight, roughly 6K input tokens and 600 output tokens per call. Over 100 iterations this adds roughly $7 at Opus pricing. Synthesis generation adds ~$0.50 and synthesis chart generation adds ~$0.50-0.80 (one premium model call per key finding chart). Total premium model cost for a 100-iteration run is typically $8-10.
-
-A data dictionary adds negligible cost — it enters the prompt only during orientation (one call per run) and is not re-injected per iteration. Its constraints reach downstream agents via the KEY CONSTRAINTS block in the profile, which is the same data_profile pin that would exist without the dictionary.
-
-Check `output/cost.txt` after each run for exact breakdown by agent.
+The seed question on `--continue` becomes the first analysis in the resumed run. DataFrame, research model, insight tree, commitment history, and all context are preserved. You can switch models between runs. State format is versioned — older checkpoints (pre-v6, before the Structural Landscape refactor) are migrated automatically on load.
 
 ## Architecture
 
 ```
-run.py               CLI: dataset loading, --continue handling, --auto-stop flag,
-                     --data-dictionary loading
+run.py               CLI: dataset loading, --continue handling, --auto-stop, --data-dictionary
 engine.py            ExplorationEngine: LLM pipeline, code execution, orientation
-                     (with optional data dictionary injection)
-auto_explore.py      Core loop: commitment system, strategic review, perspective rotation,
-                     auto-stop, synthesis charts, research model management
-output.py            OutputManager: all rendering — terminal display, analysis markdown,
-                     iteration summaries, final outputs, synthesis HTML, PDF export
-dashboard.py         Live HTML dashboard with commitment bands, "View Report" button
+auto_explore.py      Core loop: commitment system, strategic review, Structural Landscape
+                     maintenance, research model management, briefing + artefact writing
+output.py            OutputManager: terminal display, analysis markdown, briefing HTML,
+                     findings_index HTML, structural_map HTML, PDF export
+dashboard.py         Live HTML dashboard with commitment bands, three-artefact buttons
 llm.py               Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama)
 executor.py          Local code execution with security guards and traceback filtering
-prompts.py           All prompt templates (agents, code gen, orientation, strategic review,
-                     synthesis narrative structure, synthesis charts)
+prompts.py           All prompt templates
 style.py             Terminal formatting: colored commitment bars, exploration tree, spinners
 pitfalls.txt         Static code generation hints (user-editable, live-reloaded)
 logger_config.py     Logging configuration
@@ -412,4 +388,4 @@ Generated code runs locally via `exec()`. A module blacklist blocks dangerous op
 
 ## Origin
 
-Standalone extraction of the auto-explore module from [BambooAI](https://github.com/pgalko/BambooAI). Core exploration logic preserved; web UI, database, billing, and multi-tenant routing replaced with minimal local equivalents.
+Standalone extraction of the auto-explore module from [BambooAI](https://github.com/pgalko/BambooAI). Core exploration logic preserved; web UI, database, billing, and multi-tenant routing replaced with minimal local equivalents. Substantially refactored in November 2026 to move from narrative-synthesis output to structured-briefing output, reflecting the system's role as a Rung-1+2 hypothesis-search pre-filter rather than an end-to-end analytical deliverable.
