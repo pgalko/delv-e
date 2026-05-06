@@ -2779,8 +2779,14 @@ class AutoExplorer:
 
             try:
                 with style.spinner(f"Charting: {title[:40]}"):
+                    # max_tokens=14000 keeps Opus chart generation under the
+                    # Anthropic SDK's 10-minute streaming threshold while
+                    # leaving ample headroom for a single chart's code
+                    # (typically 60–150 lines). Above ~21K, the SDK refuses
+                    # non-streaming submissions for slow models.
                     code, llm_response = self.engine._call_llm_for_code(
-                        messages, self.premium_model, agent="Synthesis Chart")
+                        messages, self.premium_model, agent="Synthesis Chart",
+                        max_tokens=14000)
                     if not code:
                         logger.info(f"Synthesis chart: no code for '{title[:50]}'")
                         continue

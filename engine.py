@@ -333,7 +333,7 @@ class ExplorationEngine:
         Streams through the output_manager (which handles silent mode).
         """
         model = model_override or self.models.get_model_name(agent)[0]
-        max_tokens = 24000 if agent == "Synthesis Generator" else 16000
+        max_tokens = 24000 if agent == "Synthesis Generator" else 20000
 
         response = self.llm_client.stream(
             messages=messages,
@@ -363,17 +363,25 @@ class ExplorationEngine:
         normal_model = self.models.get_model_name(agent)[0]
         return code_model if normal_model == agent_model else agent_model
 
-    def _call_llm_for_code(self, messages, model, agent="Code Generator"):
+    def _call_llm_for_code(self, messages, model, agent="Code Generator",
+                           max_tokens=20000):
         """Call LLM and extract code with retry + model fallback.
 
         Pattern: try → retry same model with nudge → fallback alternate model.
         Returns (code, llm_response) where code may be None if all attempts fail.
+
+        max_tokens defaults to 20000 (matches the rest of the engine). Callers
+        using premium models (Opus) for code generation should pass a smaller
+        value (≲14000) to stay under the Anthropic SDK's streaming threshold:
+        the SDK forces streaming for non-streaming requests it predicts will
+        exceed 10 minutes based on max_tokens × the model's tokens/sec. Cheap
+        models stay under that bound at 22K; Opus does not.
         """
         # Attempt 1: primary model
         try:
             llm_response = self.llm_client.call(
                 messages=messages, model=model,
-                max_tokens=16000, temperature=0, agent=agent,
+                max_tokens=max_tokens, temperature=0, agent=agent,
             )
         except Exception as e:
             logger.warning(f"Code gen LLM call failed ({agent}): {e}")
@@ -396,7 +404,7 @@ class ExplorationEngine:
         try:
             llm_response = self.llm_client.call(
                 messages=retry_messages, model=model,
-                max_tokens=16000, temperature=0, agent=agent,
+                max_tokens=max_tokens, temperature=0, agent=agent,
             )
         except Exception as e:
             logger.warning(f"Code gen retry failed ({agent}): {e}")
@@ -417,7 +425,7 @@ class ExplorationEngine:
             try:
                 llm_response = self.llm_client.call(
                     messages=messages, model=fallback_model,
-                    max_tokens=16000, temperature=0, agent=agent,
+                    max_tokens=max_tokens, temperature=0, agent=agent,
                 )
             except Exception as e:
                 logger.warning(f"Code gen fallback failed ({agent}): {e}")
@@ -553,7 +561,7 @@ class ExplorationEngine:
                 llm_response = self.llm_client.call(
                     messages=messages,
                     model=model,
-                    max_tokens=16000,
+                    max_tokens=20000,
                     temperature=0,
                     agent="Error Corrector",
                 )
@@ -734,7 +742,7 @@ class ExplorationEngine:
                     llm_response = self.llm_client.call(
                         messages=messages,
                         model=model,
-                        max_tokens=16000,
+                        max_tokens=20000,
                         temperature=0,
                         agent="Error Corrector",
                     )
