@@ -418,16 +418,13 @@ the broader claim. Do NOT keep refining a narrowed substrate when the narrowing
 itself is the problem.
 
 BUDGET. {remaining_iterations} iterations remain. When planned arcs are
-complete but budget remains, do NOT declare the investigation finished.
-Pursue: robustness checks on [PROVISIONAL]/[SHRINKS] findings; subgroup
-decomposition of aggregates; operational implications of [ESTABLISHED]
-findings (thresholds, breakpoints); bootstrap or permutation validation of
-top findings; untested columns from the profile; identifiability-closing
-work for entries in the Structural Landscape.
-
-PIVOT plans 1-2 perspective-rotation iterations after ARC_COMPLETE
-automatically — budget accordingly. Do NOT spend remaining budget on
-narrative synthesis; a dedicated briefing agent handles that.
+complete but budget remains, pursue: robustness checks on [PROVISIONAL]/
+[SHRINKS] findings; subgroup decomposition; operational implications of
+[ESTABLISHED] findings (thresholds, breakpoints); bootstrap validation;
+untested profile columns; identifiability-closing for Structural Landscape
+entries. PIVOT auto-plans 1-2 perspective-rotation iterations after
+ARC_COMPLETE — budget accordingly. Do NOT spend budget on narrative
+synthesis; the briefing agent handles that.
 
 HOLD when: pursued finding is advancing (scores stable/improving); finding
 not yet tested for identifiability or robustness; moderate scores during
@@ -597,7 +594,26 @@ PROBE_NEEDED: [YES / NO] — YES when raw analytical output deserves a second
       more operationally useful than what was tested.
   (d) IF TYPE=FULL: a recent result that may have stripped signal between
       the substrate's regimes by over-normalising on a matching axis.
-  Most iterations should be NO. Expect YES roughly 5-8 per 100 iterations.
+  (e) ADVERSARIAL: a recent score-8+ finding exhibits suspicion signals
+      that warrant an attack rather than an extension. Trigger when ANY:
+      R² > 0.95 on few parameter levels; non-monotonic / threshold /
+      tipping-point claim from <7 points; fitted critical value outside
+      sampled range; mechanism algebraically derivable from the model
+      spec (e.g., from substrate/data-generating process); language like
+      "universal", "novel mechanism", "robust" without an explicit
+      discriminator test having been run; bootstrap CI suspiciously tight
+      relative to number of independent runs/subjects/documents.
+      Adversarial probes should be rarer than reframings — expect ~3-5
+      per 100 iterations. Score-8+ findings without these signals do NOT
+      warrant an adversarial probe.
+  Most iterations should be NO. Expect YES roughly 8-12 per 100 iterations
+  total across all cases.
+PROBE_SUSPICION: [one-sentence statement | NONE]
+  REQUIRED when PROBE_NEEDED is YES with reason (e). Name the target
+  finding (chain_id) and the specific suspicion. Example:
+  "Finding [[ap_alpha_sweep]] reports β=0.43 universal exponent under a
+  pure 2-parameter power law; alternative functional forms (saturating,
+  shifted) were not compared." NONE for cases (a)-(d).
 ARC_COMPLETE: [YES / NO] — Only on ABANDON. YES when this arc produced
   established findings and reached a genuine conclusion.
 EARLY_STOP: [YES / NO] — YES ONLY when ALL true:
@@ -634,20 +650,16 @@ include UPDATED_CAUSAL_SUBSTRATE. Otherwise omit.]"""
     # ══════════════════════════════════════════════════
 
     reframing_probe = """You are reviewing the raw analytical output from a data exploration.
-The strategic review flagged this moment as one where a fresh look at the actual
-numbers could reveal something the standard analysis missed.
-
-Your job is NOT to rerun the analyses. It is to READ THE ACTUAL NUMBERS below and
-notice what the headline statistics missed: distributional shifts, variance changes,
-threshold effects, saturation patterns, period-to-period differences, outlier clustering, or any
-pattern that suggests an alternative framing would produce a sharper or more
-operationally useful finding.
+The strategic review flagged this moment for a fresh look. Two modes are
+possible — read the SUSPICION line below to determine which applies.
 
 **Original research agenda:** {seed_question}
 
 **Current arc:** {arc_summary}
 
 **Why a fresh look matters here:** {why_it_matters}
+
+**Adversarial suspicion (if any):** {probe_suspicion}
 
 **Causal Substrate (authored at orientation; the investigation's causal frame):**
 {causal_substrate}
@@ -656,54 +668,79 @@ operationally useful finding.
 
 {full_results}
 
+═══ MODE SELECTION ═══
+
+If the SUSPICION line above is NONE or empty: this is a REFRAMING probe.
+Your job is to read the actual numbers and notice what the headline tests
+missed: distributional shifts, variance changes, threshold effects,
+saturation, period-to-period differences, outlier clustering — patterns
+that suggest an alternative framing would be sharper or more operationally
+useful. Do NOT rerun analyses; reframe.
+
+If the SUSPICION line names a specific concern: this is an ADVERSARIAL
+probe. Your job is to attack the targeted finding, not to extend it.
+Pose a discriminator test that would either confirm the finding under
+genuine adversarial conditions OR demonstrate that the suspicion is
+correct. Prefer:
+- Alternative functional forms (fit competing curves; compare AICs).
+- Ablation of the claimed mechanism (remove the proposed causal element;
+  see if the pattern persists).
+- Fresh-seed or fresh-split replication.
+- Counterfactual parameterization (vary a parameter the original held fixed).
+- Matched controls or negative controls.
+Do NOT propose a question whose answer would merely add detail. The verdict
+must come from data, not from your reasoning. The next iteration runs the
+test you specify; its result is what either retains or shrinks the
+finding's status.
+
 ═══ YOUR TASK ═══
 
-Read the numbers above carefully. Then answer four questions (skip Q4 when the
-substrate is not TYPE=FULL):
+Read the numbers carefully. Then answer the four fields below (skip Q4
+when substrate is not TYPE=FULL):
 
-1. HIDDEN PATTERN: What pattern, threshold, regime change, or distributional feature
-   in these numbers does the headline test NOT capture? Look for: variance changes
-   across time periods, saturation/threshold effects in scatter relationships, clustering of
-   outliers in specific conditions, changes in distribution shape even if the mean
-   is stable, decompositions (e.g., counting observations above/below a threshold vs
-   testing a continuous mean), or operational thresholds where a relationship
-   changes character (e.g., an outcome variable flattening above a predictor threshold).
+1. HIDDEN PATTERN (reframing mode) / TARGETED CLAIM (adversarial mode):
+   Reframing: what pattern, threshold, regime change, or distributional
+   feature does the headline test NOT capture?
+   Adversarial: state precisely the claim being attacked, including the
+   specific numbers/exponents/thresholds and the supporting chain_id.
 
-2. ALTERNATIVE FRAMING: What specific metric, decomposition, or analytical approach
-   would produce a sharper or more operationally useful finding than what the
-   standard tests captured? Define the metric precisely enough that a code generator
-   can implement it (e.g., "count the number of observations per period where [metric] exceeds
-   [threshold] and test this count as a predictor of [outcome]").
+2. ALTERNATIVE FRAMING (reframing) / DISCRIMINATOR DESIGN (adversarial):
+   Reframing: what specific metric, decomposition, or analytical approach
+   would produce a sharper finding?
+   Adversarial: what specific test would either confirm or break the
+   claim? Define it precisely enough that a code generator can implement
+   it (e.g., "fit ESL = a + b·(α + d)^(−β) and compare AIC against the
+   2-parameter form ESL = c·α^(−β); declare PARAMETERIZATION-dependent
+   if ΔAIC > 10 in favor of the saturating form").
 
-3. NEXT QUESTION: Write one specific analytical question that the code generator
-   should tackle, using your alternative framing.
+3. NEXT QUESTION: Write one specific analytical question for the code
+   generator. In adversarial mode, the question must include the
+   discriminator's success/failure criteria explicitly so the next
+   iteration's RI can retag the finding (SHRINKS or CONTRADICTED) based
+   on the result.
 
 4. OVER-CONTROL CHECK (only if Causal Substrate TYPE=FULL):
    The Causal Substrate names regimes and matching axes. When an analysis
-   normalizes by, residualizes on, or controls for the matching axis at a
-   granularity that also removes the between-regime variation of interest,
-   the reported null may be an artifact of the control — the signal was
-   stripped, not absent.
-   Check the recent results against this pattern:
-   - Did the analysis apply a normalization (ratio, residual, z-score, percentile
-     within a grouping) that involved a variable named in the substrate's
-     LATENT CONFOUNDERS or MATCHING AXES?
-   - Did the normalization operate at a grouping level (e.g., within-session
-     when the substrate cares about between-session-context comparison) that
-     could remove the signal between the substrate's REGIMES?
-   If yes to both, emit OVER_CONTROL_RISK naming (a) the control that was applied
-   and (b) a specific alternative analysis without that control that would
-   preserve the between-regime signal. Otherwise say NONE.
+   normalizes by, residualizes on, or controls for the matching axis at
+   a granularity that also removes the between-regime variation of
+   interest, the reported null may be an artifact of the control.
+   Check the recent results: did the analysis apply a normalization
+   (ratio, residual, z-score, percentile within a grouping) involving a
+   variable named in the substrate's LATENT CONFOUNDERS or MATCHING AXES,
+   at a grouping level that could remove signal between REGIMES?
+   If yes, emit OVER_CONTROL_RISK naming (a) the control applied and
+   (b) a specific alternative analysis without that control. Otherwise
+   say NONE.
 
-If the null result is genuine and no alternative framing is warranted, say NONE for
-the first three fields. Do not force a finding.
+If the null is genuine and no reframing/discriminator is warranted,
+say NONE for the first three fields. Do not force a finding.
 
 ═══ RESPONSE FORMAT ═══
 
-HIDDEN_PATTERN: [what you noticed in the raw numbers, or NONE]
-ALTERNATIVE_FRAMING: [the specific metric/approach, or NONE]
+HIDDEN_PATTERN: [reframing: pattern noticed, or NONE | adversarial: targeted claim restated]
+ALTERNATIVE_FRAMING: [reframing: metric/approach, or NONE | adversarial: discriminator design]
 REFRAMING_DIRECTION: [the analytical question to pursue, or NONE]
-OVER_CONTROL_RISK: [specific control + alternative analysis, or NONE, or N/A if substrate is not FULL]"""
+OVER_CONTROL_RISK: [specific control + alternative, or NONE, or N/A if substrate not FULL]"""
 
 
     # ══════════════════════════════════════════════════

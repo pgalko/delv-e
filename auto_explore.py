@@ -84,6 +84,9 @@ class AutoExplorer:
         self._initial_trajectory = ""        # set by seed decomposition, consumed on iteration 0
         self.last_probe_iteration = 0        # tracks when last probe ran (observability)
         self.probe_history = []              # [(iteration, brief_result)] for dashboard
+        self._last_probe_suspicion = ""      # set by SR when probe is adversarial; consumed
+                                             # by the probe call at the next iteration; cleared
+                                             # implicitly on next SR (which re-emits or omits)
         self.completed_original_arcs = set() # arc directions that have been rotated (no recursion)
         self.rotation_history = []           # [(iteration, parent_arc, [{name, question}])] for dashboard
         self.arc_history = []                # [(start_iter, label)] for dashboard heatmap
@@ -134,6 +137,7 @@ class AutoExplorer:
         self._initial_trajectory = ""
         self.last_probe_iteration = 0
         self.probe_history = []
+        self._last_probe_suspicion = ""
         self.completed_original_arcs = set()
         self.rotation_history = []
         self.arc_history = []
@@ -1000,11 +1004,20 @@ class AutoExplorer:
             if nd_text and nd_text.upper() not in ('UNCHANGED', 'NONE', 'N/A'):
                 next_direction = nd_text[:500]  # cap length
 
-        # ── Parse PROBE_NEEDED ──
+        # ── Parse PROBE_NEEDED + PROBE_SUSPICION ──
+        # PROBE_SUSPICION is set when SR triggers an adversarial probe
+        # (case (e) in PROBE_NEEDED). It's a one-sentence statement naming
+        # the target finding's chain_id and the specific suspicion. Empty
+        # for non-adversarial probes (cases a-d) and for PROBE_NEEDED: NO.
         probe_needed = False
         if 'PROBE_NEEDED:' in response.upper():
             probe_line = response.upper().split('PROBE_NEEDED:')[1].split('\n')[0].strip()
             probe_needed = 'YES' in probe_line
+        self._last_probe_suspicion = ""
+        if 'PROBE_SUSPICION:' in response:
+            ps_text = response.split('PROBE_SUSPICION:')[1].split('\n')[0].strip()
+            if ps_text and ps_text.upper() not in ('NONE', 'N/A', ''):
+                self._last_probe_suspicion = ps_text[:500]
 
         # ── Parse ARC_COMPLETE ──
         arc_complete = False
@@ -1728,7 +1741,11 @@ class AutoExplorer:
             why_it_matters=why_it_matters,
             full_results=full_results,
             causal_substrate=substrate,
+            probe_suspicion=self._last_probe_suspicion if self._last_probe_suspicion else "NONE",
         )
+
+        if self._last_probe_suspicion:
+            logger.info(f"Adversarial probe firing: {self._last_probe_suspicion[:120]}")
 
         messages = [{"role": "user", "content": prompt}]
         response = self._call_agent_with_retry(
