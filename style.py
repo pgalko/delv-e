@@ -48,18 +48,53 @@ def gray(t):       return f"{GRAY}{t}{RESET}"
 
 _BRAILLE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+# Per-thread flag set by OutputManager when a thread is running with output
+# buffering active (parallel question processing). When set, style.spinner
+# becomes a no-op on that thread: the animated `\r`-overwrites it does would
+# fight with other workers' animations on the same terminal, and the buffered
+# output channel doesn't preserve cursor control sequences anyway. The thread
+# instead emits no progress display; the calling code shows a single combined
+# spinner at the outer level.
+_quiet_state = threading.local()
+
+
+def set_quiet_mode(quiet):
+    """Suppress style.spinner animation on the calling thread.
+
+    Called by OutputManager.begin_buffer / end_buffer to mark a thread as
+    running under per-thread output buffering. While set, style.spinner
+    skips its animation thread and prints nothing on enter/exit.
+
+    Per-thread (threading.local) — does not affect other threads.
+    """
+    _quiet_state.quiet = bool(quiet)
+
+
+def is_quiet_mode():
+    """Return True if spinners should be suppressed on the calling thread."""
+    return getattr(_quiet_state, 'quiet', False)
+
 class spinner:
     """Animated spinner as context manager. Shows progress during silent LLM calls.
 
     Usage:
         with style.spinner("Evaluating results"):
             result = slow_llm_call()
+
+    Thread-aware: when the calling thread has quiet mode set (via
+    style.set_quiet_mode(True), used by OutputManager when buffering output
+    for parallel question processing), the spinner becomes a no-op. This
+    prevents multiple workers from clobbering each other's `\r`-overwritten
+    animation on the same terminal line. The caller in that case is
+    expected to show a single combined progress indicator at the outer
+    level.
     """
 
     def __init__(self, label):
         self.label = label
         self._stop = threading.Event()
         self._thread = None
+        self._suppressed = False
 
     def _spin(self):
         i = 0
@@ -74,11 +109,19 @@ class spinner:
         sys.stdout.flush()
 
     def __enter__(self):
+        if is_quiet_mode():
+            # Suppressed: no animation, no checkmark on exit. The caller
+            # is running under per-thread buffering and will surface progress
+            # via a single outer spinner instead.
+            self._suppressed = True
+            return self
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._suppressed:
+            return False
         self._stop.set()
         self._thread.join()
         return False

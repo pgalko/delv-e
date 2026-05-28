@@ -29,9 +29,11 @@ Key mechanisms:
     arc. Perspective arcs do not trigger further rotations.
 """
 
+import concurrent.futures
 import json
 import os
 import re
+import sys
 import time
 import traceback
 
@@ -2035,6 +2037,84 @@ class AutoExplorer:
         return focused_question, initial_trajectory
 
     # ══════════════════════════════════════════════
+    # PARALLEL QUESTION WORKER
+    # ══════════════════════════════════════════════
+
+    def _run_question_buffered(self, question, chain_id, image, q_idx, total):
+        """Worker function for parallel question processing.
+
+        Runs in a ThreadPoolExecutor worker. Sets up per-thread output
+        buffering before calling _process_question, so all terminal writes
+        (the [Code Generator] header line, the result box, the file_ref
+        line, error messages) accumulate in a thread-local list instead of
+        racing with other workers on stdout. The accumulated text is
+        returned to the caller, which flushes buffers in q_idx order after
+        all workers complete.
+
+        Side effects on shared state:
+          - message_manager.qa_pairs / .full_results_store / .all_questions:
+            via _process_question -> append_qa_pair (lock-protected)
+          - message_manager.error_patterns: via record_error_pattern
+            (lock-protected, only when a retry succeeded)
+          - llm_client.cost_tracker / .run_logger: via the LLM calls
+            (lock-protected in Step 1)
+
+        Catches exceptions from _process_question internally so the caller's
+        future.result() doesn't raise — failed questions return a
+        well-formed result dict with results=None and error populated.
+
+        Returns:
+            (result_dict, buffered_text, error_occurred) where
+            - result_dict is the dict returned by _process_question (or a
+              skeleton on exception)
+            - buffered_text is the captured stdout of this worker as a
+              single string, ready to be written to sys.stdout in order
+            - error_occurred is True if _process_question raised
+        """
+        om = self.engine.output_manager
+        om.begin_buffer()
+
+        error_occurred = False
+        result = None
+        try:
+            # Question header lives inside the buffer so the whole block
+            # (header → body → file ref) flushes atomically. If we printed
+            # the header outside the buffer (i.e. before submit), all
+            # headers would appear up-front and then be separated from
+            # their bodies by 30+ lines of other questions' output.
+            om.print_wrapper("")
+            om.print_wrapper(
+                style.question_display(q_idx + 1, total, "", question)
+            )
+
+            try:
+                result = self.engine._process_question(
+                    question,
+                    chain_id=chain_id,
+                    image=image,
+                )
+            except Exception as e:
+                error_occurred = True
+                logger.warning(
+                    f"Execution error in worker (q_idx={q_idx}): "
+                    f"{e}\n{traceback.format_exc()}"
+                )
+                om.display_error(
+                    f"Execution error: {e}", chain_id=chain_id
+                )
+                result = {
+                    'results': None,
+                    'code': None,
+                    'last_plan': None,
+                    'plots': [],
+                    'error': str(e),
+                }
+        finally:
+            buffered_text = om.end_buffer()
+
+        return result, buffered_text, error_occurred
+
+    # ══════════════════════════════════════════════
     # MAIN RUN LOOP
     # ══════════════════════════════════════════════
 
@@ -2260,38 +2340,139 @@ class AutoExplorer:
                 print(style.iteration_bar(iteration + 1, max_iterations, posture))
 
                 # ── PROCESS QUESTIONS ──
-                solutions_data = []
+                # Step 2 of the parallelisation refactor: the per-question
+                # loop becomes a ThreadPoolExecutor when there's more than
+                # one question to process. Each worker runs under per-thread
+                # output buffering (set up by _run_question_buffered) so
+                # concurrent terminal writes don't interleave. After all
+                # workers complete, the buffered blocks are flushed to stdout
+                # in question-index order — visually identical to the
+                # sequential layout, just with one combined wait instead of
+                # N sequential waits.
+                #
+                # Iteration 0's single seed question keeps the inline path:
+                # no pool, no buffering, live spinners. The pool only kicks
+                # in from iteration 1 onwards where 2-3 questions run in
+                # parallel.
+                #
+                # _arc_reference_code is per-iteration (set above by strategic
+                # review on score-8+ wins) and read-only during the question
+                # phase, so we set it once before workers fire.
+                n_questions = len(questions_to_process)
+                solutions_data = [None] * n_questions
+                self.engine._arc_reference_code = self._arc_reference_code
 
-                for q_idx, question in enumerate(questions_to_process):
-                    if self.kill_signal:
-                        break
+                # Pre-allocate chain_ids: one timestamp per iteration's batch,
+                # offset by q_idx. Ensures uniqueness across parallel workers
+                # within an iteration.
+                base_ts = int(time.time())
+                chain_ids = [base_ts + q_idx for q_idx in range(n_questions)]
 
-                    self.chain_id = int(time.time()) + q_idx
-                    solution_chain_id = self.chain_id
-
+                if n_questions == 1:
+                    # ── Single-question (seed) path — inline, live spinners ──
+                    question = questions_to_process[0]
                     print()
-                    print(style.question_display(q_idx + 1, len(questions_to_process), "", question))
+                    print(style.question_display(1, 1, "", question))
 
                     error_occurred = False
                     try:
-                        self.engine._arc_reference_code = self._arc_reference_code
-                        self.engine._process_question(question, current_image if q_idx == 0 else None, None, None)
+                        result = self.engine._process_question(
+                            question,
+                            chain_id=chain_ids[0],
+                            image=current_image,
+                        )
                     except Exception as e:
                         error_occurred = True
                         logger.warning(f"Execution error: {e}")
-                        self.engine.output_manager.display_error(f"Execution error: {e}", chain_id=self.chain_id)
+                        self.engine.output_manager.display_error(
+                            f"Execution error: {e}", chain_id=chain_ids[0])
+                        result = {
+                            'results': None, 'code': None, 'last_plan': None,
+                            'plots': [], 'error': str(e),
+                        }
 
-                    solutions_data.append({
+                    solutions_data[0] = {
                         'question': question,
-                        'results': self.engine.message_manager.code_exec_results,
-                        'code': self.engine.message_manager.last_code,
-                        'text_answer': self.engine.message_manager.last_plan,
-                        'chain_id': solution_chain_id,
+                        'results': result.get('results'),
+                        'code': result.get('code'),
+                        'text_answer': result.get('last_plan'),
+                        'chain_id': chain_ids[0],
                         'error_occurred': error_occurred,
-                    })
+                    }
+                else:
+                    # ── Multi-question path — parallel workers with buffered output ──
+                    buffers = [None] * n_questions
+                    label = (f"Processing {n_questions} questions in parallel "
+                             f"({self.engine.models.code_model.split(':', 1)[-1][:24]})")
 
-                    self.engine.message_manager.reset_non_cumul_messages()
-                    time.sleep(1)
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=n_questions,
+                            thread_name_prefix='qworker',
+                    ) as ex:
+                        futures = {}
+                        for q_idx in range(n_questions):
+                            if self.kill_signal:
+                                break
+                            futures[q_idx] = ex.submit(
+                                self._run_question_buffered,
+                                questions_to_process[q_idx],
+                                chain_ids[q_idx],
+                                # Only the first question gets the image —
+                                # matches the pre-refactor behaviour.
+                                current_image if q_idx == 0 else None,
+                                q_idx,
+                                n_questions,
+                            )
+
+                        # One combined spinner spans the entire parallel
+                        # wait. We collect results in submission order
+                        # (sorted q_idx), so .result() blocks naturally
+                        # serve as a barrier — by the time we exit this
+                        # loop, all workers are done.
+                        with style.spinner(label):
+                            for q_idx in sorted(futures):
+                                try:
+                                    result, buffered_text, worker_error = \
+                                        futures[q_idx].result()
+                                except Exception as e:
+                                    # _run_question_buffered catches its own
+                                    # exceptions, so a raise here means the
+                                    # wrapper itself failed. Degenerate.
+                                    logger.warning(
+                                        f"Worker for q_idx={q_idx} raised "
+                                        f"unhandled: {e}\n{traceback.format_exc()}"
+                                    )
+                                    result = {
+                                        'results': None, 'code': None,
+                                        'last_plan': None, 'plots': [],
+                                        'error': str(e),
+                                    }
+                                    buffered_text = ''
+                                    worker_error = True
+
+                                buffers[q_idx] = buffered_text
+                                solutions_data[q_idx] = {
+                                    'question': questions_to_process[q_idx],
+                                    'results': result.get('results'),
+                                    'code': result.get('code'),
+                                    'text_answer': result.get('last_plan'),
+                                    'chain_id': chain_ids[q_idx],
+                                    'error_occurred': worker_error,
+                                }
+
+                    # Outer spinner has exited (cleared its \r-overwritten
+                    # line and emitted its checkmark line). Now safe to
+                    # flush each question's buffered block to stdout in
+                    # order. This is where the user actually sees the
+                    # per-question output for the iteration.
+                    for buf in buffers:
+                        if buf:
+                            sys.stdout.write(buf)
+                    sys.stdout.flush()
+
+                # Drop any None slots (kill_signal raced mid-submit on the
+                # parallel path) so downstream code sees a clean list.
+                solutions_data = [s for s in solutions_data if s is not None]
 
                 self.chain_id = int(time.time())
                 supporting_chain_id = self.chain_id

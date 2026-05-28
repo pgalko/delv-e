@@ -13,10 +13,31 @@ import glob
 import os
 import re
 import sys
+import threading
 
 import style
 from logger_config import get_logger
 logger = get_logger(__name__)
+
+
+# Per-thread output buffer. When a thread calls OutputManager.begin_buffer(),
+# its `print_wrapper` writes accumulate here instead of going to stdout. The
+# main thread later retrieves the accumulated text via end_buffer() and flushes
+# the buffers in deterministic order. Used by the parallel question loop in
+# auto_explore.AutoExplorer.run to keep N concurrent workers' terminal output
+# from interleaving on stdout.
+#
+# Distinct from silent_mode (a per-OutputManager flag used elsewhere to mute
+# LLM token streaming during cheap-agent calls) — silent_mode is global to
+# the manager, this is per-thread. The two mechanisms coexist: silent_mode
+# wins if both are active, since silent_mode means "don't show this at all"
+# whereas buffering means "show this later, in order".
+_per_thread_buffer = threading.local()
+
+
+def _active_buffer():
+    """Return the calling thread's active output buffer (list), or None."""
+    return getattr(_per_thread_buffer, 'buffer', None)
 
 
 class OutputManager:
@@ -24,6 +45,41 @@ class OutputManager:
         self.output_dir = output_dir
         self.silent_mode = False
         self._captured_output = []
+
+    # ──────────────────────────────────────────────
+    # Per-thread output buffering (parallel question processing)
+    # ──────────────────────────────────────────────
+
+    def begin_buffer(self):
+        """Activate per-thread output buffering for the calling thread.
+
+        After this call, every print_wrapper invocation on this thread writes
+        to a thread-local list instead of stdout. The accumulated output is
+        retrieved via end_buffer(). Also sets style quiet mode on the thread,
+        so style.spinner becomes a no-op and avoids fighting other workers
+        over terminal cursor positioning.
+
+        Idempotent in practice — calling twice on the same thread without an
+        intervening end_buffer simply re-initialises the buffer (any
+        previously-buffered content is dropped). The two-step
+        begin_buffer / end_buffer pattern is intended to bracket exactly one
+        unit of work.
+        """
+        _per_thread_buffer.buffer = []
+        style.set_quiet_mode(True)
+
+    def end_buffer(self):
+        """Deactivate buffering on the calling thread and return what was buffered.
+
+        Returns the accumulated output as a single string. After this call,
+        print_wrapper resumes writing to stdout for this thread. Always
+        pair with a preceding begin_buffer() — calling end_buffer() without
+        an active buffer returns the empty string.
+        """
+        buf = getattr(_per_thread_buffer, 'buffer', None)
+        _per_thread_buffer.buffer = None
+        style.set_quiet_mode(False)
+        return ''.join(buf) if buf else ''
 
     # ──────────────────────────────────────────────
     # Terminal display
@@ -36,28 +92,64 @@ class OutputManager:
             if end:
                 self._captured_output.append(end)
             return
+        # Per-thread buffering: parallel workers route their output here.
+        # The main thread flushes the buffers in deterministic order after
+        # all workers complete.
+        buf = _active_buffer()
+        if buf is not None:
+            buf.append(message)
+            if end:
+                buf.append(end)
+            return
         print(message, end=end, flush=flush)
 
     def display_system_messages(self, message, chain_id=None):
         if self.silent_mode:
             return
-        print(f"  {style.DIM}{message}{style.RESET}")
+        line = f"  {style.DIM}{message}{style.RESET}"
+        buf = _active_buffer()
+        if buf is not None:
+            buf.append(line)
+            buf.append("\n")
+            return
+        print(line)
 
     def display_tool_start(self, agent_name, model, chain_id=None):
         if self.silent_mode:
             return
-        print(style.agent(agent_name, model))
+        line = style.agent(agent_name, model)
+        buf = _active_buffer()
+        if buf is not None:
+            buf.append(line)
+            buf.append("\n")
+            return
+        print(line)
 
     def display_results(self, chain_id=None, **kwargs):
         if self.silent_mode:
             return
         if 'answer' in kwargs and kwargs['answer']:
+            buf = _active_buffer()
+            if buf is not None:
+                buf.append(str(kwargs['answer']))
+                buf.append("\n")
+                return
             print(kwargs['answer'])
 
     def display_error(self, error, chain_id=None):
         if self.silent_mode:
             return
-        print(style.error_msg(str(error)[:200]), file=sys.stderr)
+        line = style.error_msg(str(error)[:200])
+        # In buffered mode the error message belongs inside this question's
+        # output block (so the user sees it next to the question that
+        # produced it, when the buffer flushes). Outside buffered mode it
+        # still goes to stderr as before.
+        buf = _active_buffer()
+        if buf is not None:
+            buf.append(line)
+            buf.append("\n")
+            return
+        print(line, file=sys.stderr)
 
     def display_tool_info(self, action, action_input, chain_id=None):
         if self.silent_mode:

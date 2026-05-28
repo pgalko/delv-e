@@ -46,6 +46,16 @@ class SimpleMessageManager:
     """
     Minimal message manager. Stores code execution results and QA pairs.
     No conversation history — context comes from QA pairs + research model.
+
+    Thread-safe for the cumulative accumulators (qa_pairs, all_questions,
+    full_results_store, error_patterns). Mutating methods take a lock so
+    parallel question processing threads can append concurrently without
+    losing entries or corrupting the dedup pass.
+
+    The legacy single-slot attributes (code_exec_results, last_code,
+    last_plan) are retained for backward compat but are no longer the
+    primary output channel of _process_question — which now returns its
+    results directly. Nothing in the parallel path writes them.
     """
 
     def __init__(self):
@@ -63,6 +73,9 @@ class SimpleMessageManager:
         self.select_analyst_messages = [{"content": ""}]
         # Error patterns from successfully-corrected code — prevents repeat failures
         self.error_patterns = []
+        # Guards mutations of qa_pairs / all_questions / full_results_store
+        # / error_patterns when called from parallel threads.
+        self._lock = threading.Lock()
 
     def reset_non_cumul_messages(self):
         self.code_exec_results = None
@@ -70,15 +83,16 @@ class SimpleMessageManager:
         self.last_plan = None
 
     def append_qa_pair(self, question, result, chain_id=None):
-        self.qa_pairs.append({
-            "question": question,
-            "result": result,
-            "chain_id": chain_id,
-        })
-        self.all_questions.append(question)
-        # Store full untruncated result for synthesis
-        if chain_id and result:
-            self.full_results_store[str(chain_id)] = result
+        with self._lock:
+            self.qa_pairs.append({
+                "question": question,
+                "result": result,
+                "chain_id": chain_id,
+            })
+            self.all_questions.append(question)
+            # Store full untruncated result for synthesis
+            if chain_id and result:
+                self.full_results_store[str(chain_id)] = result
 
     def update_finding_summary(self, chain_id, summary):
         """Enrich a qa_pair with its evaluator-generated finding summary.
@@ -148,6 +162,9 @@ class SimpleMessageManager:
         Skips context-dependent errors (wrong type passed to a method,
         KeyError on column names, generic type mismatches) — these would
         confuse the CG in later iterations where the context differs.
+
+        Thread-safe: the dedup-then-append sequence runs under the lock so
+        two concurrent threads recording the same error don't both add it.
         """
         if not error_text:
             return
@@ -172,13 +189,14 @@ class SimpleMessageManager:
         if not (is_module_error or is_useful_attr_error):
             return
 
-        # Deduplicate
-        for existing in self.error_patterns:
-            if existing == error_line:
-                return
-        self.error_patterns.append(error_line)
-        if len(self.error_patterns) > 15:
-            self.error_patterns = self.error_patterns[-15:]
+        with self._lock:
+            # Deduplicate
+            for existing in self.error_patterns:
+                if existing == error_line:
+                    return
+            self.error_patterns.append(error_line)
+            if len(self.error_patterns) > 15:
+                self.error_patterns = self.error_patterns[-15:]
 
     def format_error_patterns(self, static_hints=None):
         """Format known pitfalls for CG context.
@@ -364,7 +382,7 @@ class ExplorationEngine:
         return code_model if normal_model == agent_model else agent_model
 
     def _call_llm_for_code(self, messages, model, agent="Code Generator",
-                           max_tokens=20000):
+                           max_tokens=20000, chain_id=None):
         """Call LLM and extract code with retry + model fallback.
 
         Pattern: try → retry same model with nudge → fallback alternate model.
@@ -376,7 +394,16 @@ class ExplorationEngine:
         the SDK forces streaming for non-streaming requests it predicts will
         exceed 10 minutes based on max_tokens × the model's tokens/sec. Cheap
         models stay under that bound at 22K; Opus does not.
+
+        chain_id: passed through to output_manager for any status lines
+        printed during fallback. Falls back to self.chain_id when not given,
+        preserving backward compat for callers that haven't been updated to
+        thread chain_id through (e.g. run_orientation).
         """
+        # Resolve chain_id once. self.chain_id is a singleton on the engine
+        # and not parallel-safe; the parameter is the way forward.
+        cid = chain_id if chain_id is not None else self.chain_id
+
         # Attempt 1: primary model
         try:
             llm_response = self.llm_client.call(
@@ -420,7 +447,7 @@ class ExplorationEngine:
             logger.info(f"Code gen falling back to {fallback_model}")
             self.output_manager.print_wrapper(
                 style.error_msg(f"Retrying with fallback model..."),
-                chain_id=self.chain_id,
+                chain_id=cid,
             )
             try:
                 llm_response = self.llm_client.call(
@@ -438,11 +465,47 @@ class ExplorationEngine:
     # _process_question (called by auto_explore per iteration)
     # ──────────────────────────────────────────────
 
-    def _process_question(self, question, image=None, user_code=None, replay=None):
+    def _process_question(self, question, chain_id=None, image=None,
+                          user_code=None, replay=None):
         """
-        Simplified pipeline: question → code gen → exec → store results.
+        Simplified pipeline: question → code gen → exec → return results.
         Code generation runs silently. Only results and status are shown.
+
+        Returns a dict:
+            {
+                'results':   stdout string from execution, or an error message
+                             string when execution failed
+                'code':      the generated Python code (may be empty on
+                             code-gen failure)
+                'last_plan': legacy field, always None — kept for caller
+                             backward compat
+                'plots':     list of saved plot file paths
+                'error':     None on success, otherwise the execution error
+                             text (after the final retry)
+            }
+
+        Parameters:
+            chain_id: unique identifier for this question's outputs (used in
+                terminal display, analysis directory naming, QA-pair storage).
+                When None, falls back to self.chain_id — but the singleton
+                fallback is NOT parallel-safe, so concurrent callers MUST
+                supply chain_id explicitly.
+
+        Cumulative side effects (thread-safe via SimpleMessageManager._lock):
+            - append_qa_pair: writes one entry into qa_pairs / all_questions /
+              full_results_store keyed by chain_id
+            - record_error_pattern: appends to error_patterns if execution
+              succeeded after a retry
+
+        No longer writes message_manager.code_exec_results / .last_code /
+        .last_plan — those singletons were the parallel-safety blocker. The
+        caller reads the return value instead.
         """
+        # Resolve chain_id once at the top. Every site downstream uses this
+        # local — never self.chain_id — so a future ThreadPoolExecutor can run
+        # multiple calls concurrently without the engine attribute racing.
+        cid = chain_id if chain_id is not None else self.chain_id
+
         qa_context = self.message_manager.format_qa_pairs()
 
         # ── Code Generation (silent — user sees status, not raw LLM output) ──
@@ -490,30 +553,41 @@ class ExplorationEngine:
 
         model, _ = self.models.get_model_name("Code Generator")
         self.output_manager.print_wrapper(
-            style.agent("Code Generator", model), chain_id=self.chain_id
+            style.agent("Code Generator", model), chain_id=cid
         )
 
         with style.spinner("Generating code"):
-            code, llm_response = self._call_llm_for_code(messages, model)
+            code, llm_response = self._call_llm_for_code(messages, model, chain_id=cid)
 
         if not code:
             self.output_manager.print_wrapper(
                 style.error_msg("No executable code generated"),
-                chain_id=self.chain_id,
+                chain_id=cid,
             )
-            self.message_manager.code_exec_results = "Code generation produced no executable code."
-            self.message_manager.last_code = ""
             # Still write an analysis.md marking the failure
-            analysis_dir = self._analysis_dir_for_chain(self.chain_id)
+            analysis_dir = self._analysis_dir_for_chain(cid)
             os.makedirs(analysis_dir, exist_ok=True)
-            self.output_manager.write_analysis_md(analysis_dir, question, "(none)", None, "No code generated", [], self._iteration, self._max_iterations, self.chain_id)
-            self.message_manager.append_qa_pair(question, "Code generation failed — no executable code produced.", chain_id=self.chain_id)
-            return
+            self.output_manager.write_analysis_md(
+                analysis_dir, question, "(none)", None, "No code generated", [],
+                self._iteration, self._max_iterations, cid,
+            )
+            self.message_manager.append_qa_pair(
+                question,
+                "Code generation failed — no executable code produced.",
+                chain_id=cid,
+            )
+            return {
+                'results': "Code generation produced no executable code.",
+                'code': "",
+                'last_plan': None,
+                'plots': [],
+                'error': "No code generated",
+            }
 
         code_lines = len(code.strip().split('\n'))
 
         # ── Build analysis directory ──
-        analysis_dir = self._analysis_dir_for_chain(self.chain_id)
+        analysis_dir = self._analysis_dir_for_chain(cid)
         os.makedirs(analysis_dir, exist_ok=True)
 
         # ── Execute ──
@@ -527,7 +601,7 @@ class ExplorationEngine:
             retries += 1
             self.output_manager.print_wrapper(
                 style.error_msg(f"Retry {retries}/{self.MAX_ERROR_CORRECTIONS}: {error.strip().split(chr(10))[-1][:120]}"),
-                chain_id=self.chain_id,
+                chain_id=cid,
             )
 
             # Trim old attempts after 2 retries
@@ -580,17 +654,13 @@ class ExplorationEngine:
         if results:
             self.output_manager.print_wrapper(
                 style.success(f"{code_lines} lines, executed OK"),
-                chain_id=self.chain_id,
+                chain_id=cid,
             )
         elif error:
             self.output_manager.print_wrapper(
                 style.error_msg(f"Failed after {retries + 1} attempt(s)"),
-                chain_id=self.chain_id,
+                chain_id=cid,
             )
-
-        # ── Store results ──
-        self.message_manager.code_exec_results = results if results else f"Execution failed: {error}"
-        self.message_manager.last_code = code
 
         # ── Terminal display ──
         if results:
@@ -603,41 +673,52 @@ class ExplorationEngine:
             if s_idx >= 0 and e_idx > s_idx:
                 # Show the summary block
                 summary = results[s_idx + len(start_marker):e_idx].strip()
-                self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
+                self.output_manager.print_wrapper(style.result_border(), chain_id=cid)
                 for line in summary.split('\n'):
-                    self.output_manager.print_wrapper(style.result_line(line), chain_id=self.chain_id)
-                self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
+                    self.output_manager.print_wrapper(style.result_line(line), chain_id=cid)
+                self.output_manager.print_wrapper(style.result_border(), chain_id=cid)
             else:
                 # No markers — show truncated raw output
                 lines = results.strip().split('\n')
-                self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
+                self.output_manager.print_wrapper(style.result_border(), chain_id=cid)
                 if len(lines) > STDOUT_TRUNCATE_LINES:
                     for line in lines[:STDOUT_TRUNCATE_LINES]:
-                        self.output_manager.print_wrapper(style.result_line(line), chain_id=self.chain_id)
+                        self.output_manager.print_wrapper(style.result_line(line), chain_id=cid)
                     self.output_manager.print_wrapper(
                         style.result_line(style.dim(f"... ({len(lines) - STDOUT_TRUNCATE_LINES} more lines)")),
-                        chain_id=self.chain_id,
+                        chain_id=cid,
                     )
                 else:
                     for line in lines:
-                        self.output_manager.print_wrapper(style.result_line(line), chain_id=self.chain_id)
-                self.output_manager.print_wrapper(style.result_border(), chain_id=self.chain_id)
+                        self.output_manager.print_wrapper(style.result_line(line), chain_id=cid)
+                self.output_manager.print_wrapper(style.result_border(), chain_id=cid)
 
         # ── Write analysis.md ──
         plot_note = f"{len(plots)} plot{'s' if len(plots) != 1 else ''}" if plots else ""
-        self.output_manager.write_analysis_md(analysis_dir, question, code, results, error, plots, self._iteration, self._max_iterations, self.chain_id)
+        self.output_manager.write_analysis_md(
+            analysis_dir, question, code, results, error, plots,
+            self._iteration, self._max_iterations, cid,
+        )
         rel_path = os.path.relpath(analysis_dir, ".")
         self.output_manager.print_wrapper(
             style.file_ref(f"{rel_path}/analysis.md", plot_note),
-            chain_id=self.chain_id,
+            chain_id=cid,
         )
 
-        # ── Append QA pair ──
+        # ── Append QA pair (thread-safe via message_manager._lock) ──
         self.message_manager.append_qa_pair(
             question,
             results if results else f"Execution failed: {str(error)[:300]}",
-            chain_id=self.chain_id,
+            chain_id=cid,
         )
+
+        return {
+            'results': results if results else f"Execution failed: {error}",
+            'code': code,
+            'last_plan': None,
+            'plots': plots,
+            'error': error,
+        }
 
     # ──────────────────────────────────────────────
     # Orientation (data profiling)

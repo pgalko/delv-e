@@ -13,6 +13,7 @@ LLMClient routes to the correct provider based on the model string.
 
 import json
 import os
+import threading
 import time
 
 import httpx
@@ -243,6 +244,7 @@ class OllamaProvider:
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            extra_body={"reasoning_effort": "medium"},
         )
         content = ""
         if response.choices and len(response.choices) > 0:
@@ -265,6 +267,7 @@ class OllamaProvider:
             stream=True,
             stream_options={"include_usage": True},
             timeout=STREAM_TIMEOUT,
+            extra_body={"reasoning_effort": "medium"},
         )
         for chunk in stream:
             if chunk.usage:
@@ -309,6 +312,7 @@ class OpenRouterProvider:
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            extra_body={"reasoning": {"effort": "medium"}},
         )
         content = ""
         if response.choices and len(response.choices) > 0:
@@ -331,6 +335,7 @@ class OpenRouterProvider:
             stream=True,
             stream_options={"include_usage": True},
             timeout=STREAM_TIMEOUT,
+            extra_body={"reasoning": {"effort": "medium"}},
         )
         for chunk in stream:
             if chunk.usage:
@@ -380,19 +385,26 @@ def parse_model_string(model_string):
 # ══════════════════════════════════════════════════
 
 class CostTracker:
-    """Accumulates token counts and cost across all calls in a run."""
+    """Accumulates token counts and cost across all calls in a run.
+
+    Thread-safe: record() may be called concurrently from parallel question
+    processing threads. The lock guards the multi-step read-modify-write of
+    the running totals.
+    """
 
     def __init__(self):
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.total_cost = 0.0
+        self._lock = threading.Lock()
 
     def record(self, input_tokens, output_tokens, model=None):
-        self.calls += 1
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
-        self.total_cost += compute_cost(model or "", input_tokens, output_tokens)
+        with self._lock:
+            self.calls += 1
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.total_cost += compute_cost(model or "", input_tokens, output_tokens)
 
     def report(self):
         return (
@@ -403,11 +415,17 @@ class CostTracker:
 
 
 class RunLogger:
-    """Append-only run log. Flushes to disk after each call."""
+    """Append-only run log. Flushes to disk after each call.
+
+    Thread-safe: log() may be called concurrently from parallel question
+    processing threads. The lock serialises both the in-memory append and
+    the disk flush so two threads can't interleave their JSON writes.
+    """
 
     def __init__(self, path, append=False):
         self.path = path
         self.entries = []
+        self._lock = threading.Lock()
         if append and os.path.exists(path):
             try:
                 with open(path) as f:
@@ -433,8 +451,9 @@ class RunLogger:
         }
         if ttft is not None:
             entry["ttft_s"] = ttft
-        self.entries.append(entry)
-        self._flush()
+        with self._lock:
+            self.entries.append(entry)
+            self._flush()
 
     def _flush(self):
         try:
@@ -483,17 +502,28 @@ class LLMClient:
         self.cost_tracker = cost_tracker or CostTracker()
         self.run_logger = run_logger
         self._providers = {}  # lazily initialized
+        self._provider_lock = threading.Lock()
 
     def _get_provider(self, provider_name):
-        """Get or initialize a provider instance."""
-        if provider_name not in self._providers:
+        """Get or initialize a provider instance.
+
+        Thread-safe via double-checked locking: the fast path (provider already
+        initialised) avoids lock acquisition; the slow path (first hit per
+        provider) serialises concurrent initialisations so two threads can't
+        both construct the same provider.
+        """
+        if provider_name in self._providers:
+            return self._providers[provider_name]
+        with self._provider_lock:
+            if provider_name in self._providers:
+                return self._providers[provider_name]
             if provider_name not in PROVIDER_CLASSES:
                 raise ValueError(
                     f"Unknown provider '{provider_name}'. "
                     f"Available: {', '.join(PROVIDER_CLASSES.keys())}"
                 )
             self._providers[provider_name] = PROVIDER_CLASSES[provider_name]()
-        return self._providers[provider_name]
+            return self._providers[provider_name]
 
     def call(self, messages, model, max_tokens=10000, temperature=0, agent=None):
         """Non-streaming call. Returns response text (always a string, never None)."""
