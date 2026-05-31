@@ -34,7 +34,11 @@ def write_dashboard(output_dir, explorer, engine, iteration, max_iterations):
             f.write(html)
         os.replace(tmp, path)
     except Exception as e:
-        logger.warning(f"Dashboard write failed: {e}")
+        import traceback
+        logger.warning(
+            f"Dashboard write failed: {e}\n"
+            f"{traceback.format_exc()}"
+        )
 
 
 def _extract_data(explorer, engine, iteration, max_iterations, output_dir):
@@ -184,6 +188,73 @@ def _extract_data(explorer, engine, iteration, max_iterations, output_dir):
     # Rotation iterations
     rot_iters = {it for it, _, _ in getattr(explorer, 'rotation_history', [])}
 
+    # --- Run geometry (embedding-based observability) ---
+    # Compute on the fly from active-node embeddings. None entries propagate
+    # as coverage gaps. The panel shows from the first embedded node — Hz
+    # and clusters degrade gracefully (display as "—") until enough points
+    # accumulate. Hidden entirely when no embeddings exist.
+    geometry = None
+    try:
+        from embeddings import rolling_dispersion, z_score, compute_lineage
+        active_nodes_geo = sorted(
+            [n for n in explorer.insight_tree.values()
+             if n.get('status') == 'active'],
+            key=lambda n: n['chain_id'],
+        )
+        geo_vectors = [n.get('embedding') for n in active_nodes_geo]
+        geo_embedded = sum(1 for v in geo_vectors if v is not None)
+
+        if geo_embedded >= 1:
+            # Hz needs ≥2 points in the window to produce values; will be
+            # all-None for a single-embedding trajectory.
+            H = rolling_dispersion(geo_vectors, window=5)
+            H_z = z_score(H)
+            # Conceptual lineage: each iter's nearest prior in embedding space.
+            # Deterministic; no clustering algorithm. depths is the same length
+            # as geo_vectors with None for unembedded.
+            parents, par_dists, depths = compute_lineage(geo_vectors)
+            geo_iters = [
+                n.get('iteration_added', i + 1)
+                for i, n in enumerate(active_nodes_geo)
+            ]
+            geo_scores = [n.get('quality_score', 0) for n in active_nodes_geo]
+
+            # Current Hz (last embedded node) + trend (last 3 vs prior 3)
+            cur_hz = next((z for z in reversed(H_z) if z is not None), None)
+            valid_zs = [z for z in H_z if z is not None]
+            trend = 0.0
+            if len(valid_zs) >= 6:
+                trend = (sum(valid_zs[-3:]) / 3.0
+                         - sum(valid_zs[-6:-3]) / 3.0)
+
+            valid_depths = [d for d in depths if d is not None]
+            max_depth = max(valid_depths) if valid_depths else 0
+
+            # Truncated finding summaries for tooltip hover
+            geo_summaries = [
+                (n.get('finding_summary') or n.get('result_digest')
+                 or n.get('question') or '').strip()[:200]
+                for n in active_nodes_geo
+            ]
+
+            geometry = {
+                'iters': geo_iters,
+                'scores': geo_scores,
+                'H_z': H_z,
+                'depths': depths,
+                'parents': parents,
+                'par_dists': par_dists,
+                'max_depth': max_depth,
+                'embedded': geo_embedded,
+                'total': len(active_nodes_geo),
+                'current_hz': cur_hz,
+                'trend': trend,
+                'summaries': geo_summaries,
+            }
+    except Exception as e:
+        logger.debug(f"Geometry computation skipped: {e}")
+        geometry = None
+
     return {
         'iteration': iteration,
         'max_iterations': max_iterations,
@@ -218,6 +289,7 @@ def _extract_data(explorer, engine, iteration, max_iterations, output_dir):
         'rot_iters': rot_iters,
         'output_dir': output_dir,
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+        'geometry': geometry,
     }
 
 
@@ -495,6 +567,143 @@ def _render_html(d):
     if d['premium_model']:
         premium_meta = f'<span><span class="meta-label">Premium</span> <span class="meta-val">{_short_model(d["premium_model"])}</span></span>'
 
+    # --- Run geometry panel ---
+    geometry_html = ''
+    geo = d.get('geometry')
+    if geo:
+        # Internal coordinate system stays at 880×60 / 880×12 (wide enough that
+        # at typical dashboard widths the SVG renders close to 1:1, keeping
+        # score-9 dots nearly circular). width="100%" + preserveAspectRatio=
+        # "none" makes the SVG fill the panel column at any viewport.
+        sw, sh, pad = 880, 60, 6
+        n = len(geo['iters'])
+        if n > 1:
+            xs = [pad + i * (sw - 2 * pad) / (n - 1) for i in range(n)]
+        else:
+            xs = [sw / 2]
+
+        def _y_of(z):
+            if z is None:
+                return None
+            z = max(-2.5, min(2.5, z))
+            return pad + (sh - 2 * pad) * (1 - (z + 2.5) / 5.0)
+
+        line_pts = []
+        for x, z in zip(xs, geo['H_z']):
+            yy = _y_of(z)
+            if yy is not None:
+                line_pts.append(f"{x:.1f},{yy:.1f}")
+
+        dots_svg = ''
+        for x, z, sc in zip(xs, geo['H_z'], geo['scores']):
+            yy = _y_of(z)
+            if yy is None or sc < 9:
+                continue
+            dots_svg += (
+                f'<circle cx="{x:.1f}" cy="{yy:.1f}" r="3" '
+                f'fill="#E8C547" stroke="#1a1a1a" stroke-width="0.5"/>'
+            )
+
+        baseline_y = _y_of(0)
+        sparkline_svg = (
+            f'<svg width="100%" height="{sh}" viewBox="0 0 {sw} {sh}" '
+            f'preserveAspectRatio="none" '
+            f'xmlns="http://www.w3.org/2000/svg" style="display:block">'
+            f'<line x1="{pad}" y1="{baseline_y:.1f}" '
+            f'x2="{sw - pad}" y2="{baseline_y:.1f}" '
+            f'stroke="var(--border)" stroke-width="1" stroke-dasharray="2,2"/>'
+            f'<polyline points="{" ".join(line_pts)}" fill="none" '
+            f'stroke="#D87C5A" stroke-width="1.8"/>'
+            f'{dots_svg}</svg>'
+        )
+
+        # Depth-encoded strip cells. Each cell colored by its lineage depth
+        # — pale = shallow (near iter 1), dark = deeply built on prior work.
+        # Iter 1 and any unembedded nodes show neutral grey.
+        c_low = (228, 233, 240)   # pale slate
+        c_high = (28, 52, 89)     # deep navy
+        max_depth = max(geo['max_depth'], 1)
+        strip_cells = ''
+        for i, depth in enumerate(geo['depths']):
+            if depth is None:
+                color = '#cccccc'
+                depth_str = '—'
+            else:
+                t = depth / max_depth
+                rgb = tuple(int(c_low[k] + t * (c_high[k] - c_low[k]))
+                            for k in range(3))
+                color = f'rgb({rgb[0]},{rgb[1]},{rgb[2]})'
+                depth_str = str(depth)
+            it_num = geo['iters'][i] if i < len(geo['iters']) else (i + 1)
+            sc = geo['scores'][i] if i < len(geo['scores']) else 0
+            hz = geo['H_z'][i] if i < len(geo['H_z']) else None
+            hz_str = f"{hz:+.2f}" if hz is not None else "—"
+            parent = geo['parents'][i] if i < len(geo['parents']) else None
+            par_d = geo['par_dists'][i] if i < len(geo['par_dists']) else None
+            if parent is None:
+                parent_str = '— (root)'
+            else:
+                parent_iter = (geo['iters'][parent]
+                               if parent < len(geo['iters']) else parent)
+                par_d_str = f"{par_d:.3f}" if par_d is not None else "—"
+                parent_str = f"iter {parent_iter} (d={par_d_str})"
+            summary = (geo['summaries'][i] if i < len(geo['summaries']) else '') \
+                      or '(no summary)'
+            tip = (f"Iter {it_num} · score {sc} · depth {depth_str}\n"
+                   f"Parent: {parent_str}\n"
+                   f"Hz {hz_str} (z-scored)\n\n"
+                   f"{_escape(summary)}")
+            strip_cells += (
+                f'<div class="geo-cell" style="background:{color};" '
+                f'data-hmtip="{tip}"></div>'
+            )
+        strip_svg = (
+            f'<div class="geo-strip-cells">{strip_cells}</div>'
+        )
+
+        if geo['current_hz'] is None:
+            hz_str = '—'
+        else:
+            hz_str = f"{geo['current_hz']:+.2f}"
+        if geo['trend'] > 0.1:
+            trend_arrow = '↑'
+        elif geo['trend'] < -0.1:
+            trend_arrow = '↓'
+        else:
+            trend_arrow = '→'
+        depth_str = (str(geo['max_depth'])
+                     if geo['max_depth'] > 0 else '—')
+
+        geometry_html = f'''
+  <div class="chart-section">
+    <div class="section-title">Run geometry</div>
+    <div class="geo-card">
+      <div class="geo-stats">
+        <div class="geo-stat">
+          <div class="geo-label">Dispersion (Hz)</div>
+          <div class="geo-value">{hz_str} <span class="geo-trend">{trend_arrow}</span></div>
+        </div>
+        <div class="geo-stat">
+          <div class="geo-label">Coverage</div>
+          <div class="geo-value">{geo['embedded']}/{geo['total']}</div>
+        </div>
+        <div class="geo-stat">
+          <div class="geo-label">Max depth</div>
+          <div class="geo-value">{depth_str}</div>
+        </div>
+      </div>
+      <div class="geo-spark">
+        <div class="geo-sublabel">Hz · window 5 · z-scored<span style="float:right">−2σ ⟷ +2σ</span></div>
+        {sparkline_svg}
+      </div>
+      <div class="geo-strip">
+        <div class="geo-sublabel">Trajectory · iter 1 → {n}<span>color = lineage depth</span></div>
+        {strip_svg}
+      </div>
+      <div class="geo-caption">Hz &lt; 0: deepening · Hz &gt; 0: spreading · ● score-9</div>
+    </div>
+  </div>'''
+
     # JSON data for charts
     winners_json = json.dumps(d['winner_scores'])
     losers_json = json.dumps(d['loser_scores'])
@@ -568,6 +777,20 @@ def _render_html(d):
   .legend-dot {{ width: 8px; height: 8px; border-radius: 2px; }}
   .legend-line {{ width: 12px; height: 2px; }}
   .chart-wrap {{ position: relative; height: 260px; }}
+  .geo-card {{ background: var(--bg2); border-radius: var(--radius-lg); padding: 16px 20px; }}
+  .geo-stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
+  .geo-stat {{ display: flex; flex-direction: column; }}
+  .geo-label {{ font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; color: var(--fg3); text-transform: uppercase; margin-bottom: 3px; }}
+  .geo-value {{ font-family: var(--mono); font-size: 20px; color: var(--fg); }}
+  .geo-trend {{ color: #D87C5A; font-size: 14px; margin-left: 4px; }}
+  .geo-sublabel {{ font-family: var(--mono); font-size: 10px; color: var(--fg3); margin-bottom: 4px; display: flex; justify-content: space-between; }}
+  .geo-spark {{ margin-bottom: 10px; }}
+  .geo-strip {{ margin-bottom: 8px; }}
+  .geo-strip-cells {{ display: flex; height: 14px; border-radius: 1px; overflow: hidden; }}
+  .geo-cell {{ flex: 1 1 0; min-width: 0; height: 14px; border-right: 1px solid var(--bg2); cursor: default; transition: opacity 0.1s; }}
+  .geo-cell:last-child {{ border-right: none; }}
+  .geo-cell:hover {{ outline: 1.5px solid var(--fg); outline-offset: 0; z-index: 2; position: relative; }}
+  .geo-caption {{ font-family: var(--mono); font-size: 10px; color: var(--fg3); }}
   .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }}
   @media (max-width: 800px) {{ .two-col {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: repeat(3, 1fr); }} }}
   .findings-card {{ background: var(--bg2); border-radius: var(--radius-lg); padding: 20px; }}
@@ -607,7 +830,7 @@ def _render_html(d):
   .hm-legend {{ display: flex; gap: 14px; align-items: center; margin-top: 10px; font-size: 11px; color: var(--fg2); flex-wrap: wrap; }}
   .hm-lsw {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 3px; }}
   .hm-ldot {{ display: inline-block; width: 4px; height: 4px; border-radius: 50%; position: absolute; bottom: 1px; right: 1px; }}
-  .hm-tip {{ position: fixed; background: var(--bg); border: 1px solid var(--border2); border-radius: var(--radius); padding: 8px 12px; font-size: 11px; color: var(--fg); pointer-events: none; z-index: 200; display: none; max-width: 300px; line-height: 1.4; font-family: var(--mono); }}
+  .hm-tip {{ position: fixed; background: var(--bg); border: 1px solid var(--border2); border-radius: var(--radius); padding: 8px 12px; font-size: 11px; color: var(--fg); pointer-events: none; z-index: 200; display: none; max-width: 320px; line-height: 1.45; font-family: var(--mono); white-space: pre-line; }}
 </style>
 </head>
 <body>
@@ -690,6 +913,8 @@ def _render_html(d):
       </div>
     </div>
   </div>
+
+{geometry_html}
 
 {heatmap_html}
 

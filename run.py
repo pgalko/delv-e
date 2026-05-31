@@ -71,17 +71,45 @@ def main():
                              "verbatim file.")
     parser.add_argument("--auto-stop", action="store_true",
                         help="Allow early termination when strategic review or the mechanical backstop judges the investigation complete.")
+    parser.add_argument("--embedding-model", default=None,
+                        help="OpenAI embedding model for finding-summary "
+                             "embeddings (default: text-embedding-3-small, or "
+                             "$EMBEDDING_MODEL). Used only for run-geometry "
+                             "observability — no decision in the run is informed "
+                             "by these metrics.")
+    parser.add_argument("--no-embeddings", dest="embeddings_enabled",
+                        action="store_false", default=True,
+                        help="Disable embedding computation. Geometry panel and "
+                             "run_geometry.html will be skipped.")
+    parser.add_argument("--no-backfill-embeddings", dest="backfill_embeddings",
+                        action="store_false", default=True,
+                        help="On --continue, skip embedding pre-v10 historical "
+                             "nodes. By default the resume backfills any winning "
+                             "nodes missing embeddings so geometry has full "
+                             "coverage from iteration 1.")
     args = parser.parse_args()
 
     # ── Resolve dataset vs question ambiguity ──
-    # If dataset arg is provided but doesn't exist as a file, treat it as the question
+    # If a single positional arg is provided and looks like a file path
+    # (has a separator, or a known data extension), it must exist — error
+    # otherwise rather than silently treating it as a research question.
+    # A bare string with no path markers (e.g. "Simulate cooperation") is
+    # still treated as the seed question in computation-only mode.
+    DATA_EXTENSIONS = ('.csv', '.tsv', '.xlsx', '.xls',
+                       '.parquet', '.pq', '.json', '.jsonl')
     if args.dataset and not os.path.exists(args.dataset) and not args.continue_run:
-        if args.question is None:
-            args.question = args.dataset
-            args.dataset = None
-        else:
+        looks_like_path = (
+            os.sep in args.dataset
+            or '/' in args.dataset
+            or args.dataset.startswith('.')
+            or args.dataset.lower().endswith(DATA_EXTENSIONS)
+        )
+        if looks_like_path or args.question is not None:
             print(f"Error: File not found: {args.dataset}", file=sys.stderr)
             sys.exit(1)
+        # Bare string, no question yet → treat as computation-only question
+        args.question = args.dataset
+        args.dataset = None
 
     # Load environment
     try:
@@ -175,13 +203,17 @@ def main():
 
     # Build engine
     from engine import ExplorationEngine
+    # Resolve embedding model: CLI flag > env var > engine default
+    embedding_model = args.embedding_model or os.environ.get("EMBEDDING_MODEL")
     engine = ExplorationEngine(
         df=df,
         output_dir=args.output,
         agent_model=args.agent_model,
         code_model=args.code_model,
         continue_run=args.continue_run,
-        data_dictionary=data_dictionary_text,   # NEW
+        data_dictionary=data_dictionary_text,
+        embedding_model=embedding_model,
+        embeddings_enabled=args.embeddings_enabled,
     )
 
     # Edge case: orientation skipped but dictionary provided.
@@ -219,6 +251,7 @@ def main():
         resumed_state=resumed_state,
         orientation=args.orientation,
         auto_stop=args.auto_stop,
+        backfill_embeddings=args.backfill_embeddings,
     )
 
 

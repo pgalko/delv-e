@@ -344,6 +344,10 @@ class OutputManager:
             except Exception as e:
                 logger.debug(f"structural_map.md unreadable: {e}")
 
+        # run_geometry.html is now written directly by auto_explore.AutoExplorer
+        # as a self-contained interactive page. The briefing pipeline doesn't
+        # touch it — no markdown→HTML conversion needed.
+
         # 2. Build per-analysis HTML pages once, shared by all artefacts.
         analysis_links = self._build_analysis_pages(all_cited_ids)
 
@@ -374,6 +378,8 @@ class OutputManager:
                 analysis_links=analysis_links,
                 is_briefing=False,
             )
+
+        # run_geometry.html is written by auto_explore separately — skip here.
 
         logger.info(f"Briefing + companion artefacts written to {self.output_dir}")
 
@@ -596,7 +602,9 @@ class OutputManager:
                 '  <span class="nav-sep">·</span>\n'
                 '  <a href="findings_index.html" class="back-link">Findings Index</a>\n'
                 '  <span class="nav-sep">·</span>\n'
-                '  <a href="structural_map.html" class="back-link">Structural Map</a>'
+                '  <a href="structural_map.html" class="back-link">Structural Map</a>\n'
+                '  <span class="nav-sep">·</span>\n'
+                '  <a href="run_geometry.html" class="back-link">Run Geometry</a>'
             )
             footer_pdf = (
                 '  <div class="pdf-wrap"><button class="pdf-btn" onclick="window.print()">'

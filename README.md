@@ -179,6 +179,23 @@ python run.py "Simulate evolution of cooperation" \
 
 Adds ~$0.50-1.20 per 100-iteration run. Default disabled.
 
+### Run Geometry
+
+Each winning analysis's `tested_estimand` — the formal causal/statistical target of the iteration — is embedded with OpenAI's `text-embedding-3-small`, and the resulting trajectory is summarized as a small observability artefact. None of these metrics inform any decision the loop makes — the strategic review still operates on text alone. The geometry exists so the user can see the *shape* of the investigation after the fact: how much breadth, how much depth, where the productive clusters were, whether the loop's commitment record (HOLD/PIVOT/ABANDON) agrees with the geometric signal.
+
+The interpretive frame — low-dispersion stretches read as focused exploitation, high-dispersion stretches as breadth — is drawn from [Liu, Dehmamy, Chown, Giles, & Wang (2021)](https://www.nature.com/articles/s41467-021-25477-8), who found that creative hot streaks across artistic, cultural, and scientific careers tend to coincide with a particular sequence in a high-dimensional feature space of an individual's outputs. delv-e doesn't enforce that pattern; it just instruments the run so the pattern (or its absence) is visible.
+
+Hz is a z-scored rolling cosine dispersion over a 5-iteration sliding window; clustering is pure-numpy k-means on the embeddings; the conceptual map is a 2D PCA projection. The dashboard shows the live trajectory as a sparkline + cluster strip with three summary metrics (dispersion, coverage, clusters). The final `run_geometry.md` artefact accompanies the briefing as a fourth companion artefact (alongside `briefing.md`, `findings_index.md`, `structural_map.md`) and includes a dispersion timeline, a 2D PCA trajectory map, and per-cluster summaries identifying each cluster's highest-scoring finding.
+
+On `--continue`, any winning nodes from earlier runs that lack embeddings are backfilled before the loop resumes — so the geometry has full coverage from iteration 1. Cost is announced before backfill proceeds. Use `--no-backfill-embeddings` to skip.
+
+```bash
+python run.py data.csv "<question>" --iterations 50
+# Geometry on by default. Disable with --no-embeddings.
+```
+
+Adds ~$0.001-0.005 per 100-iteration run at default pricing. Requires `OPENAI_API_KEY`. Failures are non-fatal: a missing embedding shows as a coverage gap in the geometry, never blocks the run.
+
 ### Error Patterns and Pitfalls
 
 **Static pitfalls** (`pitfalls.txt`): user-maintained file of known code-generation traps. Loaded fresh on every code-generation call, so edits take effect mid-run without restart.
@@ -189,7 +206,7 @@ Both sources are appended to the code-generator's prompt to prevent errors recur
 
 ## Output
 
-The primary deliverables are three handoff artefacts, with chain_id citations linking back to the individual analyses that produced each number:
+The primary deliverables are four handoff artefacts, with chain_id citations linking back to the individual analyses that produced each number:
 
 ```
 output/
@@ -199,6 +216,11 @@ output/
 ├── findings_index.html         # Styled HTML version
 ├── structural_map.md           # Structural Landscape (live-written during run)
 ├── structural_map.html         # Styled HTML version
+├── run_geometry.md             # Run-geometry observability (4th companion artefact)
+├── run_geometry.html           # Styled HTML version
+├── run_geometry/               # Dispersion timeline + 2D PCA trajectory charts
+│   ├── dispersion.png
+│   └── trajectory.png
 ├── synthesis_charts/           # Publication-quality charts per finding in §2
 │   ├── 01_first_finding_name.png
 │   └── ...
@@ -234,7 +256,7 @@ output/
 
 Every numerical claim includes a `[[chain_id]]` citation that becomes a clickable link in the HTML version, opening the original analysis with its code, output, and plots. Each analysis page has a "← Back to Briefing" link.
 
-`findings_index.md` is a complete one-line-per-analysis catalogue: score, iteration, chain_id, method, question, finding summary. `structural_map.md` is the Structural Landscape rendered as a standalone artefact — written live during the run, updated each time strategic review extends the landscape, so it's visible on the dashboard as it grows.
+`findings_index.md` is a complete one-line-per-analysis catalogue: score, iteration, chain_id, method, question, finding summary. `structural_map.md` is the Structural Landscape rendered as a standalone artefact — written live during the run, updated each time strategic review extends the landscape, so it's visible on the dashboard as it grows. `run_geometry.md` is the observability artefact described under [Run Geometry](#run-geometry) — written once at end-of-run from the embedded trajectory.
 
 Charts in `synthesis_charts/` are publication-quality matplotlib figures generated for each non-CONTRADICTED H3 finding in §2. Each chart is adapted from the original analysis code that produced the finding, ensuring the numbers on the chart match the numbers in the text.
 
@@ -270,6 +292,8 @@ The strategic review (premium model) runs every iteration but is lightweight —
 
 A data dictionary adds negligible cost — it enters the prompt only during orientation (one call per run).
 
+Embeddings add ~$0.001-0.005 per 100-iteration run (`text-embedding-3-small` at $0.02/M tokens, ~400 tokens per winning node). `--no-embeddings` skips this entirely if not needed.
+
 Check `output/cost.txt` after each run for exact breakdown by agent.
 
 ## Usage
@@ -293,6 +317,9 @@ The dataset is optional. If the first argument is not a file path, it is treated
 | `--code-model` | anthropic:claude-haiku-4-5-20251001 | Model for code generation |
 | `--premium-model` | same as code-model | Model for orientation, strategic review, briefing, seed decomposition |
 | `--search-model` | disabled | Anthropic model for literature search |
+| `--embedding-model` | text-embedding-3-small | OpenAI embedding model for run-geometry observability |
+| `--no-embeddings` | | Disable embedding computation entirely (skips geometry panel + run_geometry.md) |
+| `--no-backfill-embeddings` | | On `--continue`, skip embedding pre-v10 historical nodes |
 
 ### Providers
 
@@ -362,7 +389,7 @@ python run.py data.csv "Analyze X" --iterations 25
 python run.py data.csv "Pursue the Y paradox" --continue --iterations 30
 ```
 
-The seed question on `--continue` becomes the first analysis in the resumed run. DataFrame, research model, insight tree, commitment history, and all context are preserved. You can switch models between runs. State format is versioned — older checkpoints (pre-v6, before the Structural Landscape refactor) are migrated automatically on load.
+The seed question on `--continue` becomes the first analysis in the resumed run. DataFrame, research model, insight tree, commitment history, and all context are preserved. You can switch models between runs. State format is versioned — older checkpoints (pre-v6, before the Structural Landscape refactor; pre-v10, before Run Geometry embeddings) are migrated automatically on load. On pre-v10 resumes, winning nodes are backfilled with embeddings before the loop resumes so the geometry has full coverage from iteration 1 (see [Run Geometry](#run-geometry); use `--no-backfill-embeddings` to skip).
 
 ## Architecture
 
@@ -372,9 +399,12 @@ engine.py            ExplorationEngine: LLM pipeline, code execution, orientatio
 auto_explore.py      Core loop: commitment system, strategic review, Structural Landscape
                      maintenance, research model management, briefing + artefact writing
 output.py            OutputManager: terminal display, analysis markdown, briefing HTML,
-                     findings_index HTML, structural_map HTML, PDF export
-dashboard.py         Live HTML dashboard with commitment bands, three-artefact buttons
+                     findings_index HTML, structural_map HTML, run_geometry HTML, PDF export
+dashboard.py         Live HTML dashboard with commitment bands, run-geometry panel,
+                     three-artefact buttons
 llm.py               Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama)
+embeddings.py        OpenAI embedding client and pure-numpy geometry utilities
+                     (rolling cosine dispersion, k-means, 2D PCA)
 executor.py          Local code execution with security guards and traceback filtering
 prompts.py           All prompt templates
 style.py             Terminal formatting: colored commitment bars, exploration tree, spinners

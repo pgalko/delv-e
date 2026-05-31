@@ -16,6 +16,7 @@ from output import OutputManager
 from prompts import PromptManager
 from llm import LLMClient, CostTracker, RunLogger
 from executor import CodeExecutor, extract_code
+from embeddings import EmbeddingClient
 
 from logger_config import get_logger
 logger = get_logger(__name__)
@@ -261,7 +262,8 @@ class ExplorationEngine:
     """
 
     def __init__(self, df=None, output_dir="output", agent_model=None, code_model=None,
-                 continue_run=False, data_dictionary=None):
+                 continue_run=False, data_dictionary=None,
+                 embedding_model=None, embeddings_enabled=True):
         """
         Args:
             df: pandas DataFrame to analyze (None for computation-only mode)
@@ -273,6 +275,12 @@ class ExplorationEngine:
                 constraints. Consumed ONLY by run_orientation(); its key rules
                 must be restated in the orientation profile so they propagate
                 to downstream agents.
+            embedding_model: OpenAI embedding model name for finding-summary
+                embeddings (e.g. 'text-embedding-3-small'). Defaults to
+                'text-embedding-3-small' when embeddings_enabled is True.
+                Used only for run-geometry observability; failures are non-fatal.
+            embeddings_enabled: when False, no embeddings are computed and the
+                geometry panel and run_geometry.html artefact are skipped.
         """
         # DataFrame (None in computation-only mode)
         self.df = df.copy() if df is not None else None
@@ -294,6 +302,14 @@ class ExplorationEngine:
         self.models = SimpleModelManager(agent_model=agent_model, code_model=code_model)
         self.prompts = PromptManager()
         self.reasoning_models = []
+
+        # Embeddings (observability-only — failures don't block the run)
+        if embeddings_enabled:
+            self.embedding_client = EmbeddingClient(cost_tracker=self.cost_tracker)
+            self.embedding_model = embedding_model or "text-embedding-3-small"
+        else:
+            self.embedding_client = None
+            self.embedding_model = None
 
         # State
         self.chain_id = int(time.time())

@@ -37,6 +37,8 @@ PRICING = {
     "claude-haiku-4-5-20251001":  {"input": 1.00, "output": 5.00},
     "claude-sonnet-4-6":          {"input": 3.00, "output": 15.00},
     "claude-opus-4-6":            {"input": 5.00, "output": 25.00},
+    "claude-opus-4-7":            {"input": 5.00, "output": 25.00},
+    "claude-opus-4-8":            {"input": 5.00, "output": 25.00},
     # OpenAI
     "gpt-5.4":                    {"input": 2.50, "output": 15.00},
     "gpt-5.3-codex":              {"input": 1.75, "output": 14.00},
@@ -50,6 +52,9 @@ PRICING = {
     "deepseek/deepseek-v3.2":     {"input": 0.26, "output": 0.38},
     "qwen/qwen3.5-397b-a17b":     {"input": 0.39, "output": 2.34},
     "minimax/minimax-m2.7":       {"input": 0.30, "output": 1.20},
+    # Embeddings (output_tokens always 0)
+    "text-embedding-3-small":     {"input": 0.02,  "output": 0.0},
+    "text-embedding-3-large":     {"input": 0.13,  "output": 0.0},
     # Ollama (local, free)
 }
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
@@ -66,6 +71,26 @@ def compute_cost(model, input_tokens, output_tokens):
     pricing = PRICING.get(model_name, DEFAULT_PRICING)
     return (input_tokens * pricing["input"] / 1_000_000 +
             output_tokens * pricing["output"] / 1_000_000)
+
+
+# Anthropic Opus 4.7+ deprecated temperature/top_p/top_k entirely — non-default
+# values return HTTP 400 ("`temperature` is deprecated for this model.").
+# These models must have the sampling params omitted from the request payload.
+# Matches bare names ('claude-opus-4-7') and dated variants
+# ('claude-opus-4-7-20260101', 'claude-opus-4-8-20260315'), and any future
+# Opus 4.x where x >= 7. Update if Anthropic restores the params or extends
+# the deprecation to other model families.
+_NO_SAMPLING_PARAM_PREFIXES = (
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+)
+
+
+def _omits_sampling_params(model):
+    """Return True if the model rejects temperature/top_p/top_k at request time."""
+    if not model:
+        return False
+    return any(model.startswith(p) for p in _NO_SAMPLING_PARAM_PREFIXES)
 
 
 # ══════════════════════════════════════════════════
@@ -85,11 +110,14 @@ class AnthropicProvider:
 
     def call(self, messages, model, max_tokens, temperature):
         system_msg, api_messages = self._split_system(messages)
+        kwargs = dict(
+            model=model, system=system_msg, messages=api_messages,
+            max_tokens=max_tokens,
+        )
+        if not _omits_sampling_params(model):
+            kwargs['temperature'] = temperature
         try:
-            response = self.client.messages.create(
-                model=model, system=system_msg, messages=api_messages,
-                max_tokens=max_tokens, temperature=temperature,
-            )
+            response = self.client.messages.create(**kwargs)
         except self._api_error as e:
             logger.error(f"Anthropic API error: {e}")
             raise
@@ -104,13 +132,15 @@ class AnthropicProvider:
 
     def stream(self, messages, model, max_tokens, temperature, on_token):
         system_msg, api_messages = self._split_system(messages)
+        kwargs = dict(
+            model=model, system=system_msg, messages=api_messages,
+            max_tokens=max_tokens, timeout=STREAM_TIMEOUT,
+        )
+        if not _omits_sampling_params(model):
+            kwargs['temperature'] = temperature
         collected = []
         try:
-            with self.client.messages.stream(
-                model=model, system=system_msg, messages=api_messages,
-                max_tokens=max_tokens, temperature=temperature,
-                timeout=STREAM_TIMEOUT,
-            ) as stream:
+            with self.client.messages.stream(**kwargs) as stream:
                 for event in stream:
                     if hasattr(event, 'type') and event.type == 'content_block_delta':
                         if hasattr(event.delta, 'text'):
@@ -141,11 +171,13 @@ class AnthropicProvider:
         try:
             tool_type = os.environ.get("ANTHROPIC_WEB_SEARCH_TOOL_TYPE", "web_search_20250305")
             tool = {"type": tool_type, "name": "web_search", "max_uses": max_uses}
-            response = self.client.messages.create(
+            kwargs = dict(
                 model=model, system=system_msg, messages=api_messages,
-                max_tokens=max_tokens, temperature=temperature,
-                tools=[tool],
+                max_tokens=max_tokens, tools=[tool],
             )
+            if not _omits_sampling_params(model):
+                kwargs['temperature'] = temperature
+            response = self.client.messages.create(**kwargs)
         except self._api_error as e:
             logger.error(f"Anthropic search API error: {e}")
             raise

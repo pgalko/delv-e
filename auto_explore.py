@@ -598,8 +598,11 @@ class AutoExplorer:
         tested_estimand = ""
         if 'TESTED_ESTIMAND:' in response:
             te_text = response.split('TESTED_ESTIMAND:')[1]
-            # Take until the next field marker or blank-line boundary
-            for end_marker in ['UPDATED_MODEL:', 'METHOD_USED:', 'RESULT_DIGEST:', '\n\n\n']:
+            # Take until the next field marker, decorative task separator, or
+            # blank-line boundary. The ═ catches LLM-emitted "═══ TASK X ═══"
+            # banners that leak from multi-task prompts into adjacent fields.
+            for end_marker in ['═', 'UPDATED_MODEL:', 'METHOD_USED:',
+                               'RESULT_DIGEST:', '\n\n\n']:
                 if end_marker in te_text:
                     te_text = te_text.split(end_marker)[0]
                     break
@@ -2119,13 +2122,17 @@ class AutoExplorer:
     # ══════════════════════════════════════════════
 
     def run(self, seed_question, initial_image=None, max_iterations=5, num_parallel_solutions=2,
-            interactive=False, resumed_state=None, orientation=True, auto_stop=False):
+            interactive=False, resumed_state=None, orientation=True, auto_stop=False,
+            backfill_embeddings=True):
         """Run the autonomous exploration loop.
 
         Args:
             auto_stop: If True, the system may terminate before max_iterations
                 when the strategic review determines the investigation is complete.
                 Default False — the full iteration budget is always used.
+            backfill_embeddings: If True (default), embed any pre-v10 winning
+                nodes lacking embeddings on --continue, so geometry has full
+                coverage from iteration 1.
         """
 
         num_parallel_solutions = max(2, min(5, num_parallel_solutions))
@@ -2154,6 +2161,15 @@ class AutoExplorer:
 
                 logger.info(f"Resuming from iteration {start_iteration}, "
                             f"running {max_iterations - start_iteration} more")
+
+                # Backfill embeddings for historical winning nodes (pre-v10 or
+                # earlier resumes that ran with --no-embeddings). Skipped when
+                # backfill_embeddings is False or embeddings are disabled.
+                if backfill_embeddings:
+                    try:
+                        self._backfill_embeddings()
+                    except Exception as e:
+                        logger.warning(f"Embedding backfill skipped: {e}")
             else:
                 current_questions = [seed_question]
                 last_solution_chain = None
@@ -2560,6 +2576,11 @@ class AutoExplorer:
                     self.insight_tree[new_node_id]['method_used'] = method_used
                 if new_node_id in self.insight_tree and tested_estimand:
                     self.insight_tree[new_node_id]['tested_estimand'] = tested_estimand
+
+                # Embed the winning node for geometry observability.
+                # Non-fatal: failures leave embedding=None and show as a
+                # coverage gap in the dashboard's Run Geometry panel.
+                self._embed_node(new_node_id)
 
                 self.research_model = updated_model
 
@@ -3278,6 +3299,763 @@ class AutoExplorer:
                     "research model and could not locate §1 in briefing text"
                 )
 
+        # 3. run_geometry.html — single self-contained interactive page
+        #    (silently skipped if too few embeddings to be meaningful)
+        try:
+            geometry_html = self._build_run_geometry_html()
+            if geometry_html:
+                geom_path = os.path.join(self.engine.output_dir, "run_geometry.html")
+                with open(geom_path, 'w') as f:
+                    f.write(geometry_html)
+                logger.info(f"Run geometry written to {geom_path}")
+
+                # Clean up legacy artefacts from earlier code versions so the
+                # output dir doesn't accumulate stale files. Best-effort; any
+                # failure is non-fatal.
+                legacy_md = os.path.join(self.engine.output_dir, "run_geometry.md")
+                if os.path.exists(legacy_md):
+                    try:
+                        os.remove(legacy_md)
+                        logger.debug(f"Removed legacy {legacy_md}")
+                    except Exception:
+                        pass
+                legacy_dir = os.path.join(self.engine.output_dir, "run_geometry")
+                if os.path.isdir(legacy_dir):
+                    try:
+                        import shutil
+                        shutil.rmtree(legacy_dir)
+                        logger.debug(f"Removed legacy {legacy_dir}/")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"Failed to write run_geometry.html: {e}")
+
+    def _build_run_geometry_html(self):
+        """Build run_geometry.html — a single self-contained interactive page.
+
+        Replaces the previous markdown+conceptual_map split. Contains:
+          - Topology table (lineage stats + Hz phase shares)
+          - Interactive dispersion timeline (hover any point)
+          - Interactive lineage-depth strip (hover any cell)
+          - Embedded conceptual map (t-SNE + phase shading + hover lineage)
+          - Shallow-leaves list (unfollowed early work)
+
+        Soft dependencies (sklearn, Pillow) for the conceptual map. If they're
+        missing, the map section is skipped with a notice; the rest still renders.
+
+        Returns '' when fewer than 3 embedded nodes.
+        """
+        from embeddings import rolling_dispersion, z_score, compute_lineage
+        import html as html_mod
+        import re
+
+        active = sorted(
+            [n for n in self.insight_tree.values() if n.get('status') == 'active'],
+            key=lambda n: n['chain_id'],
+        )
+        if not active:
+            return ''
+
+        vectors = [n.get('embedding') for n in active]
+        embedded = [v for v in vectors if v is not None]
+        if len(embedded) < 3:
+            return ''
+
+        H = rolling_dispersion(vectors, window=5)
+        H_z = z_score(H)
+        parents, par_dists, depths = compute_lineage(vectors)
+
+        scores = [n.get('quality_score', 0) for n in active]
+        iters = [n.get('iteration_added', i + 1) for i, n in enumerate(active)]
+        n = len(active)
+        embedded_count = len(embedded)
+        max_iter = max(iters)
+
+        def _clean(text):
+            if not text:
+                return ''
+            return re.split(r'═{2,}', text, maxsplit=1)[0].strip()
+
+        estimands = [_clean(node.get('tested_estimand') or '') for node in active]
+        summaries = [(_clean(node.get('finding_summary') or '')
+                      or _clean(node.get('result_digest') or '')
+                      or _clean(node.get('question') or '')
+                      or '(no summary)') for node in active]
+
+        # ── Topology stats ──
+        valid_hz = [z for z in H_z if z is not None]
+        tight = sum(1 for z in valid_hz if z < -0.5)
+        broad = sum(1 for z in valid_hz if z > 0.5)
+        mixed = len(valid_hz) - tight - broad
+        valid_depths = [d for d in depths if d is not None]
+        max_depth = max(valid_depths) if valid_depths else 0
+        median_depth = (sorted(valid_depths)[len(valid_depths) // 2]
+                        if valid_depths else 0)
+        from collections import Counter
+        child_counts = Counter(p for p in parents if p is not None)
+        branch_points = sum(1 for c in child_counts.values() if c > 1)
+        pivot_moves = sum(1 for d in par_dists if d is not None and d >= 0.25)
+        leaf_idxs = [i for i in range(n) if i not in child_counts]
+        orphan_iters_data = []
+        for i in leaf_idxs:
+            if depths[i] is not None and depths[i] <= 3 and i != 0:
+                orphan_iters_data.append((iters[i], depths[i], scores[i], summaries[i]))
+        orphan_iters_data.sort(key=lambda r: r[0])
+
+        # ── Longest score-9 streak (for lede) ──
+        longest, cur = [], []
+        for it, sc in zip(iters, scores):
+            if sc >= 9:
+                cur.append(it)
+                if len(cur) > len(longest):
+                    longest = list(cur)
+            else:
+                cur = []
+
+        if longest and len(longest) >= 3:
+            during_hz = [z for it, z in zip(iters, H_z) if it in longest and z is not None]
+            descriptor = ''
+            if during_hz:
+                mean_during = sum(during_hz) / len(during_hz)
+                descriptor = ("tightest semantic focus" if mean_during < 0
+                              else "broadest semantic reach")
+            lede = (
+                f"Investigation produced a lineage tree of depth {max_depth} with "
+                f"{branch_points} branch points and {pivot_moves} pivot moves. "
+                f"Its highest-quality stretch (iters {longest[0]}–{longest[-1]}, "
+                f"{len(longest)} consecutive score-9 findings)"
+            )
+            if descriptor:
+                lede += f" coincided with the trajectory's {descriptor}."
+            else:
+                lede += "."
+        else:
+            lede = (
+                f"Investigation produced a lineage tree of depth {max_depth} with "
+                f"{branch_points} branch points and {pivot_moves} pivot moves."
+            )
+
+        seed_q = (self.seed_question or '').strip()[:300]
+
+        # ── Interactive dispersion sparkline ──
+        spark_w, spark_h = 920, 110
+        spark_pad = 14
+        z_max_obs = max((abs(z) for z in valid_hz), default=2.0)
+        z_range = max(2.0, z_max_obs)
+        spark_inner_w = spark_w - 2 * spark_pad
+        spark_inner_h = spark_h - 2 * spark_pad
+
+        def _spark_xy(idx, z):
+            x = spark_pad + (idx / max(n - 1, 1)) * spark_inner_w
+            y = spark_pad + spark_inner_h / 2 - (z / z_range) * (spark_inner_h / 2 - 4)
+            return x, y
+
+        line_pts = []
+        for i, z in enumerate(H_z):
+            if z is None:
+                continue
+            x, y = _spark_xy(i, z)
+            line_pts.append(f"{x:.1f},{y:.1f}")
+
+        mid_y = spark_pad + spark_inner_h / 2
+
+        # Hover dots — invisible larger circles act as hover targets;
+        # visible dots are smaller and stay non-interactive.
+        dot_layer = []
+        for i, z in enumerate(H_z):
+            if z is None:
+                continue
+            x, y = _spark_xy(i, z)
+            sc = scores[i]
+            est = estimands[i][:220] + ('…' if len(estimands[i]) > 220 else '')
+            tip = f"iter {iters[i]} · score {sc} · Hz {z:+.2f}σ\n\n{est}"
+            # Visible dot (score-9+ gets gold, others a thin orange)
+            if sc >= 9:
+                dot_layer.append(
+                    f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" fill="#E8C547" '
+                    f'stroke="#1a1a1a" stroke-width="0.5" pointer-events="none"/>'
+                )
+            else:
+                dot_layer.append(
+                    f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" fill="#D87C5A" '
+                    f'pointer-events="none"/>'
+                )
+            # Invisible hover target
+            dot_layer.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="transparent" '
+                f'class="mtip" data-tip="{html_mod.escape(tip)}"/>'
+            )
+
+        dispersion_svg = (
+            f'<svg viewBox="0 0 {spark_w} {spark_h}" width="100%" height="{spark_h}" '
+            f'preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg" '
+            f'class="chart-svg">'
+            f'<line x1="{spark_pad}" y1="{mid_y}" x2="{spark_w - spark_pad}" '
+            f'y2="{mid_y}" stroke="var(--border2)" stroke-width="0.6" '
+            f'stroke-dasharray="2,3"/>'
+            f'<polyline points="{" ".join(line_pts)}" fill="none" '
+            f'stroke="#D87C5A" stroke-width="1.5"/>'
+            f'{"".join(dot_layer)}'
+            f'<text x="{spark_w - 4}" y="{spark_pad + 4}" font-size="9" '
+            f'text-anchor="end" fill="var(--fg3)" font-family="var(--mono)">'
+            f'+{z_range:.0f}σ</text>'
+            f'<text x="{spark_w - 4}" y="{spark_h - 4}" font-size="9" '
+            f'text-anchor="end" fill="var(--fg3)" font-family="var(--mono)">'
+            f'−{z_range:.0f}σ</text>'
+            f'</svg>'
+        )
+
+        # ── Interactive depth strip ──
+        # Width is responsive — outer container is a flex row, cells flex to fill.
+        c_low = (228, 233, 240)
+        c_high = (28, 52, 89)
+        strip_cells_html = []
+        for i in range(n):
+            d_i = depths[i]
+            if d_i is None:
+                color = '#9C9B96'
+                d_str = '—'
+            else:
+                t = d_i / max(max_depth, 1)
+                rgb = tuple(int(c_low[k] + t * (c_high[k] - c_low[k]))
+                            for k in range(3))
+                color = f'rgb({rgb[0]},{rgb[1]},{rgb[2]})'
+                d_str = str(d_i)
+            par_i = parents[i] if i < len(parents) else None
+            par_d = par_dists[i] if i < len(par_dists) else None
+            if par_i is None:
+                parent_str = '— (root)'
+            else:
+                par_iter_num = iters[par_i] if par_i < len(iters) else par_i
+                par_d_str = f"{par_d:.3f}" if par_d is not None else "—"
+                parent_str = f"iter {par_iter_num} (d={par_d_str})"
+            tip = (f"iter {iters[i]} · score {scores[i]} · depth {d_str}\n"
+                   f"parent: {parent_str}\n\n"
+                   f"{summaries[i][:240] + ('…' if len(summaries[i]) > 240 else '')}")
+            strip_cells_html.append(
+                f'<div class="strip-cell mtip" style="background:{color}" '
+                f'data-tip="{html_mod.escape(tip)}"></div>'
+            )
+
+        # Tick marks every 5 iters
+        tick_labels = []
+        for i in range(n):
+            if iters[i] % 5 == 0 or iters[i] == 1:
+                pct = (i / max(n - 1, 1)) * 100
+                tick_labels.append(
+                    f'<span style="left:{pct:.2f}%">{iters[i]}</span>'
+                )
+        strip_ticks_html = ''.join(tick_labels)
+
+        # ── Conceptual map (soft-skipped if deps missing or trajectory degenerate) ──
+        conceptual_section = self._build_conceptual_map_section(
+            vectors, iters, scores, estimands, parents, max_iter, c_low, c_high
+        )
+
+        # ── Shallow leaves section ──
+        if orphan_iters_data:
+            orphan_items = ''.join(
+                f'<li><b>iter {it}</b> (depth {dp}, score {sc}): '
+                f'{html_mod.escape(summary[:280] + ("…" if len(summary) > 280 else ""))}</li>'
+                for it, dp, sc, summary in orphan_iters_data[:10]
+            )
+            shallow_html = f"""
+  <section>
+    <h2>Shallow leaves — unfollowed early work</h2>
+    <p class="caption">Iterations attached close to the root that produced no
+    children — exploratory directions the loop opened but didn't pursue.</p>
+    <ul class="leaf-list">{orphan_items}</ul>
+  </section>"""
+        else:
+            shallow_html = ''
+
+        model_used = next(
+            (node.get('embedding_model') for node in active
+             if node.get('embedding_model')),
+            'unknown',
+        )
+
+        topology_rows = ''.join([
+            f'<tr><td>Iterations (winning)</td><td>{n}</td></tr>',
+            f'<tr><td>Embedded</td><td>{embedded_count}</td></tr>',
+            f'<tr><td>Max lineage depth</td><td>{max_depth}</td></tr>',
+            f'<tr><td>Median depth</td><td>{median_depth}</td></tr>',
+            f'<tr><td>Branch points</td><td>{branch_points}</td></tr>',
+            f'<tr><td>Pivot moves (parent dist ≥ 0.25)</td><td>{pivot_moves}</td></tr>',
+            f'<tr><td>Tight phase (Hz &lt; −0.5)</td><td>{tight} '
+            f'({tight / max(len(valid_hz), 1) * 100:.0f}%)</td></tr>',
+            f'<tr><td>Broad phase (Hz &gt; +0.5)</td><td>{broad} '
+            f'({broad / max(len(valid_hz), 1) * 100:.0f}%)</td></tr>',
+            f'<tr><td>Mixed</td><td>{mixed} '
+            f'({mixed / max(len(valid_hz), 1) * 100:.0f}%)</td></tr>',
+        ])
+
+        doc = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shape of the Investigation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+  :root {{
+    --bg: #FAFAF8; --bg2: #F1F0EC; --bg3: #E8E7E3;
+    --fg: #1A1A18; --fg2: #6B6A66; --fg3: #9C9B96;
+    --border: #E0DFDB; --border2: #CCCBC6;
+    --accent: #D87C5A;
+    --font: 'IBM Plex Sans', -apple-system, sans-serif;
+    --mono: 'IBM Plex Mono', 'SF Mono', monospace;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #161615; --bg2: #1E1E1C; --bg3: #282826;
+      --fg: #E8E7E3; --fg2: #9C9B96; --fg3: #6B6A66;
+      --border: #2E2E2B; --border2: #3A3A37;
+    }}
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: var(--bg); color: var(--fg); font-family: var(--font);
+         font-size: 14px; line-height: 1.55;
+         padding: 32px 24px; max-width: 1280px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; font-weight: 500; margin-bottom: 4px;
+       letter-spacing: -0.3px; }}
+  h2 {{ font-size: 15px; font-weight: 500; margin: 24px 0 4px;
+       letter-spacing: 0.02em; color: var(--fg);
+       border-bottom: 1px solid var(--border); padding-bottom: 6px; }}
+  .seed {{ font-size: 12px; color: var(--fg2); margin-bottom: 16px;
+          font-style: italic; font-family: var(--mono); }}
+  .lede {{ background: var(--bg2); border-left: 3px solid var(--accent);
+          padding: 10px 14px; margin: 16px 0 24px; font-size: 14px;
+          color: var(--fg); border-radius: 0 4px 4px 0; }}
+  .caption {{ font-size: 12px; color: var(--fg2); margin: 6px 0 12px;
+             line-height: 1.55; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 8px;
+          font-size: 13px; }}
+  th, td {{ padding: 6px 10px; text-align: left;
+           border-bottom: 1px solid var(--border); }}
+  th {{ font-size: 11px; color: var(--fg2); text-transform: uppercase;
+       letter-spacing: 0.08em; font-weight: 500; }}
+  td:last-child {{ text-align: right; font-family: var(--mono);
+                  font-variant-numeric: tabular-nums; }}
+  .chart-svg {{ background: var(--bg2); border: 1px solid var(--border);
+               border-radius: 4px; display: block; }}
+
+  /* Depth strip — flex row, responsive width */
+  .strip-wrap {{ background: var(--bg2); border: 1px solid var(--border);
+                border-radius: 4px; padding: 0; }}
+  .strip-cells {{ display: flex; height: 26px; border-radius: 4px 4px 0 0;
+                 overflow: hidden; }}
+  .strip-cell {{ flex: 1 1 0; min-width: 0; border-right: 1px solid var(--bg2);
+                cursor: default; transition: opacity 0.1s; }}
+  .strip-cell:last-child {{ border-right: none; }}
+  .strip-cell:hover {{ outline: 1.5px solid var(--fg); outline-offset: -1px;
+                      z-index: 2; position: relative; }}
+  .strip-ticks {{ position: relative; height: 18px; font-size: 9px;
+                 color: var(--fg2); font-family: var(--mono);
+                 border-top: 1px solid var(--border); }}
+  .strip-ticks span {{ position: absolute; top: 4px; transform: translateX(-50%); }}
+
+  /* Floating tooltip — used by dispersion + strip; appears near cursor */
+  #floating-tip {{ position: fixed; max-width: 420px; background: var(--bg);
+                  border: 1px solid var(--border2); border-radius: 4px;
+                  padding: 10px 12px; font-size: 12px; line-height: 1.5;
+                  pointer-events: none; display: none; z-index: 100;
+                  white-space: pre-line; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+                  color: var(--fg); }}
+
+  /* Conceptual map — fixed info panel above the SVG */
+  #map-tip {{ background: var(--bg2); border: 1px solid var(--border);
+             border-radius: 4px; padding: 12px 16px; font-size: 12px;
+             line-height: 1.5; white-space: pre-line; margin: 8px 0 12px;
+             height: 110px; overflow-y: auto; color: var(--fg); }}
+  #map-tip.empty {{ color: var(--fg3); font-style: italic; }}
+  .map-wrap {{ background: var(--bg2); border: 1px solid var(--border);
+              border-radius: 4px; padding: 8px; overflow: hidden; }}
+  .map-svg {{ display: block; max-width: 100%; height: auto; }}
+  .mnode {{ cursor: pointer; transition: stroke-width 0.1s; }}
+  .mnode:hover {{ stroke-width: 2.4; }}
+  .map-legend {{ font-size: 11px; color: var(--fg2); margin: 10px 0;
+                display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+                font-family: var(--mono); }}
+  .map-legend svg {{ display: block; }}
+
+  ul.leaf-list {{ list-style: none; padding-left: 0; }}
+  ul.leaf-list li {{ font-size: 13px; margin-bottom: 8px; padding-left: 16px;
+                    position: relative; }}
+  ul.leaf-list li::before {{ content: '·'; position: absolute; left: 0;
+                            color: var(--fg3); font-weight: 600; }}
+
+  footer {{ font-size: 11px; color: var(--fg2); margin-top: 36px;
+           padding-top: 12px; border-top: 1px solid var(--border);
+           font-style: italic; line-height: 1.6; }}
+</style>
+</head><body>
+
+<h1>Shape of the Investigation</h1>
+<div class="seed">seed: {html_mod.escape(seed_q)}</div>
+
+<div class="lede">{html_mod.escape(lede)}</div>
+
+<section>
+  <h2>Topology</h2>
+  <table>
+    <thead><tr><th>Metric</th><th style="text-align:right">Value</th></tr></thead>
+    <tbody>{topology_rows}</tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Dispersion timeline</h2>
+  <p class="caption">Hz = z-scored mean pairwise cosine distance over a 5-iteration
+  sliding window. Negative = the loop was deepening one conceptual neighbourhood;
+  positive = it was spreading across distinct regions. Gold dots mark score-9+
+  iterations. <b>Hover any point</b> for iter, score, Hz, and the tested estimand.</p>
+  {dispersion_svg}
+</section>
+
+<section>
+  <h2>Lineage depth · iter 1 → {max_iter}</h2>
+  <p class="caption">Each cell is one iteration. Color = depth in the conceptual
+  lineage tree — pale = shallow (close to iter 1), dark = deeply built on prior
+  work. Each iter's parent is its nearest prior iteration in embedding space.
+  <b>Hover any cell</b> for iter, parent, depth, and the finding.</p>
+  <div class="strip-wrap">
+    <div class="strip-cells">{''.join(strip_cells_html)}</div>
+    <div class="strip-ticks">{strip_ticks_html}</div>
+  </div>
+</section>
+
+{conceptual_section}
+
+{shallow_html}
+
+<footer>
+Embeddings: <code>{html_mod.escape(model_used)}</code>.
+Hz computed as mean pairwise cosine distance over a 5-iteration sliding window,
+then z-scored against the run mean. Lineage tree built by attaching each
+iteration to its nearest prior in embedding space — deterministic, no clustering.
+This is observability only — no decision in the run was informed by these metrics.
+</footer>
+
+<div id="floating-tip"></div>
+
+<script>
+const floatTip = document.getElementById('floating-tip');
+document.addEventListener('mousemove', e => {{
+  const t = e.target.closest('.mtip');
+  if (!t) {{ floatTip.style.display = 'none'; return; }}
+  floatTip.textContent = t.getAttribute('data-tip');
+  floatTip.style.display = 'block';
+  const tipWidth = 420;
+  floatTip.style.left = Math.min(e.clientX + 14, window.innerWidth - tipWidth - 16) + 'px';
+  floatTip.style.top = (e.clientY + 14) + 'px';
+}});
+</script>
+</body></html>"""
+        return doc
+
+    def _build_conceptual_map_section(self, vectors, iters, scores, estimands,
+                                       parents, max_iter, c_low, c_high):
+        """Build the conceptual-map section (t-SNE + phase shading + hover lineage).
+
+        Returns a complete HTML <section>...</section> string, or an empty
+        section with a placeholder notice if dependencies are missing or the
+        projection fails.
+        """
+        try:
+            import numpy as np
+            from sklearn.manifold import TSNE
+            from PIL import Image
+        except Exception as e:
+            return f"""
+  <section>
+    <h2>Conceptual map</h2>
+    <p class="caption">Could not render: missing dependency ({e}).
+    Install <code>scikit-learn</code> and <code>Pillow</code> to enable.</p>
+  </section>"""
+
+        import base64
+        import io
+        import html as html_mod
+
+        try:
+            embedded_idx = [i for i, v in enumerate(vectors) if v is not None]
+            X = np.array([vectors[i] for i in embedded_idx], dtype=float)
+            if not np.isfinite(X).all():
+                X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Numerical guards: explicit zero-norm protection, plus a blanket
+            # errstate suppression for the matmul itself. Embedding rows that
+            # are extreme or degenerate (very large components, near-zero norm
+            # after upstream cleanup, etc.) can still trigger cascading
+            # divide/overflow/invalid warnings inside the BLAS-backed matmul
+            # even with the norm guard in place — the warnings are diagnostic
+            # noise, not correctness bugs. The post-matmul `nan_to_num` ensures
+            # any NaN/Inf that leaks through gets replaced with sensible
+            # defaults (max distance) before t-SNE sees the matrix.
+            with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                norms = np.linalg.norm(X, axis=1, keepdims=True)
+                norms = np.where(norms > 1e-12, norms, 1.0)
+                Xn = X / norms
+                dist_mat = np.clip(1 - Xn @ Xn.T, 0, 2)
+            dist_mat = np.nan_to_num(dist_mat, nan=1.0, posinf=2.0, neginf=0.0)
+            np.fill_diagonal(dist_mat, 0)
+
+            perplexity = min(10, max(5, len(X) // 5))
+            tsne = TSNE(
+                n_components=2, metric='precomputed', init='random',
+                perplexity=perplexity, learning_rate='auto', random_state=42,
+            )
+            coords_emb = tsne.fit_transform(dist_mat)
+
+            mn, mx = coords_emb.min(axis=0), coords_emb.max(axis=0)
+            coords_emb = (coords_emb - mn) / (mx - mn + 1e-9)
+            if coords_emb[0, 1] > 0.5:
+                coords_emb[:, 1] = 1 - coords_emb[:, 1]
+            coords_emb[:, 0] += (0.5 - coords_emb[0, 0])
+            x_lo, x_hi = coords_emb[:, 0].min(), coords_emb[:, 0].max()
+            max_offset = max(0.5 - x_lo, x_hi - 0.5)
+            if max_offset > 0.45:
+                coords_emb[:, 0] = (
+                    0.5 + (coords_emb[:, 0] - 0.5) * (0.45 / max_offset)
+                )
+            coords_emb[:, 1] = coords_emb[:, 1] * 0.90 + 0.05
+
+            coords = np.full((len(vectors), 2), np.nan)
+            for k, idx in enumerate(embedded_idx):
+                coords[idx] = coords_emb[k]
+
+            iter_norm = np.array(
+                [(iters[i] - 1) / max(max_iter - 1, 1)
+                 if vectors[i] is not None else 0.0
+                 for i in range(len(vectors))],
+                dtype=float,
+            )
+            xs, ys = coords[:, 0], coords[:, 1]
+
+            img_w, img_h = 1280, 720
+            pad = 60
+            inner_w, inner_h = img_w - 2 * pad, img_h - 2 * pad
+            grid_nx, grid_ny = inner_w // 2, inner_h // 2
+            sigma = 0.07
+
+            gx = np.linspace(0, 1, grid_nx)
+            gy = np.linspace(0, 1, grid_ny)
+            X_grid, Y_grid = np.meshgrid(gx, gy)
+            mass = np.zeros((grid_ny, grid_nx))
+            weighted_sum = np.zeros((grid_ny, grid_nx))
+            for k in range(len(vectors)):
+                if vectors[k] is None:
+                    continue
+                d2 = (X_grid - xs[k]) ** 2 + (Y_grid - ys[k]) ** 2
+                w = np.exp(-d2 / (2 * sigma ** 2))
+                mass += w
+                weighted_sum += w * iter_norm[k]
+            mean_iter = np.where(
+                mass > 0.001, weighted_sum / np.maximum(mass, 1e-9), 0
+            )
+
+            c0 = np.array(c_low)
+            c1 = np.array(c_high)
+            nonzero_mass = mass[mass > 0.01]
+            mass_cap = (np.percentile(nonzero_mass, 80)
+                        if len(nonzero_mass) else 1.0)
+            alpha_map = np.clip(mass / mass_cap, 0, 1) * 0.45
+
+            rgba = np.zeros((grid_ny, grid_nx, 4), dtype=np.uint8)
+            valid_mask = mass >= 0.01
+            for ch, (lo, hi) in enumerate(zip(c0, c1)):
+                rgba[..., ch] = np.where(
+                    valid_mask, (lo + mean_iter * (hi - lo)).astype(np.uint8), 0
+                )
+            rgba[..., 3] = np.where(
+                valid_mask, (alpha_map * 255).astype(np.uint8), 0
+            )
+
+            img = Image.fromarray(rgba, 'RGBA').resize(
+                (inner_w, inner_h), Image.BILINEAR
+            )
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            img_b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+
+            def _px(i):
+                return (pad + coords[i, 0] * inner_w,
+                        pad + coords[i, 1] * inner_h)
+
+            def _grad(t):
+                return tuple(int(c0[k] + t * (c1[k] - c0[k])) for k in range(3))
+
+            svg_parts = [
+                f'<rect x="{pad}" y="{pad}" width="{inner_w}" height="{inner_h}" '
+                f'fill="var(--bg)" stroke="var(--border)" stroke-width="1"/>',
+                f'<image href="data:image/png;base64,{img_b64}" '
+                f'x="{pad}" y="{pad}" width="{inner_w}" height="{inner_h}" '
+                f'preserveAspectRatio="none"/>',
+                '<g id="lineage-layer"></g>',
+            ]
+
+            first_embedded = embedded_idx[0] if embedded_idx else None
+
+            def path_to_root(i):
+                chain = [i]
+                while parents[i] is not None:
+                    i = parents[i]
+                    chain.append(i)
+                return chain
+
+            for i in range(len(vectors)):
+                if vectors[i] is None:
+                    continue
+                x, y = _px(i)
+                sc = scores[i]
+                r = 4 + max(0, sc - 5) * 0.9
+                rgb = _grad((iters[i] - 1) / max(max_iter - 1, 1))
+                fill = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+                est_excerpt = (estimands[i][:280]
+                               + ('…' if len(estimands[i]) > 280 else ''))
+                tip = f"iter {iters[i]} · score {sc}\n\n{est_excerpt}"
+                chain = path_to_root(i)
+                chain_iters = ','.join(str(iters[j]) for j in chain)
+                if i == first_embedded:
+                    svg_parts.append(
+                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r + 6:.1f}" '
+                        f'fill="none" stroke="var(--fg)" stroke-width="1.2" '
+                        f'stroke-dasharray="2,2" pointer-events="none"/>'
+                    )
+                    svg_parts.append(
+                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r + 2:.1f}" '
+                        f'fill="{fill}" stroke="var(--fg)" stroke-width="1.3" '
+                        f'class="mnode" data-tip="{html_mod.escape(tip)}" '
+                        f'data-path="{chain_iters}"/>'
+                    )
+                    svg_parts.append(
+                        f'<text x="{x:.1f}" y="{y - r - 12:.1f}" font-size="11" '
+                        f'text-anchor="middle" fill="var(--fg)" font-weight="600" '
+                        f'font-family="var(--mono)">iter {iters[i]} (anchor)</text>'
+                    )
+                else:
+                    svg_parts.append(
+                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" '
+                        f'fill="{fill}" stroke="var(--fg)" stroke-width="0.7" '
+                        f'class="mnode" data-tip="{html_mod.escape(tip)}" '
+                        f'data-path="{chain_iters}"/>'
+                    )
+                    if sc >= 9:
+                        svg_parts.append(
+                            f'<text x="{x + r + 3:.1f}" y="{y + 3:.1f}" '
+                            f'font-size="10" fill="var(--fg2)" '
+                            f'font-family="var(--mono)">{iters[i]}</text>'
+                        )
+
+            map_svg = (
+                f'<svg viewBox="0 0 {img_w} {img_h}" width="100%" '
+                f'preserveAspectRatio="xMidYMid meet" '
+                f'xmlns="http://www.w3.org/2000/svg" class="map-svg">'
+                + ''.join(svg_parts) + '</svg>'
+            )
+
+            iter_xy_pairs = []
+            for i in range(len(vectors)):
+                if vectors[i] is None:
+                    continue
+                x, y = _px(i)
+                iter_xy_pairs.append(f'"{iters[i]}":[{x:.1f},{y:.1f}]')
+            iter_xy_js = '{' + ','.join(iter_xy_pairs) + '}'
+
+            sizes_legend = [(5, 4), (7, 5.8), (9, 7.6), (10, 8.5)]
+            size_swatches = ''.join(
+                f'<span style="display:inline-flex;align-items:center;gap:4px;'
+                f'margin-right:14px"><svg width="22" height="22">'
+                f'<circle cx="11" cy="11" r="{r}" fill="var(--fg3)" '
+                f'stroke="var(--fg)" stroke-width="0.6"/></svg>'
+                f'score {sc}</span>' for sc, r in sizes_legend
+            )
+
+            return f"""
+  <section>
+    <h2>Conceptual map</h2>
+    <p class="caption">2D projection of all iterations by conceptual similarity
+    (t-SNE on cosine distance). <b>Spatial proximity = conceptual similarity.</b>
+    iter 1 anchored at top-centre; the run unfolds downward. Dot color and
+    background shading both encode iteration (pale = early, dark = late).
+    Dot size = score. <b>Hover any iter</b> to draw its lineage path back to iter 1.</p>
+    <div class="map-legend">
+      <span style="display:inline-flex;align-items:center;gap:8px">
+        iter 1
+        <svg width="180" height="12">
+          <defs><linearGradient id="g_iter" x1="0" x2="1" y1="0" y2="0">
+            <stop offset="0%" stop-color="rgb({c0[0]},{c0[1]},{c0[2]})"/>
+            <stop offset="100%" stop-color="rgb({c1[0]},{c1[1]},{c1[2]})"/>
+          </linearGradient></defs>
+          <rect x="0" y="0" width="180" height="12" fill="url(#g_iter)"
+            stroke="var(--fg)" stroke-width="0.5"/>
+        </svg>
+        iter {max_iter}
+      </span>
+      <span>{size_swatches}</span>
+    </div>
+    <div id="map-tip" class="empty">Hover any iteration to see its estimand and lineage</div>
+    <div class="map-wrap">{map_svg}</div>
+  </section>
+
+<script>
+(() => {{
+  const mapTip = document.getElementById('map-tip');
+  const iterXY = {iter_xy_js};
+  const lineageLayer = document.getElementById('lineage-layer');
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const emptyMsg = 'Hover any iteration to see its estimand and lineage';
+
+  function drawLineage(pathStr) {{
+    clearLineage();
+    const its = pathStr.split(',');
+    if (its.length < 2) return;
+    const pts = its.map(it => iterXY[it]).filter(p => p);
+    if (pts.length < 2) return;
+    const polyline = document.createElementNS(svgNS, 'polyline');
+    polyline.setAttribute('points', pts.map(p => p.join(',')).join(' '));
+    polyline.setAttribute('fill', 'none');
+    polyline.setAttribute('stroke', '#D87C5A');
+    polyline.setAttribute('stroke-width', '1.6');
+    polyline.setAttribute('stroke-opacity', '0.85');
+    lineageLayer.appendChild(polyline);
+    pts.forEach((p, idx) => {{
+      if (idx === 0 || idx === pts.length - 1) return;
+      const c = document.createElementNS(svgNS, 'circle');
+      c.setAttribute('cx', p[0]); c.setAttribute('cy', p[1]);
+      c.setAttribute('r', '2.5'); c.setAttribute('fill', '#D87C5A');
+      c.setAttribute('stroke', '#1a1a1a'); c.setAttribute('stroke-width', '0.5');
+      lineageLayer.appendChild(c);
+    }});
+  }}
+  function clearLineage() {{
+    while (lineageLayer.firstChild) lineageLayer.removeChild(lineageLayer.firstChild);
+  }}
+  // Map nodes drive the map-tip and lineage; suppress the floating tooltip on them.
+  document.addEventListener('mousemove', e => {{
+    const m = e.target.closest('.mnode');
+    if (!m) {{
+      mapTip.textContent = emptyMsg;
+      mapTip.classList.add('empty');
+      clearLineage();
+      return;
+    }}
+    // Also hide floating-tip so it doesn't double up
+    const ft = document.getElementById('floating-tip');
+    if (ft) ft.style.display = 'none';
+    mapTip.textContent = m.getAttribute('data-tip');
+    mapTip.classList.remove('empty');
+    drawLineage(m.getAttribute('data-path'));
+  }});
+}})();
+</script>"""
+        except Exception as e:
+            return f"""
+  <section>
+    <h2>Conceptual map</h2>
+    <p class="caption">Could not render the map: {html_mod.escape(str(e))}</p>
+  </section>"""
+
     # ══════════════════════════════════════════════
     # HELPER METHODS
     # ══════════════════════════════════════════════
@@ -3323,8 +4101,134 @@ class AutoExplorer:
             'method_used': '',
             'tested_estimand': '',
             'iteration_added': getattr(self, '_current_iteration', 0) + 1,
+            'embedding': None,
+            'embedding_model': None,
         }
         return node_id
+
+    # ══════════════════════════════════════════════
+    # EMBEDDINGS (run-geometry observability)
+    # ══════════════════════════════════════════════
+
+    @staticmethod
+    def _embed_text_for_node(node):
+        """Pick the text to embed for a node.
+
+        Prefers `tested_estimand` — the formal causal/statistical target
+        of the iteration — over `finding_summary` and `result_digest`.
+        The latter two lean methodology-heavy ("Solution 1 fits...",
+        "HR-binned non-parametric matching..."), which makes embedding
+        clusters track *what apparatus was used* rather than *what
+        question was investigated*. `tested_estimand` is substantive
+        without that bias.
+
+        Falls back to the older fields for legacy (pre-v8) nodes that
+        predate `tested_estimand`, and ultimately to `question` as a
+        last resort. Returns '' when nothing usable is available.
+        """
+        text = (node.get('tested_estimand') or
+                node.get('finding_summary') or
+                node.get('result_digest') or
+                node.get('question') or '')
+        text = text.strip()
+        return text if len(text) >= 20 else ''
+
+    def _embed_node(self, node_id):
+        """Embed a winning node's finding text. Non-fatal — failures silent.
+
+        Called from the run() loop after node enrichment with finding_summary
+        and result_digest. The dashboard and run_geometry artefact treat a
+        missing embedding as a coverage gap.
+        """
+        client = getattr(self.engine, 'embedding_client', None)
+        if client is None:
+            return
+        node = self.insight_tree.get(node_id)
+        if not node:
+            return
+        text = self._embed_text_for_node(node)
+        if not text:
+            return
+        model = self.engine.embedding_model
+        try:
+            vector = client.embed(text, model)
+            node['embedding'] = vector
+            node['embedding_model'] = model
+            # Brief CLI confirmation — keeps the user informed without noise.
+            try:
+                print(
+                    f"    {style.DIM}⋯ embedded ({len(vector)}d){style.RESET}"
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Embedding failed for {node_id}: {e}")
+
+    def _backfill_embeddings(self):
+        """Embed any winning nodes that lack embeddings (post-resume backfill).
+
+        Called from run() after _restore_checkpoint when --continue is in
+        effect and backfill is enabled. Walks active winning nodes that have
+        embeddable text but no embedding, and embeds them sequentially.
+
+        Cost is announced before proceeding so the user knows what's
+        happening. Failures are logged and skipped — the panel will show
+        partial coverage rather than crashing.
+        """
+        client = getattr(self.engine, 'embedding_client', None)
+        if client is None:
+            return  # embeddings disabled
+
+        # Find candidates: active winning nodes with embeddable text + no embedding
+        candidates = []
+        for nid, node in self.insight_tree.items():
+            if node.get('status') != 'active':
+                continue
+            if node.get('embedding') is not None:
+                continue
+            if self._embed_text_for_node(node):
+                candidates.append(nid)
+
+        if not candidates:
+            return
+
+        # Rough cost estimate: assume ~400 tokens per finding_summary.
+        # text-embedding-3-small is $0.02/M, so ~$0.000008 per node.
+        try:
+            from llm import compute_cost
+            est_tokens = 400 * len(candidates)
+            est_cost = compute_cost(self.engine.embedding_model, est_tokens, 0)
+        except Exception:
+            est_cost = 0.0
+
+        print(
+            f"    {style.DIM}Backfilling embeddings for {len(candidates)} "
+            f"historical nodes (≈ ${est_cost:.4f})...{style.RESET}"
+        )
+
+        embedded = 0
+        failed = 0
+        with style.spinner(f"Embedding {len(candidates)} nodes"):
+            for nid in candidates:
+                try:
+                    self._embed_node(nid)
+                    if self.insight_tree[nid].get('embedding') is not None:
+                        embedded += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.warning(f"Backfill failed for {nid}: {e}")
+                    failed += 1
+
+        if failed:
+            print(
+                f"    {style.DIM}Backfill: {embedded} embedded, "
+                f"{failed} failed.{style.RESET}"
+            )
+        else:
+            print(
+                f"    {style.DIM}Backfill: {embedded} nodes embedded.{style.RESET}"
+            )
 
     def _get_exploration_history(self, max_entries=40, full_detail_count=15):
         """Build exploration history with tiered compaction."""
@@ -3418,9 +4322,15 @@ class AutoExplorer:
               insight_tree nodes now carry tested_estimand.
           v9: insight-tree iteration_added is now 1-based (matches
               arc_history, chain_ids, briefing/dashboard display).
+          v10: insight-tree nodes carry optional `embedding` (list[float])
+              and `embedding_model` (str). Both default to None. Used by
+              the dashboard's Run Geometry panel and the run_geometry.html
+              artifact. Pre-v10 nodes are migrated to None on load; the
+              backfill helper called from run() will embed them on
+              --continue when backfill_embeddings is True (default).
         """
         state = {
-            "version": 9,
+            "version": 10,
             "iterations_completed": iteration,
             "explorer": {
                 "insight_tree": self.insight_tree,
@@ -3547,6 +4457,24 @@ class AutoExplorer:
                 f"Legacy checkpoint: migrated {len(self.insight_tree)} "
                 f"insight-tree nodes to 1-based iteration_added"
             )
+
+        # v9 → v10 migration: ensure insight_tree nodes have the embedding
+        # fields (default None). Pre-v10 nodes never had embeddings; the
+        # backfill helper called from run() will populate them when
+        # backfill_embeddings is True. The geometry panel handles None
+        # entries gracefully (treats them as coverage gaps).
+        if version < 10:
+            added = 0
+            for node in self.insight_tree.values():
+                if 'embedding' not in node:
+                    node['embedding'] = None
+                    node['embedding_model'] = None
+                    added += 1
+            if added:
+                logger.info(
+                    f"Legacy checkpoint: added embedding fields to "
+                    f"{added} insight-tree nodes (None)"
+                )
 
         self.last_probe_iteration = ex.get('last_probe_iteration', 0)
         self.probe_history = ex.get('probe_history', [])
