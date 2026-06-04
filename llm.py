@@ -46,12 +46,12 @@ PRICING = {
     "o4-mini":                    {"input": 1.10, "output": 4.40},
     # OpenRouter — varies by model, add entries as needed
     # Pricing: https://openrouter.ai/models
-    "moonshotai/kimi-k2.5":       {"input": 0.45, "output": 2.20},
+    "moonshotai/kimi-k2.6":       {"input": 0.45, "output": 2.20},
     "z-ai/glm-5":                 {"input": 0.72, "output": 2.30},
     "z-ai/glm-5.1":               {"input": 1.39, "output": 4.40},
     "deepseek/deepseek-v3.2":     {"input": 0.26, "output": 0.38},
     "qwen/qwen3.5-397b-a17b":     {"input": 0.39, "output": 2.34},
-    "minimax/minimax-m2.7":       {"input": 0.30, "output": 1.20},
+    "minimax/minimax-m3":       {"input": 0.30, "output": 1.20},
     # Embeddings (output_tokens always 0)
     "text-embedding-3-small":     {"input": 0.02,  "output": 0.0},
     "text-embedding-3-large":     {"input": 0.13,  "output": 0.0},

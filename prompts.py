@@ -987,6 +987,17 @@ For each finding, use this block format:
 
     **STATUS: [TAG from Established Findings]**
 
+    **In plain terms:** One or two jargon-free sentences for a human reader —
+    the takeaway, not the method, and state the answer BEFORE any caveat. If the
+    finding's primary number is in an unintuitive unit (a ratio, a normalised
+    index, a regression coefficient, a log-odds), ALSO restate it in the most
+    intuitive everyday unit where one exists (e.g. a per-1000 m slope alongside a
+    ratio; a percentage alongside a log-odds). Introduce NO number or claim not
+    already supported by the technical paragraph below — this line only restates,
+    it never adds. (Human-facing only; every other line in this block stays in
+    its precise technical form, since the briefing's primary purpose is to seed
+    further LLM investigation.)
+
     One paragraph stating what was found, the key number(s), and the controls
     applied. Cite [[chain_id]] for every number. Draw from Section D for the
     specific numbers.
@@ -1010,8 +1021,9 @@ Tag semantics (same as the research model used):
   needed; the finding is not a finding-of-effect, it is an identifiability
   outcome. The NEXT line states what evidence would unblock it.
 
-Do NOT introduce finding-level narrative ("interestingly," etc.).
-Do NOT write plain-language summaries.
+Do NOT introduce finding-level narrative ("interestingly," etc.). The
+**In plain terms** line is the ONLY plain-language content in §2 and is capped at
+one or two sentences.
 
 ---
 
