@@ -16,12 +16,16 @@ build/
 output/
 logs/
 
-# Datasets (users bring their own)
-datasets/
+# Datasets: ignore everything in datasets/ except the public benchmark dataset.
+datasets/*
 *.csv
 *.xlsx
 *.parquet
 !datasets/.gitkeep
+!datasets/f1_driver_vs_car.csv
+
+# Tests (kept locally, not published to GitHub)
+tests/
 
 # IDE
 .vscode/
