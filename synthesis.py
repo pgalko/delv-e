@@ -36,7 +36,7 @@ logger = get_logger(__name__)
 
 
 from prompts import (SYNTHESIZER_SYSTEM, SYNTHESIZER_USER_TEMPLATE,
-                     SYNTHESIZER_EXTENSION_NOTICE)
+                     SYNTHESIZER_EXTENSION_NOTICE, DATA_MODE)
 
 
 def assemble_evidence(log, nav, max_chars=120000, headline_chars=1500,
@@ -105,9 +105,20 @@ def assemble_evidence(log, nav, max_chars=120000, headline_chars=1500,
 
 def _parse_synth(text):
     import re
+    # Blocks terminate ONLY at the next NAMED marker, never at arbitrary "###":
+    # a live run wrote "### Subsection" headers inside its briefing and the
+    # generic ### terminator cut the deliverable at the first one. \b keeps
+    # e.g. BRIEFINGS from matching.
+    _END = r"(?=###\s*(?:GATES|VERDICT|BRIEFING)\b|\Z)"
     def block(name):
-        m = re.search(rf"###\s*{name}\s*###\s*(.*?)(?=###|\Z)", text, re.DOTALL | re.IGNORECASE)
+        # Marker tolerance: a model occasionally malforms the trailing hashes
+        # (a live glm run emitted "###BRIEFING##" and the exact-match regex
+        # silently discarded a complete briefing). Require the leading ### and
+        # the name; accept any number of trailing hashes ON THE SAME LINE, so a
+        # zero-hash marker cannot swallow the content's own markdown headers.
+        m = re.search(rf"###\s*{name}[ \t]*#*\s*(.*?){_END}", text, re.DOTALL | re.IGNORECASE)
         return m.group(1).strip() if m else ""
+    gates = block("GATES")
     verdict_raw = block("VERDICT")
     briefing = block("BRIEFING")
     # Reasoning the model wrote before the VERDICT block — often substantial even
@@ -123,31 +134,45 @@ def _parse_synth(text):
         reason = parts[1].strip() if len(parts) > 1 else "unspecified additional analysis"
     if briefing.lower().strip() in ("none", "n/a", ""):
         briefing = ""
+    if not briefing:
+        # Briefing-marker salvage: if the model wrote a briefing marker in ANY
+        # malformed shape (wrong leading hashes, stray text on the marker line),
+        # recover the content after it rather than dropping the deliverable.
+        m = re.search(r"#{2,}\s*BRIEFING[^\n]*\n?", text, re.IGNORECASE)
+        if m:
+            salvage = text[m.end():]
+            cut = re.search(r"###\s*(GATES|VERDICT)\s*#*", salvage, re.IGNORECASE)
+            if cut:
+                salvage = salvage[:cut.start()]
+            salvage = salvage.strip()
+            if salvage.lower() not in ("none", "n/a", ""):
+                briefing = salvage
     if not verdict_raw and not briefing:
-        return {"verdict": "FINAL", "reason": "", "briefing": text.strip(), "preamble": ""}
+        return {"verdict": "FINAL", "reason": "", "briefing": text.strip(),
+                "preamble": "", "gates_review": gates}
     return {"verdict": "NEEDS_MORE_WORK" if needs else "FINAL",
-            "reason": reason, "briefing": briefing, "preamble": preamble}
+            "reason": reason, "briefing": briefing, "preamble": preamble,
+            "gates_review": gates}
 
 
 class Synthesizer:
     """Premium holistic re-derivation over raw evidence → verdict + briefing."""
 
-    def __init__(self, client, model):
+    def __init__(self, client, model, prompts=None):
         self.client = client
         self.model = model
+        self.p = prompts or DATA_MODE
 
-    def synthesize(self, seed, schema, log, nav, max_tokens=16000, final=False,
+    def synthesize(self, seed, schema, log, nav, max_tokens=None, final=False,
                    prior_seeds=None):
-        g1 = nav.g1_satisfied(log)
-        open_regimes = nav.open_regimes()
-        untested = nav.untested_frontier()
+        # Synthesis uses the shared DEFAULT_MAX_TOKENS budget (via call_with_ladder
+        # below). A reasoning synthesizer on Ollama can otherwise spend its whole
+        # budget on hidden reasoning and emit no briefing (seen live); the ladder
+        # steps its reasoning dial down on a capped turn instead of relying on the
+        # cap alone, and Anthropic's non-streaming limit is clamped inside llm.call.
+        compute = self.p.compute
         evidence = assemble_evidence(log, nav)
         nav_text = nav.render_for_investigator(log)
-
-        g1_status = ("SATISFIED — at least one effect-modifier regime was examined within levels."
-                     if g1 else
-                     "NOT SATISFIED — no stratification axis has been examined within levels. "
-                     "A null/uniform answer is NOT admissible while a candidate axis remains.")
 
         if prior_seeds:
             # On an extension, the briefing must answer ALL questions, so feed them
@@ -161,27 +186,46 @@ class Synthesizer:
         else:
             seed_for_template = seed
 
-        user = SYNTHESIZER_USER_TEMPLATE.format(
-            seed=seed_for_template, schema=schema, g1_status=g1_status,
-            open_regimes=", ".join(open_regimes) if open_regimes else "(none)",
-            untested_frontier=", ".join(untested) if untested else "(none)",
-            nav=nav_text, evidence=evidence)
+        if compute:
+            # Compute mode has no effect/regime/confound, so the statistical gates
+            # do not apply. The compute synthesizer self-checks uncertainty,
+            # convergence, and validity instead (see its system prompt).
+            g1, open_regimes, untested = True, [], []
+            user = self.p.synth_user.format(
+                seed=seed_for_template, nav=nav_text, evidence=evidence)
+        else:
+            g1 = nav.g1_satisfied(log)
+            open_regimes = nav.open_regimes()
+            untested = nav.untested_frontier()
+            g1_status = ("SATISFIED — at least one effect-modifier regime was examined within levels."
+                         if g1 else
+                         "NOT SATISFIED — no stratification axis has been examined within levels. "
+                         "A null/uniform answer is NOT admissible while a candidate axis remains.")
+            user = self.p.synth_user.format(
+                seed=seed_for_template, schema=schema, g1_status=g1_status,
+                open_regimes=", ".join(open_regimes) if open_regimes else "(none)",
+                untested_frontier=", ".join(untested) if untested else "(none)",
+                nav=nav_text, evidence=evidence)
         if prior_seeds:
             user += SYNTHESIZER_EXTENSION_NOTICE
         if final:
-            user += ("\n\nFINALIZATION NOTICE: this is the LAST synthesis — the iteration "
-                     "ceiling has been reached and no further analysis will run. You MUST "
-                     "produce a briefing (verdict FINAL); do NOT return NEEDS_MORE_WORK. If "
-                     "the answer is not fully settled, mark the Summary clearly as PROVISIONAL "
-                     "and list, in Open questions, the specific unexamined axes/confounds "
-                     f"(open regimes: {', '.join(open_regimes) or 'none'}; untested framings: "
-                     f"{', '.join(untested) or 'none'}) that could still change it.")
+            notice = ("\n\nFINALIZATION NOTICE: this is the LAST synthesis — the iteration "
+                      "ceiling has been reached and no further analysis will run. You MUST "
+                      "produce a briefing (verdict FINAL); do NOT return NEEDS_MORE_WORK. If "
+                      "the answer is not fully settled, mark the Summary clearly as PROVISIONAL")
+            if compute:
+                notice += " and list any remaining computations under Open questions."
+            else:
+                notice += (" and list, in Open questions, the specific unexamined axes/confounds "
+                           f"(open regimes: {', '.join(open_regimes) or 'none'}; untested framings: "
+                           f"{', '.join(untested) or 'none'}) that could still change it.")
+            user += notice
 
-        from llm import build_cached_messages
+        from llm import build_cached_messages, call_with_ladder
         # Cache the (stable) system prompt; the evidence/user content is volatile.
-        messages = build_cached_messages(self.model, SYNTHESIZER_SYSTEM, "", user)
-        resp = self.client.call(messages, self.model, agent="Synthesizer",
-                                max_tokens=max_tokens)
+        messages = build_cached_messages(self.model, self.p.synth_system, "", user)
+        resp, _meta = call_with_ladder(self.client, messages, self.model,
+                                       agent="Synthesizer", max_tokens=max_tokens)
         result = _parse_synth(resp or "")
 
         if final:
@@ -190,22 +234,27 @@ class Synthesizer:
             # the run always ends with a usable artifact.
             if not result["briefing"]:
                 salvage = result.get("preamble") or "(synthesizer produced no briefing text)"
+                if compute:
+                    tail = (f"\n\n## Open questions\n- {result['reason']}\n"
+                            if result.get("reason") else "")
+                else:
+                    tail = ("\n\n## Open questions\n"
+                            + (f"- Examine the effect within: {', '.join(open_regimes)}\n" if open_regimes else "")
+                            + (f"- Untested framings: {', '.join(untested)}\n" if untested else "")
+                            + (f"- {result['reason']}\n" if result.get("reason") else ""))
                 result["briefing"] = (
                     "## Summary (PROVISIONAL — stopped at the iteration ceiling)\n\n"
                     "This investigation was halted before it fully resolved; the reading below "
                     "is the best the evidence supports so far and may change with the "
                     "analyses listed under Open questions.\n\n"
-                    + salvage
-                    + "\n\n## Open questions\n"
-                    + (f"- Examine the effect within: {', '.join(open_regimes)}\n" if open_regimes else "")
-                    + (f"- Untested framings: {', '.join(untested)}\n" if untested else "")
-                    + (f"- {result['reason']}\n" if result.get("reason") else ""))
+                    + salvage + tail)
             result["verdict"] = "FINAL"
             return result
 
-        # Non-final: backstop G1 — if it tried to finalize while G1 unmet with an
-        # open axis, override to NEEDS_MORE_WORK so the loop does the work.
-        if result["verdict"] == "FINAL" and not g1 and open_regimes:
+        # Non-final: backstop G1 (data mode only) — if it tried to finalize while
+        # G1 unmet with an open axis, override to NEEDS_MORE_WORK so the loop does
+        # the work. Compute mode has no such gate.
+        if not compute and result["verdict"] == "FINAL" and not g1 and open_regimes:
             logger.warning("Synthesizer returned FINAL but G1 unmet with open regimes %s; "
                            "overriding to NEEDS_MORE_WORK.", open_regimes)
             result = {"verdict": "NEEDS_MORE_WORK",

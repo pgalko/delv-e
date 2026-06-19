@@ -19,10 +19,16 @@ ENABLED = (sys.stdout.isatty()
 VERSION = "0.2.0"
 TAGLINE = "Deep Exploratory Learning & Visualization Engine"
 
+# Set to "verify" by run_core in --verify mode: the iteration banner relabels
+# EXPLORING as VERIFYING and the run recolors magenta, so an audit pass is
+# visually unmistakable from a primary investigation.
+MODE = None
+
 _C = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
     "white": "\033[97m", "cyan": "\033[96m", "green": "\033[32m",
     "yellow": "\033[33m", "red": "\033[31m", "blue": "\033[34m", "gray": "\033[90m",
+    "magenta": "\033[95m",
 }
 
 
@@ -67,10 +73,14 @@ def _wrap(text, width, indent="    "):
     return "\n".join(out)
 
 
-def run_header(seed, rows, cols, iterations, code_model, brain_model, output):
+def run_header(seed, rows, cols, iterations, code_model, brain_model, output,
+               compute=False):
     def row(k, v, *st):
         print(f"  {c(k.ljust(8), 'dim')}{c(v, *st)}")
-    row("Data", f"{rows:,} rows × {cols} cols")
+    if compute:
+        row("Data", "computation-only (no dataset)")
+    else:
+        row("Data", f"{rows:,} rows × {cols} cols")
     row("Loop", f"{iterations} iterations")
     row("Code", code_model, "cyan")
     row("Brain", brain_model, "cyan")
@@ -83,11 +93,14 @@ def run_header(seed, rows, cols, iterations, code_model, brain_model, output):
 
 def iteration(step, max_steps, status="EXPLORING"):
     w = _width()
+    if MODE == "verify" and status == "EXPLORING":
+        status = "VERIFYING"
+    tone = "magenta" if MODE == "verify" else "cyan"
     left = f"— Iteration {step}/{max_steps} "
     right = f" {status} —"
     fill = max(3, w - len(left) - len(right) - 2)
     print()
-    print(c(left, "cyan", "bold") + c("─" * fill, "gray") + c(right, "cyan", "bold"))
+    print(c(left, tone, "bold") + c("─" * fill, "gray") + c(right, tone, "bold"))
     print()
 
 

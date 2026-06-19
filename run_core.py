@@ -39,8 +39,14 @@ def main():
         description="delv-e inverted-core: autonomous data investigation.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("dataset", help="Path to data file (.csv/.tsv/.xlsx/.parquet/.json/.jsonl).")
+    parser.add_argument("dataset", nargs="?", default=None,
+                        help="Path to data file (.csv/.tsv/.xlsx/.parquet/.json/.jsonl). "
+                             "Omit when using --compute.")
     parser.add_argument("question", nargs="?", default=None, help="Seed question.")
+    parser.add_argument("--compute", action="store_true",
+                        help="Dataset-free mode: run simulations or pure computation "
+                             "with no dataset loaded (`df` does not exist). Pass the "
+                             "question as the sole positional argument.")
     parser.add_argument("--iterations", type=int, default=14,
                         help="Max steps (a ceiling; the run stops earlier when the "
                              "Investigator synthesizes). With --resume/--extend, this "
@@ -51,7 +57,10 @@ def main():
                         help=f"Cheap model: code only (default {DEFAULT_EXECUTOR_MODEL}).")
     parser.add_argument("--synth-model", default=None,
                         help="Optional separate model for synthesis (default: investigator model).")
-    parser.add_argument("--output", default="output", help="Output directory (default: output/).")
+    parser.add_argument("--output", default=None,
+                        help="Output directory (default: output/; under --verify the "
+                             "default is output_verify/ so the audit never lands in "
+                             "the run it audits).")
     parser.add_argument("--data-dictionary", default=None,
                         help="Optional markdown file describing columns/caveats; appended to schema.")
     parser.add_argument("--periodic-every", type=int, default=0,
@@ -76,7 +85,19 @@ def main():
                              "rehydrate the prior state, pursue the new question in light "
                              "of it, and synthesize one combined briefing that reconciles "
                              "both lines, revising the original conclusion if warranted.")
+    parser.add_argument("--verify", dest="verify_run", default=None,
+                        nargs="?", const="@last", metavar="PRIOR_RUN_DIR",
+                        help="Audit a prior run: distill the decisive claims from its "
+                             "briefing.md, run a FRESH independent investigation that "
+                             "adjudicates them against the data, then write one "
+                             "reconciled briefing (originals preserved alongside) into "
+                             "output_verify/ by default. Bare --verify audits the last "
+                             "completed run (tracked in .delve_last_run). The positional "
+                             "question, if given, replaces the prior run's saved "
+                             "question in the audit framing.")
     args = parser.parse_args()
+    if args.output is None:
+        args.output = "output_verify" if args.verify_run is not None else "output"
 
     investigator_model = args.investigator_model or DEFAULT_INVESTIGATOR_MODEL
     executor_model = args.executor_model or DEFAULT_EXECUTOR_MODEL
@@ -114,7 +135,50 @@ def main():
     if args.resume_run and args.extend_run:
         print("Use either --resume or --extend, not both.", file=sys.stderr)
         sys.exit(1)
+    if args.verify_run and (args.resume_run or args.extend_run):
+        print("--verify starts a fresh independent audit; it cannot be combined "
+              "with --resume or --extend.", file=sys.stderr)
+        sys.exit(1)
     is_continue = args.resume_run or args.extend_run
+
+    # Compute mode: dataset-free. v1 supports fresh runs only; resume/extend/verify
+    # would each need the mode persisted in the saved state to rehydrate correctly.
+    if args.compute and (is_continue or args.verify_run):
+        print("--compute is a fresh dataset-free run; it cannot be combined with "
+              "--resume, --extend, or --verify yet.", file=sys.stderr)
+        sys.exit(1)
+    if args.compute:
+        # There is no dataset, so the sole positional is the question.
+        if args.question is None and args.dataset is not None:
+            args.question = args.dataset
+            args.dataset = None
+    elif not args.dataset:
+        parser.error("a dataset path is required (or pass --compute for a "
+                     "dataset-free run).")
+
+    # Verify mode: validate the prior run, load its briefing and question now;
+    # the audit seed itself is composed after the client exists (claim
+    # extraction is an LLM call). Independence is deliberate: only the prior
+    # BRIEFING crosses over, never the prior evidence chain or kernel.
+    verify_ctx = None
+    if args.verify_run:
+        import verify
+        prior_dir = verify.resolve_prior_dir(args.verify_run)
+        prior_briefing_path = verify.check_dirs(prior_dir, args.output)
+        with open(prior_briefing_path, encoding="utf-8") as f:
+            original_briefing = f.read()
+        prior_saved = _load_seeds(prior_dir)
+        original_seed = args.question or (prior_saved[-1] if prior_saved else
+                                          _load_saved_seed(prior_dir) or "")
+        if not original_seed:
+            print(f"--verify: no saved question found in {prior_dir}; "
+                  f"pass the original question as the positional argument.",
+                  file=sys.stderr)
+            sys.exit(1)
+        verify_ctx = {"original_seed": original_seed,
+                      "original_briefing": original_briefing,
+                      "prior_dir": prior_dir}
+        seed = None                      # composed after the client exists
 
     # Resolve the active seed and the prior-seed history.
     # - fresh:  seed from arg/prompt; history = [seed]
@@ -143,7 +207,7 @@ def main():
             sys.exit(1)
         if not saved_seeds:                      # older run had only seed.txt
             _save_seeds(args.output, [seed])
-    else:
+    elif not args.verify_run:
         seed = args.question
         if not seed:
             try:
@@ -154,7 +218,7 @@ def main():
             print("No seed question provided. Aborting.", file=sys.stderr)
             sys.exit(1)
 
-    df = load_dataset(args.dataset)
+    df = None if args.compute else load_dataset(args.dataset)
     data_dict = None
     if args.data_dictionary and os.path.exists(args.data_dictionary):
         with open(args.data_dictionary, encoding="utf-8") as f:
@@ -163,6 +227,8 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
     import ui
+    if verify_ctx is not None:
+        ui.MODE = "verify"
     cost_tracker = CostTracker()
     # Per-invocation log archive: <output>/logs/<UTC timestamp>/ holds run_log.json
     # and (at run end) run_telemetry.json. The checkpoint trio (nav_state.json,
@@ -176,6 +242,23 @@ def main():
     run_stats = RunStats()
     client = LLMClient(cost_tracker=cost_tracker, run_logger=run_logger,
                        progress=ui.ENABLED)
+
+    # Verify mode, phase 1: distill the prior briefing into decisive claims and
+    # compose the audit seed. From here on the pipeline is the standard one;
+    # the audit is just a run whose seed happens to carry claims to adjudicate.
+    if verify_ctx is not None:
+        ui.note(f"Verification audit of '{verify_ctx['prior_dir']}'; the "
+                f"reconciled briefing will land in '{args.output}/'.", "magenta")
+        ui.note("Verify: distilling the prior briefing into decisive claims…",
+                "magenta")
+        verify_ctx["claims"] = verify.extract_claims(
+            client, synth_model, verify_ctx["original_briefing"])
+        ui.note(f"Verify: auditing "
+                f"{len(verify_ctx['claims']) or 'an excerpt of'} claim(s).",
+                "magenta")
+        seed = verify.compose_audit_seed(
+            verify_ctx["original_seed"], verify_ctx["claims"],
+            verify_ctx["original_briefing"])
 
     # Build / restore kernel, nav, prior log.
     kernel = PersistentKernel(df=df)
@@ -202,9 +285,12 @@ def main():
                 pass
 
     ui.banner()
-    ui.run_header(seed=seed, rows=df.shape[0], cols=df.shape[1],
+    ui.run_header(seed=seed,
+                  rows=0 if df is None else df.shape[0],
+                  cols=0 if df is None else df.shape[1],
                   iterations=args.iterations, code_model=executor_model,
-                  brain_model=investigator_model, output=args.output)
+                  brain_model=investigator_model, output=args.output,
+                  compute=args.compute)
 
     run_t0 = time.time()
     try:
@@ -218,11 +304,28 @@ def main():
             g1_pushback_budget=args.g1_pushback, ui=ui,
             prior_seeds=prior_seeds,
             search_model=search_model, search_budget=args.search_budget,
-            stats=run_stats,
+            stats=run_stats, compute=args.compute,
         )
     finally:
         kernel.cleanup()
     run_wall = time.time() - run_t0
+
+    # Verify mode, phase 3: reconcile the audit with the original briefing into
+    # the single user-facing document. Runs before telemetry so the extra calls
+    # are counted. The audit's own briefing is preserved as briefing_audit.md;
+    # if reconciliation yields nothing usable, it stands in (never end
+    # empty-handed).
+    if verify_ctx is not None and briefing:
+        ui.note("Verify: reconciling the audit with the original briefing…",
+                "magenta")
+        reconciled = verify.reconcile(
+            client, synth_model, verify_ctx["original_seed"],
+            verify_ctx["original_briefing"], briefing)
+        _, used_fallback = verify.finalize_verify_outputs(
+            args.output, verify_ctx["original_briefing"], briefing,
+            reconciled, verify_ctx.get("claims", []))
+        if not used_fallback:
+            briefing = reconciled
 
     # Run telemetry (supersedes the old cost.txt). Written once, at run end, into
     # the timestamped log folder. The console still prints the cost line for live
@@ -232,7 +335,7 @@ def main():
                      else "FINAL" if briefing else "none")
     telemetry = build_run_telemetry(
         run_logger, cost_tracker, run_stats, log,
-        seed=seed, dataset_shape=df.shape,
+        seed=seed, dataset_shape=(0, 0) if df is None else df.shape,
         models={"investigator": investigator_model, "executor": executor_model,
                 "synthesizer": synth_model, "search": search_model},
         max_iters=args.iterations, wall_clock_s=run_wall,
@@ -243,10 +346,14 @@ def main():
     print()
     print(ui.c("  " + cost_line.replace("\n", "\n  "), "dim"))
     print(ui.c(f"  telemetry: {os.path.join(logs_dir, 'run_telemetry.json')}", "dim"))
+    if briefing and verify_ctx is None:
+        import verify as _verify
+        _verify.write_last_run_pointer(args.output)
     if briefing:
         ui.done(os.path.join(args.output, "briefing.md"))
     else:
         ui.note("No final briefing produced (check logs / nav_state.json).", "yellow")
+
 
 
 def _save_seeds(output_dir, seeds):

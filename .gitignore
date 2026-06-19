@@ -17,6 +17,8 @@ output/
 logs/
 
 # Datasets: ignore everything in datasets/ except the public benchmark dataset.
+# (datasets/* rather than datasets/ so a single file can be re-included; the
+# negation must come after the *.csv rule below, since last match wins.)
 datasets/*
 *.csv
 *.xlsx
@@ -40,3 +42,6 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+# Verification runs and the last-run pointer (regenerated; see --verify)
+output_verify/
+.delve_last_run

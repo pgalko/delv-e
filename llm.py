@@ -7,8 +7,9 @@ Supports Anthropic, OpenAI, Ollama, and OpenRouter via provider:model syntax:
     ollama:qwen3:30b
     openrouter:google/gemini-2.5-flash
 
-Provider classes each implement call() and stream() with identical signatures.
-LLMClient routes to the correct provider based on the model string.
+Provider classes each implement call() and stream(). LLMClient routes to the
+correct provider based on the model string and supplies any provider-specific
+options (e.g. Ollama's reasoning_effort, chosen per agent role).
 """
 
 import json
@@ -25,6 +26,52 @@ logger = get_logger(__name__)
 # the connection is considered dead. Protects against provider hangs without
 # killing legitimate slow generation (tokens keep the timer alive).
 STREAM_TIMEOUT = httpx.Timeout(None, connect=30.0, read=120.0, write=30.0)
+
+
+# Reasoning effort for models that expose a reasoning dial, chosen per agent role
+# and able to step down on truncation (see call_with_ladder). The Executor is
+# mechanical: it transcribes a closed spec into code with no analytical latitude,
+# so a chain-of-thought buys it nothing, and a reasoning model in that seat can
+# spend its entire output budget thinking and emit no code (observed with a kimi
+# code model truncating at the output cap with zero visible characters).
+# reasoning_effort="none" turns thinking off; the reasoning agents keep a real
+# budget. Valid values: "none", "low", "medium", "high". Ollama honours this on its
+# /v1 endpoint, and OpenRouter accepts the same dial (including "none") and relays
+# it to the underlying provider's native control; direct OpenAI and Anthropic have
+# no such kwarg here and are never sent it (see LLMClient._reasoning_extra). The
+# native `think: false` flag does NOT work over Ollama's /v1, which is why this is
+# expressed as reasoning_effort.
+EXECUTOR_REASONING_EFFORT = "none"
+DEFAULT_REASONING_EFFORT = "medium"
+
+# Output-token ceiling for an agent turn, shared by every role. Ollama and
+# OpenRouter take it as-is; the Anthropic clamp below applies on the direct
+# Anthropic non-streaming path.
+DEFAULT_MAX_TOKENS = 32000
+# Anthropic's SDK refuses a NON-STREAMING request whose max_tokens could run past
+# its ~10-minute timeout, so a call routed to a direct `anthropic:` model is clamped
+# to this. An `openrouter:anthropic/...` model uses the OpenAI-compatible OpenRouter
+# path instead and is not subject to this guard.
+ANTHROPIC_MAX_TOKENS = 20000
+
+# Reasoning-effort ladder, highest first. call_with_ladder (and the Investigator
+# loop) start at an agent's default effort and step down a rung each time a turn
+# truncates on hidden reasoning, forcing a model that would exhaust its budget
+# thinking to answer.
+_EFFORT_LADDER = ("high", "medium", "low", "none")
+
+
+def default_reasoning_effort(agent):
+    """The effort an agent starts at: the Executor runs with thinking off, every
+    other role at the standard default."""
+    return EXECUTOR_REASONING_EFFORT if agent == "Executor" else DEFAULT_REASONING_EFFORT
+
+
+def lower_reasoning_effort(effort):
+    """The next rung down the ladder, or None once thinking is already off."""
+    if effort not in _EFFORT_LADDER or effort == _EFFORT_LADDER[-1]:
+        return None
+    return _EFFORT_LADDER[_EFFORT_LADDER.index(effort) + 1]
 
 
 # ══════════════════════════════════════════════════
@@ -47,11 +94,13 @@ PRICING = {
     # OpenRouter — varies by model, add entries as needed
     # Pricing: https://openrouter.ai/models
     "moonshotai/kimi-k2.6":       {"input": 0.45, "output": 2.20},
-    "z-ai/glm-5":                 {"input": 0.72, "output": 2.30},
+    "z-ai/glm-5.2":               {"input": 1.40, "output": 4.40},
     "z-ai/glm-5.1":               {"input": 1.39, "output": 4.40},
     "deepseek/deepseek-v3.2":     {"input": 0.26, "output": 0.38},
     "qwen/qwen3.5-397b-a17b":     {"input": 0.39, "output": 2.34},
-    "minimax/minimax-m3":       {"input": 0.30, "output": 1.20},
+    "minimax/minimax-m3":         {"input": 0.30, "output": 1.20},
+    "google/gemini-3.5-flash":    {"input": 1.5, "output": 9.00},
+    "x-ai/grok-4.3":              {"input": 1.25, "output": 2.50},
     # Embeddings (output_tokens always 0)
     "text-embedding-3-small":     {"input": 0.02,  "output": 0.0},
     "text-embedding-3-large":     {"input": 0.13,  "output": 0.0},
@@ -357,13 +406,13 @@ class OllamaProvider:
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         self.client = OpenAI(base_url=f"{base_url}/v1", api_key="ollama")
 
-    def call(self, messages, model, max_tokens, temperature):
+    def call(self, messages, model, max_tokens, temperature, reasoning_effort="medium"):
         response = self.client.chat.completions.create(
             model=model,
             messages=_flatten_messages(messages),
             max_tokens=max_tokens,
             temperature=temperature,
-            extra_body={"reasoning_effort": "medium"},
+            extra_body={"reasoning_effort": reasoning_effort},
         )
         content = ""
         if response.choices and len(response.choices) > 0:
@@ -375,7 +424,7 @@ class OllamaProvider:
             0, 0,
         )
 
-    def stream(self, messages, model, max_tokens, temperature, on_token):
+    def stream(self, messages, model, max_tokens, temperature, on_token, reasoning_effort="medium"):
         collected = []
         input_tokens = 0
         output_tokens = 0
@@ -387,7 +436,7 @@ class OllamaProvider:
             stream=True,
             stream_options={"include_usage": True},
             timeout=STREAM_TIMEOUT,
-            extra_body={"reasoning_effort": "medium"},
+            extra_body={"reasoning_effort": reasoning_effort},
         )
         for chunk in stream:
             if chunk.usage:
@@ -426,13 +475,13 @@ class OpenRouterProvider:
             },
         )
 
-    def call(self, messages, model, max_tokens, temperature):
+    def call(self, messages, model, max_tokens, temperature, reasoning_effort="medium"):
         response = self.client.chat.completions.create(
             model=model,
             messages=_flatten_messages(messages),
             max_tokens=max_tokens,
             temperature=temperature,
-            extra_body={"reasoning": {"effort": "medium"}},
+            extra_body={"reasoning": {"effort": reasoning_effort}},
         )
         content = ""
         if response.choices and len(response.choices) > 0:
@@ -444,7 +493,7 @@ class OpenRouterProvider:
             0, 0,
         )
 
-    def stream(self, messages, model, max_tokens, temperature, on_token):
+    def stream(self, messages, model, max_tokens, temperature, on_token, reasoning_effort="medium"):
         collected = []
         input_tokens = 0
         output_tokens = 0
@@ -456,7 +505,7 @@ class OpenRouterProvider:
             stream=True,
             stream_options={"include_usage": True},
             timeout=STREAM_TIMEOUT,
-            extra_body={"reasoning": {"effort": "medium"}},
+            extra_body={"reasoning": {"effort": reasoning_effort}},
         )
         for chunk in stream:
             if chunk.usage:
@@ -499,6 +548,40 @@ def parse_model_string(model_string):
     if len(parts) == 2 and parts[0] in PROVIDER_CLASSES:
         return parts[0], parts[1]
     return DEFAULT_PROVIDER, model_string
+
+
+def call_with_ladder(client, messages, model, agent=None, max_tokens=None, temperature=0):
+    """A client call that steps the reasoning dial down (medium -> low -> none) each
+    time a turn comes back empty or capped, for providers that expose one (Ollama,
+    OpenRouter); other providers make a single call. Returns (text, meta).
+
+    Defined as a free function over `client` rather than a method so it works with
+    the lightweight client stubs in the test suite, which implement only call():
+    if a stub does not accept the meta/effort kwargs it simply gets one plain call.
+    """
+    if max_tokens is None:
+        max_tokens = DEFAULT_MAX_TOKENS
+    provider_name, _ = parse_model_string(model)
+    ladders = provider_name in ("ollama", "openrouter")
+    effort = default_reasoning_effort(agent)
+    while True:
+        try:
+            text, meta = client.call(
+                messages, model, max_tokens=max_tokens, temperature=temperature,
+                agent=agent, reasoning_effort=(effort if ladders else None),
+                return_meta=True)
+        except TypeError:
+            # Stub client without return_meta/reasoning_effort: one plain call.
+            return client.call(messages, model, max_tokens=max_tokens,
+                               temperature=temperature, agent=agent), {}
+        ok = bool((text or "").strip()) and not meta.get("truncated")
+        nxt = lower_reasoning_effort(effort) if ladders else None
+        if ok or nxt is None:
+            meta["effort_used"] = effort if ladders else None
+            return text, meta
+        logger.info("%s turn came back empty/capped at reasoning_effort=%s; "
+                    "retrying at %s.", agent or "model", effort, nxt)
+        effort = nxt
 
 
 # ══════════════════════════════════════════════════
@@ -792,6 +875,8 @@ def build_run_telemetry(run_logger, cost_tracker, run_stats, step_log,
             "synth_pushbacks": counts.get("synth_pushbacks", 0),
             "provisional_briefing": bool(flags.get("provisional_briefing", False)),
             "searches": counts.get("searches", 0),
+            "budget_wrapup_notices": counts.get("budget_wrapup_notices", 0),
+            "synth_briefing_retries": counts.get("synth_briefing_retries", 0),
         },
         "estimand": {
             "named": bool((target_estimand or "").strip()),
@@ -849,13 +934,32 @@ class LLMClient:
             self._providers[provider_name] = PROVIDER_CLASSES[provider_name]()
             return self._providers[provider_name]
 
-    def call(self, messages, model, max_tokens=10000, temperature=0, agent=None,
-             return_meta=False):
+    @staticmethod
+    def _reasoning_extra(provider_name, agent, override=None):
+        """Provider kwargs carrying the reasoning effort for this turn. Ollama and
+        OpenRouter both accept a reasoning_effort kwarg (each formats it for its own
+        API); direct OpenAI and Anthropic have no such control and get nothing.
+        `override` lets call_with_ladder step the effort down per attempt; without
+        it the agent's default applies. Keyed on the agent label so the client-call
+        interface (and every mock that implements it) stays unchanged."""
+        if provider_name not in ("ollama", "openrouter"):
+            return {}
+        return {"reasoning_effort": override or default_reasoning_effort(agent)}
+
+    def call(self, messages, model, max_tokens=DEFAULT_MAX_TOKENS, temperature=0, agent=None,
+             return_meta=False, reasoning_effort=None):
         """Non-streaming call. Returns response text (always a string, never None).
         When return_meta=True, returns (text, meta) where meta carries token usage
-        and a `truncated` flag (the model hit the output-token cap)."""
+        and a `truncated` flag (the model hit the output-token cap). reasoning_effort
+        overrides the agent default on providers with a reasoning dial. Direct
+        Anthropic is clamped to its safe non-streaming ceiling."""
         provider_name, model_name = parse_model_string(model)
         provider = self._get_provider(provider_name)
+        if max_tokens is None:
+            max_tokens = DEFAULT_MAX_TOKENS
+        if provider_name == "anthropic" and max_tokens > ANTHROPIC_MAX_TOKENS:
+            max_tokens = ANTHROPIC_MAX_TOKENS  # non-streaming SDK timeout guard
+        extra = self._reasoning_extra(provider_name, agent, reasoning_effort)
         start_time = time.time()
 
         from contextlib import nullcontext
@@ -863,7 +967,7 @@ class LLMClient:
         try:
             with spin:
                 content, input_tokens, output_tokens, cache_creation, cache_read = provider.call(
-                    messages, model_name, max_tokens, temperature
+                    messages, model_name, max_tokens, temperature, **extra
                 )
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")
@@ -888,11 +992,14 @@ class LLMClient:
                              "truncated": bool(output_tokens) and output_tokens >= max_tokens}
         return content
 
-    def stream(self, messages, model, max_tokens=10000, temperature=0,
-               output_manager=None, chain_id=None, agent=None):
+    def stream(self, messages, model, max_tokens=DEFAULT_MAX_TOKENS, temperature=0,
+               output_manager=None, chain_id=None, agent=None, reasoning_effort=None):
         """Streaming call. Returns full response text."""
         provider_name, model_name = parse_model_string(model)
         provider = self._get_provider(provider_name)
+        if max_tokens is None:
+            max_tokens = DEFAULT_MAX_TOKENS
+        extra = self._reasoning_extra(provider_name, agent, reasoning_effort)
         start_time = time.time()
         first_token_time = [None]  # mutable container for closure
 
@@ -904,7 +1011,7 @@ class LLMClient:
 
         try:
             content, input_tokens, output_tokens, cache_creation, cache_read = provider.stream(
-                messages, model_name, max_tokens, temperature, on_token
+                messages, model_name, max_tokens, temperature, on_token, **extra
             )
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")

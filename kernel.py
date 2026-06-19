@@ -41,7 +41,9 @@ logger = get_logger(__name__)
 
 # Wall-clock seconds for a single step. The persistent worker means a hang on
 # one step must not wedge the whole run, so on timeout we kill and restart.
-STEP_TIMEOUT = 300
+# Set to give a correctly vectorized simulation comfortable headroom; a scalar
+# per-sample loop will still blow past it, which is the intended signal.
+STEP_TIMEOUT = 600
 
 # Token the worker prints on its real stdout after each step completes. User
 # code output is captured in-worker and written to a result file, so the only
@@ -59,6 +61,9 @@ _INTERNAL_NAMES = {
     "_real_savefig", "_saved_plots", "_plot_counter", "_analysis_dir",
     "_patched_show", "_patched_savefig",
     "redirect_stdout",
+    # vetted toolkit functions: advertised in the prompts, not in the registry
+    "paired_ability", "cluster_bootstrap", "rank_uncertainty",
+    "_toolkit_import_error",
 }
 
 
@@ -67,7 +72,8 @@ _INTERNAL_NAMES = {
 # from stdin, execs the step's code into G (so state persists), writes a result
 # JSON, then prints the done token.
 _WORKER_SCRIPT = r'''
-import io, json, os, sys, traceback, warnings
+import inspect, io, json, os, sys, traceback, warnings
+import pickle as _pickle, types as _types, importlib as _importlib
 warnings.filterwarnings("ignore")
 
 import matplotlib
@@ -104,6 +110,32 @@ if _df_path:
     else:
         G["df"] = pd.read_csv(_df_path, low_memory=False)
 
+# ---- Vetted toolkit preload -------------------------------------------------
+# The three tested estimators from toolkit.py live in the namespace the same
+# way `df` does: callable, never shipped through a prompt. argv[2] is the
+# package directory (the worker script itself runs from a temp file). On
+# import failure we register stubs that raise an instructive error, so a spec
+# that calls one fails loudly with the cause instead of a bare NameError.
+_pkg_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+_ckpt_path = sys.argv[3] if len(sys.argv) > 3 else ""
+if _pkg_dir and _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
+try:
+    from toolkit import paired_ability, cluster_bootstrap, rank_uncertainty
+    G["paired_ability"] = paired_ability
+    G["cluster_bootstrap"] = cluster_bootstrap
+    G["rank_uncertainty"] = rank_uncertainty
+except Exception as _toolkit_err:
+    G["_toolkit_import_error"] = "%s: %s" % (type(_toolkit_err).__name__, _toolkit_err)
+    def _toolkit_stub_factory(_name):
+        def _stub(*_a, **_k):
+            raise RuntimeError(
+                "toolkit function %r is unavailable: toolkit.py failed to "
+                "import (%s)" % (_name, G["_toolkit_import_error"]))
+        return _stub
+    for _name in ("paired_ability", "cluster_bootstrap", "rank_uncertainty"):
+        G[_name] = _toolkit_stub_factory(_name)
+
 # ---- Plot capture (patched once; reads _analysis_dir from G per step) ------
 _real_savefig = _mpl_figure.Figure.savefig
 G["_real_savefig"] = _real_savefig
@@ -139,14 +171,77 @@ plt.show = _patched_show
 _mpl_figure.Figure.savefig = _patched_savefig
 
 
+_INTERNAL = {
+    "os", "io", "json", "sys", "traceback", "warnings",
+    "matplotlib", "plt", "_mpl_figure", "pd", "df",
+    "_real_savefig", "_saved_plots", "_plot_counter", "_analysis_dir",
+    "_patched_show", "_patched_savefig", "redirect_stdout",
+    "paired_ability", "cluster_bootstrap", "rank_uncertainty",
+    "_toolkit_import_error",
+}
+
+
+def _checkpoint_save(path):
+    """Pickle the derived DATA objects in G to `path` atomically. Modules are
+    recorded by import name (re-imported on load) and do not count against
+    completeness. Returns (ok, skipped): ok is True only when every non-module
+    derived object serialized. If anything is skipped (a function, lambda, or
+    otherwise unpicklable object), the previous complete checkpoint is left
+    untouched and the caller replays the tail from it instead."""
+    blobs, modules, skipped = {}, {}, []
+    for _name, _val in list(G.items()):
+        if _name in _INTERNAL or _name.startswith("_"):
+            continue
+        if isinstance(_val, _types.ModuleType):
+            modules[_name] = getattr(_val, "__name__", None)
+            continue
+        try:
+            blobs[_name] = _pickle.dumps(_val, protocol=_pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            skipped.append(_name)
+    if skipped:
+        return False, skipped
+    _tmp = path + ".tmp"
+    try:
+        with open(_tmp, "wb") as _cf:
+            _pickle.dump({"blobs": blobs, "modules": modules}, _cf,
+                         protocol=_pickle.HIGHEST_PROTOCOL)
+        os.replace(_tmp, path)
+    except Exception:
+        try:
+            os.remove(_tmp)
+        except Exception:
+            pass
+        return False, ["<write-failed>"]
+    return True, []
+
+
+def _checkpoint_load(path):
+    """Restore a checkpoint into G: re-import recorded modules, unpickle data.
+    Best-effort and silent; a missing or unreadable checkpoint leaves G empty."""
+    if not (path and os.path.exists(path) and os.path.getsize(path) > 0):
+        return
+    try:
+        with open(path, "rb") as _cf:
+            _snap = _pickle.load(_cf)
+    except Exception:
+        return
+    for _name, _modpath in (_snap.get("modules") or {}).items():
+        if _modpath:
+            try:
+                G[_name] = _importlib.import_module(_modpath)
+            except Exception:
+                pass
+    for _name, _blob in (_snap.get("blobs") or {}).items():
+        try:
+            G[_name] = _pickle.loads(_blob)
+        except Exception:
+            pass
+
+
 def _namespace_summary():
     """Compact description of user-defined names currently in G."""
-    internal = {
-        "os", "io", "json", "sys", "traceback", "warnings",
-        "matplotlib", "plt", "_mpl_figure", "pd", "df",
-        "_real_savefig", "_saved_plots", "_plot_counter", "_analysis_dir",
-        "_patched_show", "_patched_savefig", "redirect_stdout",
-    }
+    internal = _INTERNAL
     out = []
     for name, val in list(G.items()):
         if name in internal or name.startswith("__"):
@@ -167,8 +262,15 @@ def _namespace_summary():
                 desc = "%s len=%d" % (t, len(val))
             elif t in ("ndarray",):
                 desc = "ndarray shape=%s dtype=%s" % (getattr(val, "shape", "?"), getattr(val, "dtype", "?"))
-            elif t in ("function", "type", "module"):
-                continue  # imports/defs are not "derived state" worth listing
+            elif t == "function":
+                try:
+                    sig = name + str(inspect.signature(val))
+                except Exception:
+                    sig = name + "(...)"
+                doc = (inspect.getdoc(val) or "").strip().splitlines()
+                desc = "function " + sig + ((": " + doc[0][:80]) if doc else "")
+            elif t in ("type", "module"):
+                continue  # imported modules and class definitions are not reusable derived state
             else:
                 desc = t
         except Exception:
@@ -186,6 +288,9 @@ def _df_columns():
     except Exception:
         return []
 
+
+# ---- Restore checkpoint (only non-empty on a restart), then signal ready ----
+_checkpoint_load(_ckpt_path)
 
 # ---- Signal ready, then serve steps ---------------------------------------
 sys.stdout.write(_READY + "\n")
@@ -224,12 +329,21 @@ for _line in sys.stdin:
     finally:
         plt.close("all")
 
+    _ckpt_ok, _ckpt_skipped = False, []
+    if _error is None and _ckpt_path:
+        try:
+            _ckpt_ok, _ckpt_skipped = _checkpoint_save(_ckpt_path)
+        except Exception:
+            _ckpt_ok, _ckpt_skipped = False, ["<checkpoint-exception>"]
+
     _payload = {
         "stdout": _stdout,
         "error": _error,
         "plots": list(G.get("_saved_plots", [])),
         "namespace": _namespace_summary(),
         "columns": _df_columns(),
+        "checkpoint_ok": _ckpt_ok,
+        "checkpoint_skipped": _ckpt_skipped,
     }
     try:
         with open(_result_path, "w", encoding="utf-8") as _f:
@@ -265,8 +379,14 @@ class PersistentKernel:
             _WORKER_SCRIPT, suffix=".py", prefix="delve_kernel_"
         )
         # Ordered list of code blocks that previously executed without error.
-        # Replayed (in order) to reconstruct the namespace after a restart.
+        # On a restart the namespace is restored from a checkpoint and only the
+        # tail not covered by it is replayed (see _restart_and_replay).
+        # _snapshot_through is the number of history steps the last COMPLETE
+        # checkpoint covers; 0 means no usable checkpoint yet (full replay).
         self._history = []
+        _cfd, self._ckpt_path = tempfile.mkstemp(suffix=".pkl", prefix="delve_ckpt_")
+        os.close(_cfd)  # leaves a 0-byte file; the worker skips an empty checkpoint
+        self._snapshot_through = 0
         # Latest namespace registry from the worker.
         self.registry = {"namespace": [], "columns": []}
         self._proc = None
@@ -276,9 +396,11 @@ class PersistentKernel:
 
     # ----- worker lifecycle ------------------------------------------------
 
-    def _start_worker(self):
+    def _start_worker(self, load_ckpt=True):
         self._proc = subprocess.Popen(
-            [sys.executable, "-u", self._worker_script_path, self._df_path or ""],
+            [sys.executable, "-u", self._worker_script_path, self._df_path or "",
+             os.path.dirname(os.path.abspath(__file__)),
+             self._ckpt_path if load_ckpt else ""],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -339,17 +461,35 @@ class PersistentKernel:
         self._proc = None
 
     def _restart_and_replay(self):
-        """Restart the worker and replay successful history to rebuild state."""
-        logger.warning("Persistent kernel restarting; replaying %d step(s).", len(self._history))
+        """Rebuild the namespace after a kill. Restore the last complete checkpoint
+        (loaded by the fresh worker on startup), then replay only the steps after
+        it. If that tail fails (a step errors or the worker dies), fall back to a
+        full replay from a clean worker, which is the original O(n) behavior."""
+        n = self._snapshot_through
+        tail = self._history[n:]
+        logger.warning(
+            "Persistent kernel restarting; restoring checkpoint through step %d, "
+            "replaying %d tail step(s).", n, len(tail))
         self._kill_worker()
-        self._start_worker()
-        replayed = 0
-        for code in self._history:
-            ok = self._run_once(code, analysis_dir=None)
-            if ok is None:  # death during replay → give up cleanly
-                logger.error("Kernel died during replay at step %d; namespace partial.", replayed)
+        self._start_worker(load_ckpt=(n > 0))
+        for i, code in enumerate(tail):
+            res = self._run_once(code, analysis_dir=None)
+            if res is None or res.get("_timeout") or res.get("error"):
+                logger.warning("Checkpoint tail replay failed at tail step %d; "
+                               "falling back to full replay.", i)
                 break
-            replayed += 1
+        else:
+            return  # tail replayed cleanly: namespace is whole
+
+        # Fallback: clean worker, ignore the checkpoint, replay the whole history.
+        self._kill_worker()
+        self._start_worker(load_ckpt=False)
+        for j, code in enumerate(self._history):
+            res = self._run_once(code, analysis_dir=None)
+            if res is None or (res and res.get("_timeout")):
+                logger.error("Kernel could not complete full replay at step %d; "
+                             "namespace partial.", j)
+                break
 
     # ----- execution -------------------------------------------------------
 
@@ -445,6 +585,10 @@ class PersistentKernel:
         }
         if error is None:
             self._history.append(code)  # only successful steps are replayable
+            if result.get("checkpoint_ok"):
+                # The checkpoint now captures state through this step, so a future
+                # restart restores from here and skips replaying everything before.
+                self._snapshot_through = len(self._history)
         return stdout, error, plots
 
     # ----- introspection / lifecycle --------------------------------------
@@ -492,7 +636,12 @@ class PersistentKernel:
         self._kill_worker()
         self._history = []
         self.registry = {"namespace": [], "columns": []}
-        self._start_worker()
+        self._snapshot_through = 0
+        try:
+            open(self._ckpt_path, "wb").close()  # truncate so no stale state loads
+        except Exception:
+            pass
+        self._start_worker(load_ckpt=False)
 
     @property
     def history(self):
@@ -502,8 +651,8 @@ class PersistentKernel:
 
     def restore_history(self, history):
         """Replay an external history (from a prior run) to rebuild the namespace
-        on a fresh worker. Used by --continue. Best-effort: a step that fails to
-        replay is logged and skipped."""
+        on a fresh worker. Used by --resume and --extend. Best-effort: a step that
+        fails to replay is logged and skipped."""
         for code in history or []:
             res = self._run_once(code, analysis_dir=None)
             if res is None:                      # worker died mid-replay
@@ -511,6 +660,8 @@ class PersistentKernel:
                 res = self._run_once(code, analysis_dir=None)
             if res and not res.get("error") and not res.get("_timeout"):
                 self._history.append(code)
+                if res.get("checkpoint_ok"):
+                    self._snapshot_through = len(self._history)
                 self.registry = {"namespace": res.get("namespace", []),
                                  "columns": res.get("columns", [])}
             else:
@@ -527,7 +678,7 @@ class PersistentKernel:
                     self._kill_worker()
         finally:
             self._kill_worker()
-            _cleanup_files(self._worker_script_path, self._df_path)
+            _cleanup_files(self._worker_script_path, self._df_path, self._ckpt_path)
             self._worker_script_path = None
             self._df_path = None
 

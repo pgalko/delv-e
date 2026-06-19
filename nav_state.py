@@ -336,7 +336,7 @@ class NavState:
     def evidence_index(log, spec_chars=90):
         """MECHANICAL view of the log: step -> spec handle + has-output/error.
         Lets any reader resolve a step pointer back to what was run. Not stored
-        in NavState; rebuilt from the log on demand (and after --continue)."""
+        in NavState; rebuilt from the log on demand (and after --resume/--extend)."""
         lines = []
         for e in log:
             if e.get("terminal"):
@@ -391,7 +391,7 @@ class NavState:
         """For artifacts/dashboard. Still pointer-based — not an answer."""
         return self.render_for_investigator(log=None)
 
-    # ---- persistence (for --continue / dashboard) ----------------------
+    # ---- persistence (for --resume/--extend / dashboard) ----------------
 
     def to_dict(self):
         return {

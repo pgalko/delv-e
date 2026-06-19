@@ -42,12 +42,17 @@ from logger_config import get_logger
 logger = get_logger(__name__)
 # Prompts now live in prompts.py (single source of truth; see the prompt audit).
 from prompts import (
-    INVESTIGATOR_SYSTEM, INVESTIGATOR_HEAD_TEMPLATE, INVESTIGATOR_TAIL_TEMPLATE,
-    EXECUTOR_SYSTEM, EXECUTOR_USER_TEMPLATE, EXECUTOR_RETRY_TEMPLATE,
+    INVESTIGATOR_TAIL_TEMPLATE,
+    EXECUTOR_USER_TEMPLATE, EXECUTOR_RETRY_TEMPLATE,
     EXECUTOR_TRUNCATION_RETRY, DIRECTIVE_G1_GATE, DIRECTIVE_SYNTH_GATE,
-    DIRECTIVE_MIDPOINT, DIRECTIVE_EXTEND_LEDGER,
+    DIRECTIVE_MIDPOINT, DIRECTIVE_EXTEND_LEDGER, BUDGET_WRAPUP_TEMPLATE,
     SEARCH_INVESTIGATOR_INSTRUCTION, SEARCH_MIDSTREAM_TEMPLATE,
-    DIRECTIVE_SEARCH_SPENT, DIRECTIVE_SEARCH_FAILED,
+    DIRECTIVE_SEARCH_SPENT, DIRECTIVE_SEARCH_FAILED, DIRECTIVE_TRUNCATED_RETRY,
+    DATA_MODE, mode_prompts,
+)
+from llm import (
+    DEFAULT_MAX_TOKENS, default_reasoning_effort, lower_reasoning_effort,
+    call_with_ladder,
 )
 
 
@@ -157,18 +162,19 @@ class Executor:
     """Cheap coder: closed spec -> pandas -> run in kernel -> raw output.
     Mechanical retry on error (no judgment)."""
 
-    def __init__(self, client, model, max_retries=2, max_tokens=20000):
+    def __init__(self, client, model, max_retries=2, max_tokens=None, prompts=None):
         self.client = client
         self.model = model
         self.max_retries = max_retries
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens or DEFAULT_MAX_TOKENS
+        self.p = prompts or DATA_MODE
 
     def run(self, spec, kernel, registry_text, analysis_dir=None):
         """Returns dict: {code, stdout, error, attempts}. Never raises on a bad
         executor response — if the model fails to produce runnable code, that is
         returned as an error dict so the Investigator can see it and adapt."""
         messages = [
-            {"role": "system", "content": EXECUTOR_SYSTEM},
+            {"role": "system", "content": self.p.exec_system},
             {"role": "user", "content": EXECUTOR_USER_TEMPLATE.format(
                 spec=spec, registry=registry_text)},
         ]
@@ -176,8 +182,8 @@ class Executor:
         stdout = None
         error = None
         for attempt in range(self.max_retries + 1):
-            resp = self.client.call(messages, self.model, agent="Executor",
-                                    max_tokens=self.max_tokens)
+            resp, _meta = call_with_ladder(self.client, messages, self.model,
+                                           agent="Executor", max_tokens=self.max_tokens)
             code = extract_code(resp or "")
             if not code:
                 # Most common cause: a reasoning model spent its whole token budget
@@ -199,18 +205,27 @@ class Executor:
                 "attempts": self.max_retries + 1}
 
 
+# Investigator turns use the shared DEFAULT_MAX_TOKENS budget. The output-token cap
+# is no longer the lever for a reasoning model that exhausts its budget thinking:
+# the loop below steps the reasoning dial down (medium -> low -> none) on a truncated
+# turn instead. Anthropic's non-streaming SDK limit is handled by a clamp inside
+# llm.call, so the same budget is safe to pass on every provider.
+
+
 class Investigator:
     """Premium thinker: reads raw evidence, integrates, decides + compiles next step."""
 
-    def __init__(self, client, model, search_enabled=False, search_budget=0):
+    def __init__(self, client, model, search_enabled=False, search_budget=0, prompts=None):
         self.client = client
         self.model = model
         self.search_enabled = search_enabled
         self.search_budget = search_budget
+        self.p = prompts or DATA_MODE
 
-    def decide(self, seed, schema, registry_text, log, nav, directive=None, rehydrate=None):
+    def decide(self, seed, schema, registry_text, log, nav, directive=None, rehydrate=None,
+               budget_note=None, reasoning_effort=None):
         nav_text = nav.render_for_investigator(log)
-        head = INVESTIGATOR_HEAD_TEMPLATE.format(seed=seed, schema=schema)
+        head = self.p.inv_head.format(seed=seed, schema=schema)
         # Tiered history: recent + live-thread (protected) + rehydrated stay full;
         # older closed-thread steps collapse to a headline + pointer.
         blocks = _history_blocks(log, protected=nav.protected_steps(),
@@ -223,22 +238,28 @@ class Investigator:
         else:
             stable_blocks = [head] + blocks
         tail = INVESTIGATOR_TAIL_TEMPLATE.format(registry=registry_text, nav=nav_text)
+        # Late-window budget notice (volatile, uncached): present only in the run's
+        # final stretch so the total budget never reads as a quota to fill.
+        if budget_note:
+            tail += ("\n\n" + budget_note)
         if directive:
             tail += ("\n\nDIRECTIVE (act on this now): " + directive)
         from llm import build_cached_messages
-        messages = build_cached_messages(self.model, INVESTIGATOR_SYSTEM, stable_blocks, tail)
-        # 16k so a thinking model's reasoning AND its structured decision both fit;
-        # at 8k a long chain-of-thought could exhaust the budget before emitting any
-        # markers, yielding an empty turn. `truncated` lets the loop retry instead of
-        # mis-reading an empty/cut-off turn as a decision.
+        messages = build_cached_messages(self.model, self.p.inv_system, stable_blocks, tail)
+        # The budget is shared by a thinking model between its reasoning and its
+        # structured decision. `truncated` lets the loop retry instead of mis-reading
+        # an empty/cut-off turn as a decision; reasoning_effort is stepped down by the
+        # loop across those retries.
         try:
             resp, meta = self.client.call(messages, self.model, agent="Investigator",
-                                          max_tokens=16000, return_meta=True)
+                                          max_tokens=DEFAULT_MAX_TOKENS, return_meta=True,
+                                          reasoning_effort=reasoning_effort)
         except TypeError:
-            # Client predates return_meta (e.g. a lightweight test stub): fall back to
-            # text-only; truncation can then only be inferred from an empty response.
+            # Client predates return_meta/reasoning_effort (e.g. a lightweight test
+            # stub): fall back to text-only; truncation can then only be inferred
+            # from an empty response.
             resp = self.client.call(messages, self.model, agent="Investigator",
-                                    max_tokens=16000)
+                                    max_tokens=DEFAULT_MAX_TOKENS)
             meta = {}
         decision = _parse_investigator(resp or "")
         decision["incomplete"] = (not (resp or "").strip()) or bool(meta.get("truncated"))
@@ -313,6 +334,13 @@ def _format_log(log):
 INV_TRUNCATION_RETRIES = 2
 
 
+def _budget_window(max_steps):
+    """How many final iterations get the wrap-up notice: the last fifth of the
+    budget, never fewer than the last 2 turns. The notice is absent before the
+    window so the total budget is never visible as a quota to fill."""
+    return max(2, -(-max_steps // 5))
+
+
 def _referenced_names(text, kernel):
     """Names of existing derived objects that appear (as whole words) in `text`.
     Used to show the Executor only the objects its closed spec actually names."""
@@ -341,7 +369,8 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                       synth_model=None, schema_text="", max_steps=12,
                       output_dir="output", kernel=None, nav=None, log=None,
                       periodic_every=0, g1_pushback_budget=2, on_step=None, ui=None,
-                      prior_seeds=None, search_model=None, search_budget=3, stats=None):
+                      prior_seeds=None, search_model=None, search_budget=3, stats=None,
+                      compute=False):
     """The inverted-core loop with synthesis.
 
     Each iteration: one premium Investigator call (integrate last raw result,
@@ -354,7 +383,12 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
     resumes with a directive instead of finishing. Optional periodic re-derivation
     writes landscape snapshots and can course-correct.
 
-    To RESUME a prior run (--continue): pass the restored `kernel` (with
+    `compute=True` selects dataset-free mode: `df` may be None, the agents use the
+    compute prompt bundle, and the statistical G1 gate is bypassed (the compute
+    synthesizer self-checks uncertainty/convergence/validity instead). Everything
+    else (kernel, ledger, loop, nets) is identical.
+
+    To RESUME a prior run (--resume/--extend): pass the restored `kernel` (with
     restore_history already applied), `nav`, and prior `log`; max_steps is then
     the number of ADDITIONAL steps. Step numbering continues from the prior log.
 
@@ -372,12 +406,13 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
         log.pop()
     step_offset = max((e["step"] for e in log if not e.get("terminal")), default=0)
 
+    p = mode_prompts(compute)
     synth_model = synth_model or investigator_model
     search_enabled = bool(search_model)
-    investigator = Investigator(client, investigator_model,
-                                search_enabled=search_enabled, search_budget=search_budget)
-    executor = Executor(client, executor_model)
-    synthesizer = Synthesizer(client, synth_model)
+    investigator = Investigator(client, investigator_model, search_enabled=search_enabled,
+                                search_budget=search_budget, prompts=p)
+    executor = Executor(client, executor_model, prompts=p)
+    synthesizer = Synthesizer(client, synth_model, prompts=p)
     searches_used = 0
     briefing = ""
     # On an --extend run, the first Investigator turn is told to carry the
@@ -414,27 +449,45 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
         for i in range(1, max_steps + 1):
             step = step_offset + i
             registry_text = kernel.describe_namespace(names=_live_names(kernel, log))
+            # Wrap-up notice only inside the final stretch of THIS invocation's
+            # budget (resume/extend budgets are additional steps, so i is right).
+            steps_left = max_steps - i + 1
+            budget_note = None
+            if steps_left <= _budget_window(max_steps):
+                budget_note = BUDGET_WRAPUP_TEMPLATE.format(n=steps_left)
+                if stats:
+                    stats.bump("budget_wrapup_notices")
             if ui:
                 ui.iteration(step, max_steps, "ORIENTING" if i == 1 else "EXPLORING")
                 ui.agent("Investigator", investigator_model)
             decision = investigator.decide(seed, schema_text, registry_text, log,
-                                           nav, directive=directive, rehydrate=rehydrate)
+                                           nav, directive=directive, rehydrate=rehydrate,
+                                           budget_note=budget_note)
             # An empty or token-capped (truncated) turn carries no real decision.
             # Retry it rather than letting the parser's markerless fallback finalize
             # the run prematurely. Only after repeated truncation do we give up and
             # emit a provisional briefing (never end empty-handed).
             inv_tries = 1
+            inv_effort = default_reasoning_effort("Investigator")
             while decision.get("incomplete") and inv_tries <= INV_TRUNCATION_RETRIES:
+                inv_effort = lower_reasoning_effort(inv_effort) or inv_effort
                 logger.info("Step %d: Investigator turn was empty/truncated "
-                            "(attempt %d/%d); retrying instead of finalizing.",
-                            step, inv_tries, INV_TRUNCATION_RETRIES)
+                            "(attempt %d/%d); retrying at reasoning_effort=%s.",
+                            step, inv_tries, INV_TRUNCATION_RETRIES, inv_effort)
                 if ui:
                     ui.note("Investigator turn was cut off; retrying.", "yellow")
                 inv_tries += 1
                 if stats:
                     stats.bump("investigator_truncation_retries")
+                # Re-sending the same prompt just repeats the over-thinking, so both
+                # steer the retry to emit the decision now AND step the reasoning dial
+                # down. Keep any pending directive too.
+                retry_directive = (DIRECTIVE_TRUNCATED_RETRY if not directive
+                                   else directive + "\n\n" + DIRECTIVE_TRUNCATED_RETRY)
                 decision = investigator.decide(seed, schema_text, registry_text, log,
-                                               nav, directive=directive, rehydrate=rehydrate)
+                                               nav, directive=retry_directive, rehydrate=rehydrate,
+                                               budget_note=budget_note,
+                                               reasoning_effort=inv_effort)
             directive = None  # consumed (after any retries)
             if decision.get("incomplete"):
                 logger.warning("Step %d: Investigator still truncated after %d attempts; "
@@ -447,7 +500,8 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                             "stdout": None, "error": None,
                             "thinking": decision.get("thinking", ""), "attempts": 0,
                             "terminal": True, "g1_satisfied": nav.g1_satisfied(log),
-                            "synth_verdict": result["verdict"]})
+                            "synth_verdict": result["verdict"],
+                            "gates_review": result.get("gates_review", "")})
                 _persist()
                 if on_step:
                     on_step(log[-1])
@@ -469,10 +523,11 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
             _persist()
 
             if decision["status"] == "SYNTHESIZE":
-                # G1 HARD GATE. If the effect was never examined within a regime
-                # and a candidate axis still exists, do NOT finish — push back and
-                # make the Investigator do the stratification first.
-                if (not nav.g1_satisfied(log) and nav.open_regimes()
+                # G1 HARD GATE (data mode only). If the effect was never examined
+                # within a regime and a candidate axis still exists, do NOT finish:
+                # push back and make the Investigator stratify first. In compute
+                # mode there is no effect/regime to gate on, so it is skipped.
+                if (not compute and not nav.g1_satisfied(log) and nav.open_regimes()
                         and pushbacks < g1_pushback_budget):
                     pushbacks += 1
                     if stats:
@@ -509,12 +564,25 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                                 "spent; forcing a provisional briefing.", step)
                     result = _final_synthesis(final=True)
 
+                # FINAL with no parseable briefing is the one terminal state the
+                # other nets do not cover (seen live: a malformed briefing marker
+                # parsed to an empty briefing under a FINAL verdict). Re-run once
+                # in finalization mode, which forces a briefing and salvages.
+                if result["verdict"] == "FINAL" and not result.get("briefing"):
+                    logger.warning("Step %d: synthesizer returned FINAL with no "
+                                   "parseable briefing; re-running in finalization "
+                                   "mode to recover the deliverable.", step)
+                    if stats:
+                        stats.bump("synth_briefing_retries")
+                    result = _final_synthesis(final=True)
+
                 briefing = result.get("briefing", "")
                 log.append({"step": step, "spec": "(synthesize)", "code": None,
                             "stdout": None, "error": None,
                             "thinking": decision["thinking"], "attempts": 0,
                             "terminal": True, "g1_satisfied": nav.g1_satisfied(log),
-                            "synth_verdict": result["verdict"]})
+                            "synth_verdict": result["verdict"],
+                            "gates_review": result.get("gates_review", "")})
                 _persist()
                 if on_step:
                     on_step(log[-1])

@@ -8,6 +8,10 @@ decides each analytical move. A cheaper model turns each move into Python code
 and runs it. A premium model writes the final briefing from the evidence that was
 gathered. Every step is recorded, so the whole investigation can be audited.
 
+It also runs without a dataset, in a computation-only mode, for questions answered
+by simulation or numerical work rather than by analysis of a file (see
+[Computation-only mode](#computation-only-mode)).
+
 ## What you get
 
 You give delv-e two things: a data file and a question in plain language. It
@@ -33,13 +37,19 @@ question is answered, the Synthesizer reads the raw evidence and writes the
 briefing. It can also send the investigation back for more work when the evidence
 does not yet support a conclusion.
 
+The kernel also preloads a small **vetted toolkit** of tested estimators
+(`paired_ability`, `cluster_bootstrap`, `rank_uncertainty`), so the Investigator
+can request a standard method as a single call instead of describing the
+algorithm. The Investigator chooses the estimator; the Executor only transcribes
+the call; the implementation lives in `toolkit.py` under known-answer tests.
+
 ### The persistent kernel
 
 All code runs in one long-lived Python worker process with a single namespace.
-The dataset loads once at the start. Objects created in one step remain available
-to later steps, so the investigation builds on its own intermediate work. When a
-step crashes, the failure is isolated and the namespace is rebuilt by replaying
-the prior code.
+The dataset loads once at the start. Objects and functions created in one step
+remain available to later steps, so the investigation builds on its own
+intermediate work. When a step crashes, the failure is isolated and the namespace
+is rebuilt from the most recent checkpoint and a replay of only the steps after it.
 
 ### The pointer ledger
 
@@ -119,6 +129,21 @@ A local Ollama server needs no key.
 python run_core.py DATA_FILE "YOUR QUESTION"
 ```
 
+To audit a finished run with a fresh, independent second pass (claims are
+distilled from its briefing, re-derived from the raw data under a fixed stress
+battery, and the two documents are reconciled into one corrected briefing):
+
+```
+python run_core.py DATA_FILE --verify                 # audits the last run
+python run_core.py DATA_FILE --verify SOME_RUN_DIR    # audits a specific run
+```
+
+Results land in `output_verify/` (override with `--output`). The audit's
+`briefing.md` carries each decisive claim with its verification status
+(confirmed, attenuated, refuted, or contested); the original and the raw
+audit are preserved alongside as `briefing_original.md` and `briefing_audit.md`.
+Roughly doubles runtime; worth it when the conclusions matter.
+
 Example:
 
 ```
@@ -135,7 +160,7 @@ csv, tsv, xlsx, parquet, json, and jsonl.
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--iterations N` | 14 | Maximum number of steps. The run stops earlier when the Investigator synthesizes. With `--continue`, this is the number of additional steps. |
+| `--iterations N` | 14 | Maximum number of steps. The run stops earlier when the Investigator synthesizes. With `--resume` or `--extend`, this is the number of additional steps. |
 | `--investigator-model M` | anthropic:claude-opus-4-8 | Premium model for reasoning and synthesis. |
 | `--executor-model M` | anthropic:claude-haiku-4-5-20251001 | Cheaper model for writing and running code. |
 | `--synth-model M` | investigator model | Optional separate model for synthesis. |
@@ -143,7 +168,12 @@ csv, tsv, xlsx, parquet, json, and jsonl.
 | `--data-dictionary FILE` | none | Markdown file describing columns and caveats, appended to the schema. |
 | `--periodic-every N` | 0 | Take a holistic re-derivation snapshot every N steps. 0 turns it off. |
 | `--g1-pushback N` | 2 | How many times the synthesis gates (G1, G3, G4) may collectively force more work before a verdict is accepted. |
-| `--continue` | off | Resume from saved state in the output directory. Iterations are additive. |
+| `--search-model M` | none | Enables mid-stream web search for external calibration. Anthropic models only. Off when unset. |
+| `--search-budget N` | 3 | Hard cap on web searches per run when search is enabled. |
+| `--resume` | off | Continue an interrupted or finished run from the saved state in the output directory. |
+| `--extend` | off | Continue a finished run with a new question that can revise the earlier conclusion. Requires a new question. |
+| `--verify [DIR]` | off | Audit a finished run with a fresh independent second pass: its decisive claims are re-derived under a fixed stress battery and reconciled into a corrected briefing (originals kept alongside). Bare `--verify` audits the last run; pass a run directory to audit a specific one. Writes to `output_verify/` by default. Cannot combine with `--resume`, `--extend`, or `--compute`. |
+| `--compute` | off | Run without a dataset (computation-only mode); the sole positional argument is the question. Fresh runs only. See below. |
 
 ### Models and providers
 
@@ -157,6 +187,37 @@ python run_core.py data.csv "..." \
   --executor-model ollama:kimi-k2.6:cloud
 ```
 
+### Web search
+
+Search is off by default. Setting `--search-model` (an Anthropic model) lets the
+Investigator request a web search mid-run when an external reference value would
+help calibrate a finding. Each search is recorded in the evidence log and in
+`exploration/NN/search.md`, and `--search-budget` caps how many searches one run
+may use. Search results serve as calibration context; the analysis itself always
+comes from the data.
+
+### Computation-only mode
+
+For questions answered by computation rather than by analysis of a file,
+`--compute` runs the same loop with no dataset loaded:
+
+```
+python run_core.py --compute "Estimate the probability that two fair six-sided dice sum to 9 or more, by Monte Carlo, and cross-check it against the exact value."
+```
+
+The roles are unchanged. The Investigator decides each move and writes a closed
+specification; the Executor writes and runs the code for that move (a simulation, a
+numerical method, or a derivation) against the same persistent kernel; the
+Synthesizer writes the briefing from the results. Because there is no dataset, the
+data-oriented guardrails do not apply. In their place the Synthesizer checks that
+the answer carries its uncertainty (a Monte Carlo standard error or an interval),
+that it converged or was cross-checked against a known case, and that its
+assumptions and the regime where it holds are stated.
+
+This mode runs fresh investigations only; it cannot be combined with `--resume`,
+`--extend`, or `--verify`. Pass the question as the single positional argument and
+omit the data file.
+
 ## Output
 
 Everything is written under the output directory.
@@ -165,20 +226,34 @@ Everything is written under the output directory.
 - `log.json` is the full evidence log of every step.
 - `nav_state.json` is the pointer ledger.
 - `kernel_history.json` is the code history, used to resume.
-- `exploration/NN/analysis.md` holds the move, the reasoning, the code, and the output for step NN.
-- `seed.txt` stores the question for resuming.
+- `exploration/NN/analysis.md` holds the move, the reasoning, the code, and the output for step NN. Web-search steps write `search.md` there instead.
+- `landscape_stepNN.md` holds the periodic snapshots when `--periodic-every` is on.
+- `seeds.json` stores the question history for `--resume` and `--extend`; `seed.txt` mirrors the latest question for quick reading.
 - `logs/<timestamp>/` holds one folder per run: `run_log.json` (the full API-call log) and `run_telemetry.json` (token usage, dollar cost per provider, cache savings, and per-agent timing, written once at the end of the run).
 
-## Resuming a run
+## Resuming and extending a run
 
-To continue an investigation, point `--continue` at the same output directory:
+To continue an investigation after an interruption, point `--resume` at the same
+output directory:
 
 ```
-python run_core.py data.csv --continue --iterations 8
+python run_core.py data.csv --resume --iterations 8
 ```
 
 The kernel is rebuilt from its history, the ledger and evidence are reloaded, and
-the new iteration count is added on top.
+the new iteration count is added on top of the prior steps. A finished run can be
+resumed too; its closing entry is reopened so the investigation continues.
+
+To take a finished investigation further, `--extend` accepts a new question:
+
+```
+python run_core.py data.csv "Is the effect explained by era alone?" --extend --iterations 8
+```
+
+An extension rehydrates the prior state, pursues the new question alongside the
+original one, and writes a single combined briefing that reconciles both lines.
+The Synthesizer re-derives everything from the raw evidence, so an extension can
+revise the original conclusion when the new work warrants it.
 
 ## Terminal output
 
@@ -195,10 +270,13 @@ remains in `run_log.json`. To keep logs and warnings on the console, set
 | `run_core.py` | Command line entry point and run setup. |
 | `investigation.py` | The main loop, the Investigator, and the Executor. |
 | `synthesis.py` | The Synthesizer and the briefing. |
+| `verify.py` | The independent audit pass behind `--verify`: claim extraction, re-derivation under a stress battery, and reconciliation into a corrected briefing. |
 | `nav_state.py` | The pointer ledger. |
 | `kernel.py` | The persistent Python kernel. |
-| `llm.py` | Provider clients, prompt caching, and cost tracking. |
-| `executor.py` | Shared helpers for code extraction, plot capture, and kernel support. |
+| `llm.py` | Provider clients, prompt caching, cost tracking, and run telemetry. |
+| `prompts.py` | All model-facing prompt text: system prompts, templates, and directives. |
+| `executor.py` | Shared code helpers: the security blacklist for generated code, code extraction, and temp-file utilities. |
+| `toolkit.py` | Vetted statistical estimators preloaded into the kernel (paired-comparison ability models, cluster bootstrap, rank uncertainty). |
 | `dataio.py` | Dataset loading and schema building. |
 | `ui.py` | Terminal styling and progress output. |
 | `logger_config.py` | Logging setup. |
