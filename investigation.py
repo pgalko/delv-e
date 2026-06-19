@@ -51,7 +51,7 @@ from prompts import (
     DATA_MODE, mode_prompts,
 )
 from llm import (
-    DEFAULT_MAX_TOKENS, default_reasoning_effort, lower_reasoning_effort,
+    DEFAULT_MAX_TOKENS,
     call_with_ladder,
 )
 
@@ -215,12 +215,14 @@ class Executor:
 class Investigator:
     """Premium thinker: reads raw evidence, integrates, decides + compiles next step."""
 
-    def __init__(self, client, model, search_enabled=False, search_budget=0, prompts=None):
+    def __init__(self, client, model, search_enabled=False, search_budget=0, prompts=None,
+                 reasoning_effort="medium"):
         self.client = client
         self.model = model
         self.search_enabled = search_enabled
         self.search_budget = search_budget
         self.p = prompts or DATA_MODE
+        self.reasoning_effort = reasoning_effort
 
     def decide(self, seed, schema, registry_text, log, nav, directive=None, rehydrate=None,
                budget_note=None, reasoning_effort=None):
@@ -248,12 +250,14 @@ class Investigator:
         messages = build_cached_messages(self.model, self.p.inv_system, stable_blocks, tail)
         # The budget is shared by a thinking model between its reasoning and its
         # structured decision. `truncated` lets the loop retry instead of mis-reading
-        # an empty/cut-off turn as a decision; reasoning_effort is stepped down by the
-        # loop across those retries.
+        # an empty/cut-off turn as a decision. The effort defaults to the configured
+        # starting level (the --reasoning-effort flag); the loop overrides it to 'none'
+        # on the final truncation retry.
+        eff = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
         try:
             resp, meta = self.client.call(messages, self.model, agent="Investigator",
                                           max_tokens=DEFAULT_MAX_TOKENS, return_meta=True,
-                                          reasoning_effort=reasoning_effort)
+                                          reasoning_effort=eff)
         except TypeError:
             # Client predates return_meta/reasoning_effort (e.g. a lightweight test
             # stub): fall back to text-only; truncation can then only be inferred
@@ -370,7 +374,7 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                       output_dir="output", kernel=None, nav=None, log=None,
                       periodic_every=0, g1_pushback_budget=2, on_step=None, ui=None,
                       prior_seeds=None, search_model=None, search_budget=3, stats=None,
-                      compute=False):
+                      compute=False, reasoning_effort="medium"):
     """The inverted-core loop with synthesis.
 
     Each iteration: one premium Investigator call (integrate last raw result,
@@ -410,9 +414,11 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
     synth_model = synth_model or investigator_model
     search_enabled = bool(search_model)
     investigator = Investigator(client, investigator_model, search_enabled=search_enabled,
-                                search_budget=search_budget, prompts=p)
+                                search_budget=search_budget, prompts=p,
+                                reasoning_effort=reasoning_effort)
     executor = Executor(client, executor_model, prompts=p)
-    synthesizer = Synthesizer(client, synth_model, prompts=p)
+    synthesizer = Synthesizer(client, synth_model, prompts=p,
+                              reasoning_effort=reasoning_effort)
     searches_used = 0
     briefing = ""
     # On an --extend run, the first Investigator turn is told to carry the
@@ -465,29 +471,33 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                                            budget_note=budget_note)
             # An empty or token-capped (truncated) turn carries no real decision.
             # Retry it rather than letting the parser's markerless fallback finalize
-            # the run prematurely. Only after repeated truncation do we give up and
-            # emit a provisional briefing (never end empty-handed).
-            inv_tries = 1
-            inv_effort = default_reasoning_effort("Investigator")
-            while decision.get("incomplete") and inv_tries <= INV_TRUNCATION_RETRIES:
-                inv_effort = lower_reasoning_effort(inv_effort) or inv_effort
+            # the run prematurely. Attempt 1 above ran at the chosen effort; a retry
+            # holds that effort but adds the think-less directive, and the FINAL retry
+            # forces reasoning off (the one reliable circuit-breaker across models),
+            # dropping the directive since 'none' is the fix rather than the nudge.
+            # Only after the retries are exhausted do we emit a provisional briefing
+            # (never end empty-handed).
+            inv_retry = 0
+            while decision.get("incomplete") and inv_retry < INV_TRUNCATION_RETRIES:
+                inv_retry += 1
+                last = inv_retry == INV_TRUNCATION_RETRIES
+                retry_effort = "none" if last else None  # None keeps the chosen effort
+                if last:
+                    retry_directive = directive
+                else:
+                    retry_directive = (DIRECTIVE_TRUNCATED_RETRY if not directive
+                                       else directive + "\n\n" + DIRECTIVE_TRUNCATED_RETRY)
                 logger.info("Step %d: Investigator turn was empty/truncated "
-                            "(attempt %d/%d); retrying at reasoning_effort=%s.",
-                            step, inv_tries, INV_TRUNCATION_RETRIES, inv_effort)
+                            "(retry %d/%d); reasoning_effort=%s.", step, inv_retry,
+                            INV_TRUNCATION_RETRIES, retry_effort or investigator.reasoning_effort)
                 if ui:
                     ui.note("Investigator turn was cut off; retrying.", "yellow")
-                inv_tries += 1
                 if stats:
                     stats.bump("investigator_truncation_retries")
-                # Re-sending the same prompt just repeats the over-thinking, so both
-                # steer the retry to emit the decision now AND step the reasoning dial
-                # down. Keep any pending directive too.
-                retry_directive = (DIRECTIVE_TRUNCATED_RETRY if not directive
-                                   else directive + "\n\n" + DIRECTIVE_TRUNCATED_RETRY)
                 decision = investigator.decide(seed, schema_text, registry_text, log,
                                                nav, directive=retry_directive, rehydrate=rehydrate,
                                                budget_note=budget_note,
-                                               reasoning_effort=inv_effort)
+                                               reasoning_effort=retry_effort)
             directive = None  # consumed (after any retries)
             if decision.get("incomplete"):
                 logger.warning("Step %d: Investigator still truncated after %d attempts; "

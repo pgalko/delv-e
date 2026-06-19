@@ -316,11 +316,14 @@ DIRECTIVE_SEARCH_FAILED = (
 # prompt just repeats that, so the retry is steered to spend the budget on the
 # decision rather than on more thinking.
 DIRECTIVE_TRUNCATED_RETRY = (
-    "Your previous turn used up its entire output budget on internal reasoning and "
-    "produced no decision. Do NOT re-derive everything from scratch. Reason in at most "
-    "a few sentences, then emit your ###THINKING###, ###STATUS###, ###SPEC###, and "
-    "###LEDGER### blocks right away. Getting a complete, parseable decision out this "
-    "turn matters more than any further analysis; you can refine on the next turn.")
+    "STOP. Your previous turn used up its entire output budget on internal reasoning "
+    "and produced NO usable decision, which wasted the turn completely. Do not let that "
+    "happen again. You have ALREADY done the reasoning, so do NOT re-derive anything and "
+    "do NOT keep thinking. Emit your ###THINKING### (two sentences at most), ###STATUS###, "
+    "###SPEC###, and ###LEDGER### blocks IMMEDIATELY, before any further analysis. A "
+    "complete, parseable decision this turn is the ONLY thing that matters; you can refine "
+    "on the next turn. If you are unsure, commit to the single most reasonable next move "
+    "and emit the blocks now.")
 
 
 # Injected as the FIRST directive of an --extend run, so the inherited ledger is

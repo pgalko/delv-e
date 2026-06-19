@@ -164,6 +164,7 @@ csv, tsv, xlsx, parquet, json, and jsonl.
 | `--investigator-model M` | anthropic:claude-opus-4-8 | Premium model for reasoning and synthesis. |
 | `--executor-model M` | anthropic:claude-haiku-4-5-20251001 | Cheaper model for writing and running code. |
 | `--synth-model M` | investigator model | Optional separate model for synthesis. |
+| `--reasoning-effort LEVEL` | medium | How hard the Investigator and Synthesizer think: `max`, `high`, `medium`, `low`, or `none`. The Executor always runs with reasoning off. Mapped per provider; a direct Anthropic model ignores it. See [Reasoning effort](#reasoning-effort). |
 | `--output DIR` | output/ | Where results are written. |
 | `--data-dictionary FILE` | none | Markdown file describing columns and caveats, appended to the schema. |
 | `--periodic-every N` | 0 | Take a holistic re-derivation snapshot every N steps. 0 turns it off. |
@@ -186,6 +187,19 @@ python run_core.py data.csv "..." \
   --investigator-model anthropic:claude-opus-4-8 \
   --executor-model ollama:kimi-k2.6:cloud
 ```
+
+### Reasoning effort
+
+`--reasoning-effort` sets how hard the premium models think. It applies to the
+Investigator and Synthesizer; the Executor always runs with reasoning off, since it
+only transcribes a closed specification. The levels are `max`, `high`, `medium`
+(the default), `low`, and `none`.
+
+Each level is mapped to the provider's own dial: Ollama takes it unchanged,
+OpenRouter's top level is `xhigh` so `max` maps to that, and a direct `anthropic:`
+model ignores the flag (it has no effort dial; an `openrouter:anthropic/...` model
+still honors it). Reasoning models also read the levels differently: GLM-5.2 already
+runs at its maximum for `medium` and `low`, so pass `high` to make it reason less.
 
 ### Web search
 

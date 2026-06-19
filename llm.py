@@ -46,32 +46,37 @@ DEFAULT_REASONING_EFFORT = "medium"
 
 # Output-token ceiling for an agent turn, shared by every role. Ollama and
 # OpenRouter take it as-is; the Anthropic clamp below applies on the direct
-# Anthropic non-streaming path.
-DEFAULT_MAX_TOKENS = 32000
+# Anthropic non-streaming path. Sized to let a heavy reasoning model (e.g. GLM-5.2
+# at its max effort) finish its thinking AND emit a decision in a single turn.
+DEFAULT_MAX_TOKENS = 64000
 # Anthropic's SDK refuses a NON-STREAMING request whose max_tokens could run past
 # its ~10-minute timeout, so a call routed to a direct `anthropic:` model is clamped
 # to this. An `openrouter:anthropic/...` model uses the OpenAI-compatible OpenRouter
 # path instead and is not subject to this guard.
 ANTHROPIC_MAX_TOKENS = 20000
 
-# Reasoning-effort ladder, highest first. call_with_ladder (and the Investigator
-# loop) start at an agent's default effort and step down a rung each time a turn
-# truncates on hidden reasoning, forcing a model that would exhaust its budget
-# thinking to answer.
-_EFFORT_LADDER = ("high", "medium", "low", "none")
+# A truncation retry holds the chosen effort once (with a directive to stop
+# over-thinking), then drops straight to 'none' (see call_with_ladder and the
+# Investigator loop). Walking intermediate rungs is unreliable across models, since
+# some collapse low/medium to their max, so 'none' is the one dependable off switch.
 
 
 def default_reasoning_effort(agent):
     """The effort an agent starts at: the Executor runs with thinking off, every
-    other role at the standard default."""
+    other role at the standard default (overridable by the --reasoning-effort flag)."""
     return EXECUTOR_REASONING_EFFORT if agent == "Executor" else DEFAULT_REASONING_EFFORT
 
 
-def lower_reasoning_effort(effort):
-    """The next rung down the ladder, or None once thinking is already off."""
-    if effort not in _EFFORT_LADDER or effort == _EFFORT_LADDER[-1]:
+def _provider_effort(provider_name, effort):
+    """Translate a canonical effort value to what the provider expects, or None to
+    send no effort field. Ollama takes the value as-is; OpenRouter's top rung is
+    'xhigh' rather than 'max'; direct OpenAI and Anthropic have no effort dial here
+    (Anthropic uses a thinking-token budget, a separate mechanism)."""
+    if provider_name not in ("ollama", "openrouter"):
         return None
-    return _EFFORT_LADDER[_EFFORT_LADDER.index(effort) + 1]
+    if provider_name == "openrouter":
+        return "xhigh" if effort == "max" else effort
+    return effort
 
 
 # ══════════════════════════════════════════════════
@@ -550,38 +555,45 @@ def parse_model_string(model_string):
     return DEFAULT_PROVIDER, model_string
 
 
-def call_with_ladder(client, messages, model, agent=None, max_tokens=None, temperature=0):
-    """A client call that steps the reasoning dial down (medium -> low -> none) each
-    time a turn comes back empty or capped, for providers that expose one (Ollama,
-    OpenRouter); other providers make a single call. Returns (text, meta).
+def call_with_ladder(client, messages, model, agent=None, max_tokens=None,
+                     temperature=0, reasoning_effort=None):
+    """Call the client at the chosen reasoning effort, and if the turn comes back
+    empty or capped, retry ONCE with reasoning turned off, for providers that have a
+    reasoning dial (Ollama, OpenRouter); other providers make a single call. Returns
+    (text, meta).
 
-    Defined as a free function over `client` rather than a method so it works with
-    the lightweight client stubs in the test suite, which implement only call():
-    if a stub does not accept the meta/effort kwargs it simply gets one plain call.
+    'none' is the one value every such provider honors as off, so it is the reliable
+    circuit-breaker. Stepping through intermediate rungs is not reliable across models
+    (some collapse low/medium to their max), so we hold the chosen effort, then drop
+    straight to none rather than walking a ladder.
+
+    Defined as a free function over `client` rather than a method so it works with the
+    lightweight client stubs in the test suite, which implement only call(): a stub
+    that does not accept the meta/effort kwargs simply gets one plain call.
     """
     if max_tokens is None:
         max_tokens = DEFAULT_MAX_TOKENS
     provider_name, _ = parse_model_string(model)
     ladders = provider_name in ("ollama", "openrouter")
-    effort = default_reasoning_effort(agent)
-    while True:
+    effort = reasoning_effort or default_reasoning_effort(agent)
+    # Hold the chosen effort; fall back to 'none' once if it came back empty/capped.
+    attempts = [effort, "none"] if (ladders and effort != "none") else [effort]
+    for i, eff in enumerate(attempts):
         try:
             text, meta = client.call(
                 messages, model, max_tokens=max_tokens, temperature=temperature,
-                agent=agent, reasoning_effort=(effort if ladders else None),
+                agent=agent, reasoning_effort=(eff if ladders else None),
                 return_meta=True)
         except TypeError:
             # Stub client without return_meta/reasoning_effort: one plain call.
             return client.call(messages, model, max_tokens=max_tokens,
                                temperature=temperature, agent=agent), {}
         ok = bool((text or "").strip()) and not meta.get("truncated")
-        nxt = lower_reasoning_effort(effort) if ladders else None
-        if ok or nxt is None:
-            meta["effort_used"] = effort if ladders else None
+        if ok or i == len(attempts) - 1:
+            meta["effort_used"] = eff if ladders else None
             return text, meta
         logger.info("%s turn came back empty/capped at reasoning_effort=%s; "
-                    "retrying at %s.", agent or "model", effort, nxt)
-        effort = nxt
+                    "retrying with reasoning off.", agent or "model", eff)
 
 
 # ══════════════════════════════════════════════════
@@ -939,12 +951,13 @@ class LLMClient:
         """Provider kwargs carrying the reasoning effort for this turn. Ollama and
         OpenRouter both accept a reasoning_effort kwarg (each formats it for its own
         API); direct OpenAI and Anthropic have no such control and get nothing.
-        `override` lets call_with_ladder step the effort down per attempt; without
-        it the agent's default applies. Keyed on the agent label so the client-call
-        interface (and every mock that implements it) stays unchanged."""
-        if provider_name not in ("ollama", "openrouter"):
-            return {}
-        return {"reasoning_effort": override or default_reasoning_effort(agent)}
+        `override` is the chosen effort for this attempt; without it the agent's
+        default applies. The value is translated per provider (e.g. 'max' becomes
+        OpenRouter's 'xhigh'). Keyed on the agent label so the client-call interface
+        (and every mock that implements it) stays unchanged."""
+        effort = override or default_reasoning_effort(agent)
+        mapped = _provider_effort(provider_name, effort)
+        return {} if mapped is None else {"reasoning_effort": mapped}
 
     def call(self, messages, model, max_tokens=DEFAULT_MAX_TOKENS, temperature=0, agent=None,
              return_meta=False, reasoning_effort=None):

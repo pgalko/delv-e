@@ -158,17 +158,18 @@ def _parse_synth(text):
 class Synthesizer:
     """Premium holistic re-derivation over raw evidence → verdict + briefing."""
 
-    def __init__(self, client, model, prompts=None):
+    def __init__(self, client, model, prompts=None, reasoning_effort="medium"):
         self.client = client
         self.model = model
         self.p = prompts or DATA_MODE
+        self.reasoning_effort = reasoning_effort
 
     def synthesize(self, seed, schema, log, nav, max_tokens=None, final=False,
                    prior_seeds=None):
         # Synthesis uses the shared DEFAULT_MAX_TOKENS budget (via call_with_ladder
         # below). A reasoning synthesizer on Ollama can otherwise spend its whole
-        # budget on hidden reasoning and emit no briefing (seen live); the ladder
-        # steps its reasoning dial down on a capped turn instead of relying on the
+        # budget on hidden reasoning and emit no briefing (seen live); call_with_ladder
+        # retries once with reasoning off on a capped turn instead of relying on the
         # cap alone, and Anthropic's non-streaming limit is clamped inside llm.call.
         compute = self.p.compute
         evidence = assemble_evidence(log, nav)
@@ -225,7 +226,8 @@ class Synthesizer:
         # Cache the (stable) system prompt; the evidence/user content is volatile.
         messages = build_cached_messages(self.model, self.p.synth_system, "", user)
         resp, _meta = call_with_ladder(self.client, messages, self.model,
-                                       agent="Synthesizer", max_tokens=max_tokens)
+                                       agent="Synthesizer", max_tokens=max_tokens,
+                                       reasoning_effort=self.reasoning_effort)
         result = _parse_synth(resp or "")
 
         if final:

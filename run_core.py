@@ -95,6 +95,13 @@ def main():
                              "completed run (tracked in .delve_last_run). The positional "
                              "question, if given, replaces the prior run's saved "
                              "question in the audit framing.")
+    parser.add_argument("--reasoning-effort",
+                        choices=["max", "high", "medium", "low", "none"], default="medium",
+                        help="Starting reasoning effort for the Investigator and Synthesizer "
+                             "(default medium). The Executor always runs with reasoning off. "
+                             "Mapped per provider; direct Anthropic ignores it (no effort dial). "
+                             "Note GLM-5.2 already runs at its max for medium/low; pass 'high' to "
+                             "make it reason less.")
     args = parser.parse_args()
     if args.output is None:
         args.output = "output_verify" if args.verify_run is not None else "output"
@@ -305,6 +312,7 @@ def main():
             prior_seeds=prior_seeds,
             search_model=search_model, search_budget=args.search_budget,
             stats=run_stats, compute=args.compute,
+            reasoning_effort=args.reasoning_effort,
         )
     finally:
         kernel.cleanup()
