@@ -130,8 +130,8 @@ python run_core.py DATA_FILE "YOUR QUESTION"
 ```
 
 To audit a finished run with a fresh, independent second pass (claims are
-distilled from its briefing, re-derived from the raw data under a fixed stress
-battery, and the two documents are reconciled into one corrected briefing):
+distilled from its briefing, re-derived under a fixed stress battery, and the
+two documents are reconciled into one corrected briefing):
 
 ```
 python run_core.py DATA_FILE --verify                 # audits the last run
@@ -143,6 +143,11 @@ Results land in `output_verify/` (override with `--output`). The audit's
 (confirmed, attenuated, refuted, or contested); the original and the raw
 audit are preserved alongside as `briefing_original.md` and `briefing_audit.md`.
 Roughly doubles runtime; worth it when the conclusions matter.
+
+A compute run is audited the same way, with no data file
+(`python run_core.py --verify SOME_RUN_DIR`). The audit detects the run's mode
+from its saved state and re-derives the computation independently, by a different
+method where possible, rather than re-reading a dataset.
 
 Example:
 
@@ -173,8 +178,8 @@ csv, tsv, xlsx, parquet, json, and jsonl.
 | `--search-budget N` | 3 | Hard cap on web searches per run when search is enabled. |
 | `--resume` | off | Continue an interrupted or finished run from the saved state in the output directory. |
 | `--extend` | off | Continue a finished run with a new question that can revise the earlier conclusion. Requires a new question. |
-| `--verify [DIR]` | off | Audit a finished run with a fresh independent second pass: its decisive claims are re-derived under a fixed stress battery and reconciled into a corrected briefing (originals kept alongside). Bare `--verify` audits the last run; pass a run directory to audit a specific one. Writes to `output_verify/` by default. Cannot combine with `--resume`, `--extend`, or `--compute`. |
-| `--compute` | off | Run without a dataset (computation-only mode); the sole positional argument is the question. Fresh runs only. See below. |
+| `--verify [DIR]` | off | Audit a finished run with a fresh independent second pass: its decisive claims are re-derived under a fixed stress battery and reconciled into a corrected briefing (originals kept alongside). Bare `--verify` audits the last run; pass a run directory to audit a specific one. Writes to `output_verify/` by default. The audit runs in the same mode as the run it audits, so a compute run is audited dataset-free automatically. Cannot combine with `--resume` or `--extend`. |
+| `--compute` | off | Run without a dataset (computation-only mode); the sole positional argument is the question. Can be resumed, extended, and verified. See below. |
 
 ### Models and providers
 
@@ -228,9 +233,10 @@ the answer carries its uncertainty (a Monte Carlo standard error or an interval)
 that it converged or was cross-checked against a known case, and that its
 assumptions and the regime where it holds are stated.
 
-This mode runs fresh investigations only; it cannot be combined with `--resume`,
-`--extend`, or `--verify`. Pass the question as the single positional argument and
-omit the data file.
+This mode can be resumed, extended, and verified: the run's mode is restored from the
+saved state, so you continue or audit a compute run without re-passing `--compute`, and
+a `--verify` audit of a compute run re-derives the computation independently. Pass the
+question as the single positional argument and omit the data file.
 
 ## Output
 
@@ -268,6 +274,11 @@ An extension rehydrates the prior state, pursues the new question alongside the
 original one, and writes a single combined briefing that reconciles both lines.
 The Synthesizer re-derives everything from the raw evidence, so an extension can
 revise the original conclusion when the new work warrants it.
+
+Compute runs (`--compute`) are resumed and extended the same way, without a data
+file. The mode is restored from the saved state, so you do not re-pass `--compute`:
+`python run_core.py --resume --output DIR` continues a compute run, and
+`python run_core.py "new question" --extend --output DIR` extends it.
 
 ## Terminal output
 

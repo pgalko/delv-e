@@ -148,12 +148,30 @@ def main():
         sys.exit(1)
     is_continue = args.resume_run or args.extend_run
 
-    # Compute mode: dataset-free. v1 supports fresh runs only; resume/extend/verify
-    # would each need the mode persisted in the saved state to rehydrate correctly.
-    if args.compute and (is_continue or args.verify_run):
-        print("--compute is a fresh dataset-free run; it cannot be combined with "
-              "--resume, --extend, or --verify yet.", file=sys.stderr)
-        sys.exit(1)
+    # Resume/extend restore the run's mode from run_meta.json, so a compute run can be
+    # continued without re-passing --compute (a dataset run is not re-declared either).
+    # Passing --compute against a saved dataset run is a mismatch and is rejected.
+    if is_continue:
+        saved_compute = _load_run_meta(args.output).get("compute", False)
+        if args.compute and not saved_compute:
+            parser.error(f"{args.output} is a dataset run; --compute cannot be "
+                         "applied to a --resume/--extend.")
+        args.compute = saved_compute
+
+    # A verify run audits the prior run in that run's own mode: a compute run is
+    # audited in compute mode (no dataset), a dataset run in dataset mode. The mode is
+    # read from the prior run's run_meta.json, so --compute is not re-passed for an
+    # audit, and passing it against a dataset run is rejected.
+    prior_dir = None
+    if args.verify_run:
+        import verify
+        prior_dir = verify.resolve_prior_dir(args.verify_run)
+        audit_compute = _load_run_meta(prior_dir).get("compute", False)
+        if args.compute and not audit_compute:
+            parser.error("the run being verified is a dataset run; --compute does "
+                         "not apply to its audit.")
+        args.compute = audit_compute
+
     if args.compute:
         # There is no dataset, so the sole positional is the question.
         if args.question is None and args.dataset is not None:
@@ -169,14 +187,12 @@ def main():
     # BRIEFING crosses over, never the prior evidence chain or kernel.
     verify_ctx = None
     if args.verify_run:
-        import verify
-        prior_dir = verify.resolve_prior_dir(args.verify_run)
         prior_briefing_path = verify.check_dirs(prior_dir, args.output)
         with open(prior_briefing_path, encoding="utf-8") as f:
             original_briefing = f.read()
         prior_saved = _load_seeds(prior_dir)
-        original_seed = args.question or (prior_saved[-1] if prior_saved else
-                                          _load_saved_seed(prior_dir) or "")
+        original_seed = (args.question or verify.original_question(prior_saved)
+                         or _load_saved_seed(prior_dir) or "")
         if not original_seed:
             print(f"--verify: no saved question found in {prior_dir}; "
                   f"pass the original question as the positional argument.",
@@ -259,13 +275,14 @@ def main():
         ui.note("Verify: distilling the prior briefing into decisive claims…",
                 "magenta")
         verify_ctx["claims"] = verify.extract_claims(
-            client, synth_model, verify_ctx["original_briefing"])
+            client, synth_model, verify_ctx["original_briefing"],
+            compute=args.compute)
         ui.note(f"Verify: auditing "
                 f"{len(verify_ctx['claims']) or 'an excerpt of'} claim(s).",
                 "magenta")
         seed = verify.compose_audit_seed(
             verify_ctx["original_seed"], verify_ctx["claims"],
-            verify_ctx["original_briefing"])
+            verify_ctx["original_briefing"], compute=args.compute)
 
     # Build / restore kernel, nav, prior log.
     kernel = PersistentKernel(df=df)
@@ -279,6 +296,7 @@ def main():
             kernel.restore_history(history)
     else:
         _save_seeds(args.output, [seed])
+        _save_run_meta(args.output, args.compute)
         # Fresh run: clear stale per-step artifacts from any previous run in this
         # output dir so old exploration/NN folders and landscape files don't
         # accumulate. (--resume/--extend intentionally skip this to preserve the run.)
@@ -328,7 +346,7 @@ def main():
                 "magenta")
         reconciled = verify.reconcile(
             client, synth_model, verify_ctx["original_seed"],
-            verify_ctx["original_briefing"], briefing)
+            verify_ctx["original_briefing"], briefing, compute=args.compute)
         _, used_fallback = verify.finalize_verify_outputs(
             args.output, verify_ctx["original_briefing"], briefing,
             reconciled, verify_ctx.get("claims", []))
@@ -397,6 +415,28 @@ def _load_saved_seed(output_dir):
             return f.read().strip()
     except OSError:
         return None
+
+
+def _save_run_meta(output_dir, compute):
+    """Persist run-level mode as run_meta.json so --resume/--extend can restore it.
+    Written for every fresh run, dataset and compute alike."""
+    try:
+        with open(os.path.join(output_dir, "run_meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"compute": bool(compute)}, f, indent=2)
+    except OSError:
+        pass
+
+
+def _load_run_meta(output_dir):
+    """Return saved run metadata, or {} if absent (older dirs are dataset runs)."""
+    try:
+        with open(os.path.join(output_dir, "run_meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+            if isinstance(meta, dict):
+                return meta
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
 
 
 def _load_saved_state(output_dir):

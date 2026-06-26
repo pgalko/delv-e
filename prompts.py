@@ -389,6 +389,38 @@ INDEPENDENT AUDIT:
 {audit}"""
 
 
+# Compute-mode counterparts of the three verify prompts above. The audit discipline
+# is the same (adjudicate the decisive claims by an independent pass, then reconcile),
+# but the stress axes are the ones that break a computation rather than a dataset: an
+# independent re-derivation, convergence under refinement, parameter and edge
+# sensitivity, and a cross-check against known or limiting cases.
+
+CLAIM_EXTRACTION_PROMPT_COMPUTE = """Below is a computational briefing. List its decisive claims: the specific findings, with their numbers, that carry the briefing's conclusions. Write at most ten claims, one per line, numbered 1., 2., and so on. Each claim must be one self-contained sentence preserving the decisive quantities (computed values, error bounds, standard errors, tolerances, convergence criteria, thresholds) exactly as stated, and preserve inside each claim the method, parameters, resolution, seed, or model specification the briefing attaches to that finding; a claim is incomplete without the specification under which it was computed. Output only the numbered list.
+
+BRIEFING:
+{briefing}"""
+
+AUDIT_SEED_TEMPLATE_COMPUTE = """A prior computation addressed the following question: {original_seed}
+
+Its decisive claims were:
+{claims}
+
+Your task is to adjudicate this report, not to redo it wholesale. Verify each decisive claim by independent computation and attempt to break it: re-derive each quantity by an alternative method or an independent implementation rather than reusing the original's approach, report numerical error honestly and check that each result converges under refinement (a finer grid, more samples, a tighter tolerance), test sensitivity to the parameters and to edge and boundary cases, and cross-check against known, closed-form, or limiting cases and against the problem statement the computation is meant to model. Classify each claim as confirmed, attenuated, or refuted, with the evidence that decides it. Then, independently of the claims, identify whatever material aspect of the original question the analyst failed to examine, and examine it. Produce a corrected account of what the computation actually establishes."""
+
+RECONCILIATION_PROMPT_COMPUTE = """Two documents about the same computation follow: an original briefing, and an independent audit that re-derived the original's decisive claims by independent computation and adjudicated each one. Produce the single corrected briefing that answers the original question.
+
+Rules. Keep the standard structure (## Summary, ## What the computation shows, ## Where it breaks down, ## Ruled out, ## Open questions, ## Method notes). Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the method, the parameters or resolution, and the error treatment. If these differ, the audit has computed a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
+
+ORIGINAL QUESTION:
+{seed}
+
+ORIGINAL BRIEFING:
+{original}
+
+INDEPENDENT AUDIT:
+{audit}"""
+
+
 # ====================================================================
 # COMPUTE MODE
 # ====================================================================

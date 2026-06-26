@@ -56,7 +56,7 @@ def write_last_run_pointer(output_dir, pointer_path=LAST_RUN_POINTER):
         logger.warning("Could not write the last-run pointer %s.", pointer_path)
 
 
-def extract_claims(client, model, briefing_text):
+def extract_claims(client, model, briefing_text, compute=False):
     """One cheap call that distills the briefing into numbered decisive claims.
 
     Returns a list of claim strings (possibly empty: the caller falls back to
@@ -65,10 +65,12 @@ def extract_claims(client, model, briefing_text):
     without markdown bold, and unnumbered continuation lines fold into the
     previous claim.
     """
+    template = (prompts.CLAIM_EXTRACTION_PROMPT_COMPUTE if compute
+                else prompts.CLAIM_EXTRACTION_PROMPT)
     out, _meta = call_with_ladder(
         client,
         [{"role": "user",
-          "content": prompts.CLAIM_EXTRACTION_PROMPT.format(briefing=briefing_text)}],
+          "content": template.format(briefing=briefing_text)}],
         model=model, agent="ClaimExtractor")
     claims = []
     for raw in out.splitlines():
@@ -96,19 +98,39 @@ def claims_blob(claims, original_briefing):
             + original_briefing[:_FALLBACK_EXCERPT_CHARS])
 
 
-def compose_audit_seed(original_seed, claims, original_briefing=""):
-    return prompts.AUDIT_SEED_TEMPLATE.format(
+def original_question(seeds):
+    """The question an audit adjudicates is the full chain the audited briefing
+    answered: the root problem first, then any extension instructions. Consecutive
+    duplicates (an extend re-run with the same question) collapse. For a fresh run
+    this is the single seed; for an extended run it restores the root problem that a
+    bare last-seed lookup would miss, where the last seed is only an extension
+    instruction like "now also test 24 mornings" and carries none of the model.
+    """
+    chain = []
+    for s in seeds:
+        if s and (not chain or s != chain[-1]):
+            chain.append(s)
+    return "\n\n".join(chain)
+
+
+def compose_audit_seed(original_seed, claims, original_briefing="", compute=False):
+    template = (prompts.AUDIT_SEED_TEMPLATE_COMPUTE if compute
+                else prompts.AUDIT_SEED_TEMPLATE)
+    return template.format(
         original_seed=original_seed.strip(),
         claims=claims_blob(claims, original_briefing))
 
 
-def reconcile(client, model, original_seed, original_briefing, audit_briefing):
+def reconcile(client, model, original_seed, original_briefing, audit_briefing,
+              compute=False):
     """One synthesis-grade call that merges the two documents into the single
     corrected briefing answering the original question."""
+    template = (prompts.RECONCILIATION_PROMPT_COMPUTE if compute
+                else prompts.RECONCILIATION_PROMPT)
     out, meta = call_with_ladder(
         client,
         [{"role": "user",
-          "content": prompts.RECONCILIATION_PROMPT.format(
+          "content": template.format(
               seed=original_seed.strip(), original=original_briefing,
               audit=audit_briefing)}],
         model=model, agent="Reconciler")
