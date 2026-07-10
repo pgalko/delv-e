@@ -229,9 +229,12 @@ class Investigator:
         nav_text = nav.render_for_investigator(log)
         head = self.p.inv_head.format(seed=seed, schema=schema)
         # Tiered history: recent + live-thread (protected) + rehydrated stay full;
-        # older closed-thread steps collapse to a headline + pointer.
+        # older closed-thread steps collapse to a headline + pointer. Past the
+        # history budget, old headlines slim and fold into an archive and older
+        # protected residents trim (see _history_blocks).
         blocks = _history_blocks(log, protected=nav.protected_steps(),
-                                 forced_full=set(rehydrate or []))
+                                 forced_full=set(rehydrate or []),
+                                 char_budget=HISTORY_CHAR_BUDGET)
         # Search instruction lives in the cached prefix (static for the run) so it
         # adds no per-turn cost; present only when search is enabled.
         if self.search_enabled:
@@ -270,15 +273,58 @@ class Investigator:
         return decision
 
 
-def _step_block(e, full=True, hard_ceiling=20000):
+# ── History-budget compaction knobs ─────────────────────────────────────────
+# Tiered demotion engages only when the rendered per-step history exceeds this
+# many characters (sum of block lengths), so short/typical runs render
+# byte-identically to the unbudgeted behavior. Sized from measured heavy runs
+# (the F1 seed): late-run history hit 95-145K chars; this budget holds it near
+# 90K, roughly 30K prompt tokens once the head and volatile tail sit on top,
+# while typical sub-13-step runs never cross it.
+HISTORY_CHAR_BUDGET = 90_000
+# Over budget, the raw of an older PROTECTED resident (full only because it
+# feeds a live thread, not because it is recent) is trimmed to this ceiling.
+PROTECTED_SLIM_CEILING = 4_000
+# Over budget, an old collapsed headline keeps only this much of its SPEC (its
+# first sentence, capped); the step's finding lives in the NAV MAP and the
+# full raw remains one REHYDRATE away.
+SLIM_SPEC_CHARS = 200
+
+
+def _spec_excerpt(spec, limit=SLIM_SPEC_CHARS):
+    """First sentence of a spec, capped: enough to recognize the step, cheap
+    enough to keep forever."""
+    s = (spec or "").strip()
+    head = s.split(". ")[0]
+    if len(head) < len(s):
+        head = head.rstrip(".") + "."
+    return head if len(head) <= limit else head[:limit].rstrip() + "..."
+
+
+def _slim_headline(e):
+    """A collapsed step demoted under the history budget: one-sentence SPEC
+    plus the same recovery affordances as a normal headline."""
+    return (f"--- STEP {e['step']} (collapsed) ---\n"
+            f"SPEC: {_spec_excerpt(e.get('spec'))}\n"
+            f"[Compacted under the history budget. Finding is in the NAV MAP; list "
+            f"step {e['step']} in a ###REHYDRATE### block to restore the full raw.]")
+
+
+def _archive_line(e):
+    return f"STEP {e['step']}: {_spec_excerpt(e.get('spec'))}"
+
+
+def _step_block(e, full=True, hard_ceiling=20000, budget_trim=False):
     """Render ONE completed step as a deterministic, byte-stable block.
 
     full=True  → SPEC + complete RAW output + the Investigator's prior note.
     full=False → COLLAPSED: SPEC + a pointer. The raw is NOT destroyed (it stays
-                 in the on-disk log, is always given to the Synthesizer, and can be
-                 pulled back via REHYDRATE); it is merely non-resident this turn so
-                 stale tables don't crowd the model's attention. The step's finding
-                 lives in the nav map.
+                 in the on-disk log, is always given to the Synthesizer in full, and
+                 can be pulled back via REHYDRATE); it is merely non-resident this
+                 turn so stale tables don't crowd the model's attention. The step's
+                 finding lives in the nav map.
+    budget_trim=True marks a ceiling cut made by the history-budget policy (an
+    older protected resident trimmed to PROTECTED_SLIM_CEILING), which gets a
+    calm recovery notice instead of the "unusual" one.
     """
     if e.get("kind") == "search":
         return (f"--- STEP {e['step']} (WEB SEARCH) ---\n"
@@ -294,10 +340,16 @@ def _step_block(e, full=True, hard_ceiling=20000):
     raw = (f"[error after {e.get('attempts', '?')} attempt(s)]\n{e['error']}"
            if e.get("error") else (e.get("stdout") or "(no output)"))
     if len(raw) > hard_ceiling:
-        raw = (raw[:hard_ceiling].rstrip()
-               + "\n[...this step's raw output hit the per-step safety ceiling and was "
-                 "cut here; unusual — the step likely dumped a very large table. Re-run "
-                 "a summarized version if these numbers matter...]")
+        if budget_trim:
+            raw = (raw[:hard_ceiling].rstrip()
+                   + "\n[...older live-thread step trimmed here under the history "
+                     "budget; the full raw is on disk and returns via ###REHYDRATE### "
+                     "if you need its exact numbers...]")
+        else:
+            raw = (raw[:hard_ceiling].rstrip()
+                   + "\n[...this step's raw output hit the per-step safety ceiling and was "
+                     "cut here; unusual — the step likely dumped a very large table. Re-run "
+                     "a summarized version if these numbers matter...]")
     parts = [f"--- STEP {e['step']} ---", f"SPEC: {e.get('spec', '')}",
              (f"RESULT: {raw}" if e.get("error") else f"RAW RESULT:\n{raw}")]
     if e.get("thinking"):
@@ -305,7 +357,8 @@ def _step_block(e, full=True, hard_ceiling=20000):
     return "\n".join(parts)
 
 
-def _history_blocks(log, recent_full=3, protected=None, forced_full=None):
+def _history_blocks(log, recent_full=3, protected=None, forced_full=None,
+                    char_budget=None):
     """Per-step blocks, one per completed step, append-only and stable.
 
     A step is shown FULL when it is recent (last `recent_full`), protected (feeds a
@@ -314,18 +367,85 @@ def _history_blocks(log, recent_full=3, protected=None, forced_full=None):
     working set small so long runs don't bury the signal (needle-in-haystack), while
     nothing is lost: collapsed raw stays on disk, goes to the Synthesizer in full,
     and is fetchable via REHYDRATE.
+
+    Budgeted tiering (char_budget set; the Investigator passes
+    HISTORY_CHAR_BUDGET): when the rendered blocks exceed the budget, steps are
+    demoted oldest-first, cheapest-fidelity-first, until under budget:
+      1. old collapsed headlines slim to a one-sentence SPEC;
+      2. the oldest slim headlines fold into a single ARCHIVED STEPS block,
+         one line each, so prompt size asymptotes instead of growing with
+         every completed step;
+      3. older PROTECTED residents get their raw trimmed to
+         PROTECTED_SLIM_CEILING.
+    The last `recent_full` steps, search blocks, and this turn's rehydrates are
+    never demoted, whatever the budget, so a run whose untouchable core exceeds
+    the budget simply exceeds it. Every demotion is recoverable (raw on disk,
+    Synthesizer sees everything full, REHYDRATE restores any step), and below
+    the budget the output is byte-identical to the unbudgeted rendering.
+    Demotions rewrite deep history and so reset the cached prefix at the first
+    changed block; measured runs already reset to the seed almost every turn
+    under one-collapse-per-turn churn, so the marginal cache cost is small
+    against the fresh-input savings.
     """
     protected = protected or set()
     forced_full = forced_full or set()
     steps = [e for e in log if not e.get("terminal")]
     recent_ids = {e["step"] for e in steps[-recent_full:]}
-    blocks = []
-    for e in steps:
+
+    def _base_full(e):
         sid = e["step"]
-        full = (e.get("kind") == "search") or (sid in recent_ids) \
+        return (e.get("kind") == "search") or (sid in recent_ids) \
             or (sid in protected) or (sid in forced_full)
-        blocks.append(_step_block(e, full=full))
-    return blocks
+
+    modes = ["full" if _base_full(e) else "collapsed" for e in steps]
+
+    def _render():
+        blocks, archive = [], []
+        for e, m in zip(steps, modes):
+            if m == "archived":
+                archive.append(_archive_line(e))
+            elif m == "slim_collapsed":
+                blocks.append(_slim_headline(e))
+            elif m == "slim_full":
+                blocks.append(_step_block(e, full=True,
+                                          hard_ceiling=PROTECTED_SLIM_CEILING,
+                                          budget_trim=True))
+            else:
+                blocks.append(_step_block(e, full=(m == "full")))
+        if archive:
+            blocks.insert(0, "--- ARCHIVED STEPS (oldest; raw on disk; any step "
+                             "returns via ###REHYDRATE###) ---\n" + "\n".join(archive))
+        return blocks
+
+    out = _render()
+    if char_budget is None or sum(map(len, out)) <= char_budget:
+        return out
+
+    # Pass 1: slim old collapsed headlines, oldest first.
+    for i, m in enumerate(modes):
+        if m == "collapsed":
+            modes[i] = "slim_collapsed"
+            out = _render()
+            if sum(map(len, out)) <= char_budget:
+                return out
+    # Pass 2: fold the oldest slim headlines into the archive block.
+    for i, m in enumerate(modes):
+        if m == "slim_collapsed":
+            modes[i] = "archived"
+            out = _render()
+            if sum(map(len, out)) <= char_budget:
+                return out
+    # Pass 3: trim older protected residents (never recents, search blocks,
+    # or this turn's rehydrates).
+    for i, e in enumerate(steps):
+        sid = e["step"]
+        if modes[i] == "full" and e.get("kind") != "search" \
+                and sid not in recent_ids and sid not in forced_full:
+            modes[i] = "slim_full"
+            out = _render()
+            if sum(map(len, out)) <= char_budget:
+                return out
+    return out   # best effort: the untouchable core alone exceeds the budget
 
 
 def _format_log(log):

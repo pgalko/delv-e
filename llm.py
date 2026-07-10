@@ -67,13 +67,76 @@ def default_reasoning_effort(agent):
     return EXECUTOR_REASONING_EFFORT if agent == "Executor" else DEFAULT_REASONING_EFFORT
 
 
-def _provider_effort(provider_name, effort):
+import uuid as _uuid
+
+# One shared per-run UUID feeds every cache-affinity mechanism: the x-ai/*
+# x-grok-conv-id header (xAI's cache is automatic but affinity-sensitive;
+# without a stable id, requests land on different backend servers and hit
+# rates collapse even for identical prefixes), the openai/* prompt_cache_key
+# (mandated on GPT-5.6+ for reliable matching), and OpenRouter's session_id
+# (pins sticky provider routing from the first request, before any hit is
+# observed). One id per run (per process) maximizes hits across the
+# Investigator's turns.
+_RUN_ID = _uuid.uuid4().hex
+
+
+def _usage_detail(usage, key):
+    """A prompt_tokens_details field (cached_tokens, cache_write_tokens) from a
+    usage object, robust to SDK versions that do not type the detail: falls
+    back to the raw payload dict."""
+    if not usage:
+        return 0
+    ptd = getattr(usage, "prompt_tokens_details", None)
+    v = getattr(ptd, key, None) if ptd is not None else None
+    if v is None:
+        try:
+            d = usage.model_dump()
+        except Exception:                                       # noqa: BLE001
+            d = getattr(usage, "__dict__", {}) or {}
+        v = ((d.get("prompt_tokens_details") or {})).get(key)
+    return v or 0
+
+
+def _xai_conv_headers(model):
+    return {"x-grok-conv-id": _RUN_ID} if (model or "").startswith("x-ai/") else {}
+
+
+def _openai_cache_body(model):
+    """GPT-5.6+ requires `prompt_cache_key` for reliable cache matching (implicit
+    and explicit). One key per run, same id as the xAI affinity header: both
+    exist to pin a stable prefix to the same cache."""
+    if not (model or "").startswith("openai/"):
+        return {}
+    return {
+        # 5.6's mandated key for reliable matching; kept for GA. The provider pin
+        # was tried and removed: routing was not the cause of the intra-run
+        # misses (5.6 preview does no automatic prefix matching on this path).
+        "prompt_cache_key": "delve-" + _RUN_ID,
+    }
+
+
+def _provider_effort(provider_name, effort, model=""):
     """Translate a canonical effort value to what the provider expects, or None to
     send no effort field. Ollama takes the value as-is; OpenRouter's top rung is
     'xhigh' rather than 'max'; direct OpenAI and Anthropic have no effort dial here
-    (Anthropic uses a thinking-token budget, a separate mechanism)."""
+    (Anthropic uses a thinking-token budget, a separate mechanism).
+
+    Model-aware floor: glm-5.x exposes only 'high' and 'max' and has no off
+    switch; sending 'none' makes Ollama cloud return an instant empty completion.
+    So 'none' is floored to 'high' for glm on either route. Models that tolerate
+    'none' (kimi and other non-thinking executors) are unaffected."""
     if provider_name not in ("ollama", "openrouter"):
         return None
+    if provider_name == "ollama" and "glm" in (model or ""):
+        # Ollama's /v1 for glm-5.2:cloud returns an instant empty completion
+        # (finish_reason "stop", zero tokens) for ANY explicit reasoning_effort
+        # value, every level verified empirically; omitting the field works. So
+        # glm on Ollama gets no effort field at all and runs at its own default.
+        # Consequence: no thinking off-switch for this combo, so the truncation
+        # ladder's final "none" rescue degrades to a plain retry there.
+        return None
+    if effort == "none" and "glm" in (model or ""):
+        effort = "high"   # OpenRouter route: documented enum is high/max only
     if provider_name == "openrouter":
         return "xhigh" if effort == "max" else effort
     return effort
@@ -106,6 +169,9 @@ PRICING = {
     "minimax/minimax-m3":         {"input": 0.30, "output": 1.20},
     "google/gemini-3.5-flash":    {"input": 1.5, "output": 9.00},
     "x-ai/grok-4.3":              {"input": 1.25, "output": 2.50},
+    "x-ai/grok-4.5":              {"input": 2.0, "output": 6.0, "cached_input": 0.50},
+    "openai/gpt-5.6-terra":       {"input": 2.50, "output": 15.0, "cached_input": 0.25, "cached_write": 3.125},
+    "openai/gpt-5.6-luna":       {"input": 1.00, "output": 6.0, "cached_input": 0.10, "cached_write": 1.25},
     # Embeddings (output_tokens always 0)
     "text-embedding-3-small":     {"input": 0.02,  "output": 0.0},
     "text-embedding-3-large":     {"input": 0.13,  "output": 0.0},
@@ -115,12 +181,20 @@ DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
 
 def compute_cost(model, input_tokens, output_tokens,
-                 cache_creation_tokens=0, cache_read_tokens=0):
+                 cache_creation_tokens=0, cache_read_tokens=0, cached_tokens=0,
+                 cache_write_tokens=0):
     """Compute USD cost for a single API call.
 
     Cache pricing (Anthropic): a cache WRITE costs 1.25x the normal input rate,
     a cache READ costs 0.10x. `input_tokens` here is the fresh/uncached input
     only (Anthropic reports cached portions separately).
+
+    Cache pricing (OpenAI-compatible, e.g. GPT-5.6 explicit breakpoints via
+    OpenRouter): `input_tokens` INCLUDES both the cached and the written
+    portions; `cached_tokens` bills at the model's cached rate and
+    `cache_write_tokens` at its write rate. Semantics validated live against
+    OpenRouter cost accounting to six decimals (terra: reads 0.25/M = the 90%
+    discount, writes 3.125/M = 1.25x input).
     """
     # Strip provider prefix if present (e.g. 'openrouter:moonshotai/kimi-k2.5' → 'moonshotai/kimi-k2.5')
     model_name = model
@@ -131,7 +205,18 @@ def compute_cost(model, input_tokens, output_tokens,
     pricing = PRICING.get(model_name, DEFAULT_PRICING)
     in_rate = pricing["input"] / 1_000_000
     out_rate = pricing["output"] / 1_000_000
-    return (input_tokens * in_rate
+    # OpenAI-compatible caches (OpenRouter/xAI/DeepSeek...): `input_tokens`
+    # INCLUDES the cached portion; bill it at the model's cached rate when the
+    # pricing table defines one, else at the full rate (never under-report).
+    cached_rate = pricing.get("cached_input", pricing["input"]) / 1_000_000
+    # Writes carry a premium, so the never-under-report fallback points the
+    # other way: 1.25x input (OpenAI's stated 5.6+ rule, and the same premium
+    # this function already charges Anthropic cache_creation).
+    write_rate = pricing.get("cached_write", pricing["input"] * 1.25) / 1_000_000
+    fresh_input = max(input_tokens - cached_tokens - cache_write_tokens, 0)
+    return (fresh_input * in_rate
+            + cached_tokens * cached_rate
+            + cache_write_tokens * write_rate
             + cache_creation_tokens * in_rate * 1.25
             + cache_read_tokens * in_rate * 0.10
             + output_tokens * out_rate)
@@ -140,11 +225,20 @@ def compute_cost(model, input_tokens, output_tokens,
 def _flatten_messages(messages):
     """Collapse any block-list message content into a plain string, dropping
     Anthropic cache_control. Used by non-Anthropic providers, which take string
-    content and do not understand cache_control blocks."""
+    content and do not understand cache_control blocks.
+
+    Exception: a part list carrying a prompt_cache_breakpoint (GPT-5.6 explicit
+    caching, built by build_cached_messages for openrouter:openai/gpt-5.6*) is
+    already in chat-completions shape and passes through untouched; flattening
+    it would strip the very markers it exists to carry."""
     out = []
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, list):
+            if any(isinstance(b, dict) and "prompt_cache_breakpoint" in b
+                   for b in content):
+                out.append(msg)
+                continue
             text = "".join(
                 (b.get("text", "") if isinstance(b, dict) else str(b))
                 for b in content
@@ -165,9 +259,18 @@ def _cache_usage(usage):
     return cc, cr
 
 
+def _gpt56_explicit_cache(model):
+    """True for models whose route accepts GPT-5.6 explicit cache breakpoints
+    (prompt_cache_breakpoint on chat-completions content parts). Scoped to
+    OpenRouter, where forwarding was verified live; the direct openai: path
+    speaks the Responses API and its provider flattens content, so it is
+    deliberately excluded until that path grows its own support."""
+    return (model or "").startswith("openrouter:openai/gpt-5.6")
+
+
 def build_cached_messages(model, system_text, stable, tail_text):
-    """Build chat messages with Anthropic prompt-cache breakpoints positioned so
-    that an append-only history caches INCREMENTALLY.
+    """Build chat messages with prompt-cache breakpoints positioned so that an
+    append-only history caches INCREMENTALLY.
 
     `stable` is the stable, append-only context: either a single string or a LIST
     of strings, one block per unit of history (e.g. one per completed step). The
@@ -182,7 +285,19 @@ def build_cached_messages(model, system_text, stable, tail_text):
     Breakpoints (Anthropic allows up to 4): the system block, the FIRST stable
     block (so seed/schema is cached from turn 1 and as a fallback), and the LAST
     stable block (the moving frontier). `tail_text` is volatile and never cached.
-    Non-Anthropic providers get a single flattened string.
+
+    GPT-5.6 via OpenRouter gets the same first/last placement as content parts
+    carrying prompt_cache_breakpoint markers (verified forwarded on chat
+    completions despite docs saying Responses-only). The request stays in
+    implicit mode, so OpenAI's free breakpoint on the latest message rides
+    along. Whether the first-block fallback marker is honored alongside the
+    frontier one is unverified live; worst case extras are ignored and
+    frontier-only behavior remains. Part texts carry LEADING "\\n\\n" separators
+    (never trailing) so appending a block or a new tail cannot rewrite the
+    bytes of an already-cached part, and the concatenated prompt is
+    byte-identical to the flattened form every other model receives.
+
+    All other non-Anthropic providers get a single flattened string.
     """
     if isinstance(stable, str):
         stable_blocks = [stable] if stable else []
@@ -201,6 +316,18 @@ def build_cached_messages(model, system_text, stable, tail_text):
             content.append(blk)
         content.append({"type": "text", "text": tail_text})   # volatile, uncached
         return [{"role": "system", "content": system},
+                {"role": "user", "content": content}]
+
+    if _gpt56_explicit_cache(model) and stable_blocks:
+        content = []
+        last = len(stable_blocks) - 1
+        for i, b in enumerate(stable_blocks):
+            blk = {"type": "text", "text": ("\n\n" + b) if i else b}
+            if i == 0 or i == last:          # breakpoint on first and last stable block
+                blk["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            content.append(blk)
+        content.append({"type": "text", "text": "\n\n" + tail_text})   # volatile, uncached
+        return [{"role": "system", "content": system_text},
                 {"role": "user", "content": content}]
 
     user = ("\n\n".join(stable_blocks + [tail_text])
@@ -245,6 +372,9 @@ class AnthropicProvider:
         self._api_error = anthropic.APIError
 
     def call(self, messages, model, max_tokens, temperature):
+        self._last_cached = 0
+        self._last_cache_write = 0
+        self._last_reasoning_chars = 0
         system_msg, api_messages = self._split_system(messages)
         kwargs = dict(
             model=model, system=system_msg, messages=api_messages,
@@ -398,38 +528,86 @@ class OpenAIProvider:
         return ''.join(collected), input_tokens, output_tokens, 0, 0
 
 
-class OllamaProvider:
-    """Ollama inference via OpenAI-compatible SDK.
+def _ollama_extras(model, reasoning_effort):
+    """(extra_body, extra_headers) for Ollama's /v1 endpoint: just the effort
+    field, and only when set. A falsy effort must never serialize; glm on
+    Ollama arrives here as None precisely so the field is omitted at the wire
+    (see _provider_effort)."""
+    return ({"reasoning_effort": reasoning_effort} if reasoning_effort else {}), {}
 
-    Supports both local models and cloud models (e.g. gpt-oss:120b-cloud).
-    Cloud models are offloaded automatically by the local Ollama server —
-    just run 'ollama signin' and 'ollama pull <model>' first.
+
+def _openrouter_extras(model, reasoning_effort):
+    """(extra_body, extra_headers) for OpenRouter: the effort dict only when
+    set, the openai/* prompt cache key, detailed usage accounting, and the
+    x-ai/* cache-affinity header."""
+    body = {**({"reasoning": {"effort": reasoning_effort}} if reasoning_effort else {}),
+            **_openai_cache_body(model),
+            "usage": {"include": True},   # detailed accounting incl. cached tokens
+            # Sticky provider routing from the first request. OpenRouter's
+            # default conversation hash keys on the first non-system message,
+            # which delv-e REWRITES every turn, so without the explicit id
+            # stickiness never engages for multi-provider models.
+            "session_id": _RUN_ID}
+    return body, _xai_conv_headers(model)
+
+
+class OpenAICompatProvider:
+    """Shared provider for the chat-completions-shaped OpenAI-compatible
+    endpoints: Ollama and OpenRouter.
+
+    Ollama serves local models and cloud models (e.g. gpt-oss:120b-cloud);
+    cloud models are offloaded automatically by the local server, just run
+    'ollama signin' and 'ollama pull <model>' first. OpenRouter fronts
+    hundreds of models named 'vendor/model' (usage:
+    openrouter:google/gemini-2.5-flash; docs:
+    https://openrouter.ai/docs/quickstart).
+
+    The two differ only in connection details and per-request extras, so the
+    registry holds zero-arg factories (_ollama_provider, _openrouter_provider)
+    and every provider quirk lives in the `extras` builder, which maps
+    (model, reasoning_effort) to (extra_body, extra_headers): the conditional
+    effort field (a falsy effort never serializes), OpenRouter's detailed
+    usage accounting, the openai/* prompt cache key, and the x-ai/* affinity
+    header. Direct OpenAI is NOT this shape (it speaks the Responses API) and
+    stays a separate class, as does Anthropic (thinking budget, cache_control,
+    cache telemetry in its return tuple).
     """
 
-    def __init__(self):
+    def __init__(self, base_url, api_key, extras, default_headers=None):
         from openai import OpenAI
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.client = OpenAI(base_url=f"{base_url}/v1", api_key="ollama")
+        kwargs = {"default_headers": default_headers} if default_headers else {}
+        self.client = OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+        self._extras = extras
 
     def call(self, messages, model, max_tokens, temperature, reasoning_effort="medium"):
+        extra_body, extra_headers = self._extras(model, reasoning_effort)
         response = self.client.chat.completions.create(
             model=model,
             messages=_flatten_messages(messages),
             max_tokens=max_tokens,
             temperature=temperature,
-            extra_body={"reasoning_effort": reasoning_effort},
+            extra_body=extra_body,
+            extra_headers=extra_headers,
         )
         content = ""
         if response.choices and len(response.choices) > 0:
             content = response.choices[0].message.content or ""
+        _u = response.usage
+        self._last_cached = _usage_detail(_u, "cached_tokens")
+        self._last_cache_write = _usage_detail(_u, "cache_write_tokens")
+        _msg = response.choices[0].message if response.choices else None
+        self._last_reasoning_chars = len(
+            (getattr(_msg, "reasoning", None) or
+             getattr(_msg, "reasoning_content", None) or "")) if _msg else 0
         return (
             content,
-            response.usage.prompt_tokens if response.usage else 0,
-            response.usage.completion_tokens if response.usage else 0,
+            _u.prompt_tokens if _u else 0,
+            _u.completion_tokens if _u else 0,
             0, 0,
         )
 
     def stream(self, messages, model, max_tokens, temperature, on_token, reasoning_effort="medium"):
+        extra_body, extra_headers = self._extras(model, reasoning_effort)
         collected = []
         input_tokens = 0
         output_tokens = 0
@@ -441,12 +619,24 @@ class OllamaProvider:
             stream=True,
             stream_options={"include_usage": True},
             timeout=STREAM_TIMEOUT,
-            extra_body={"reasoning_effort": reasoning_effort},
+            extra_body=extra_body,
+            extra_headers=extra_headers,
         )
+        self._last_reasoning_chars = 0
         for chunk in stream:
             if chunk.usage:
                 input_tokens = chunk.usage.prompt_tokens or 0
                 output_tokens = chunk.usage.completion_tokens or 0
+                self._last_cached = _usage_detail(chunk.usage, "cached_tokens")
+                self._last_cache_write = _usage_detail(chunk.usage, "cache_write_tokens")
+            _d = chunk.choices[0].delta if chunk.choices else None
+            _r = (getattr(_d, "reasoning", None) or
+                  getattr(_d, "reasoning_content", None)) if _d else None
+            if _r:
+                # Reasoning-channel text: counted for diagnostics, NEVER merged
+                # into content (thinking may contain drafts; the Executor must
+                # never receive it as code).
+                self._last_reasoning_chars += len(_r)
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                 text = chunk.choices[0].delta.content
                 collected.append(text)
@@ -454,84 +644,36 @@ class OllamaProvider:
         return ''.join(collected), input_tokens, output_tokens, 0, 0
 
 
-class OpenRouterProvider:
-    """OpenRouter API — access hundreds of models via OpenAI-compatible endpoint.
+def _ollama_provider():
+    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    return OpenAICompatProvider(f"{base_url}/v1", "ollama", _ollama_extras)
 
-    Uses the OpenAI SDK pointed at OpenRouter's base URL.
-    Model names use OpenRouter's format: 'google/gemini-2.5-flash',
-    'deepseek/deepseek-chat-v3', etc.
 
-    Usage: openrouter:google/gemini-2.5-flash
-    Docs:  https://openrouter.ai/docs/quickstart
-    """
-
-    def __init__(self):
-        from openai import OpenAI
-        api_key = os.environ.get("OPEN_ROUTER_API_KEY")
-        if not api_key:
-            raise EnvironmentError("OPEN_ROUTER_API_KEY not found. Set it in .env or environment.")
-        base_url = os.environ.get("OPEN_ROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            default_headers={
-                "HTTP-Referer": "https://github.com/pgalko/delv-e",
-                "X-Title": "delv-e",
-            },
-        )
-
-    def call(self, messages, model, max_tokens, temperature, reasoning_effort="medium"):
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=_flatten_messages(messages),
-            max_tokens=max_tokens,
-            temperature=temperature,
-            extra_body={"reasoning": {"effort": reasoning_effort}},
-        )
-        content = ""
-        if response.choices and len(response.choices) > 0:
-            content = response.choices[0].message.content or ""
-        return (
-            content,
-            response.usage.prompt_tokens if response.usage else 0,
-            response.usage.completion_tokens if response.usage else 0,
-            0, 0,
-        )
-
-    def stream(self, messages, model, max_tokens, temperature, on_token, reasoning_effort="medium"):
-        collected = []
-        input_tokens = 0
-        output_tokens = 0
-        stream = self.client.chat.completions.create(
-            model=model,
-            messages=_flatten_messages(messages),
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream=True,
-            stream_options={"include_usage": True},
-            timeout=STREAM_TIMEOUT,
-            extra_body={"reasoning": {"effort": reasoning_effort}},
-        )
-        for chunk in stream:
-            if chunk.usage:
-                input_tokens = chunk.usage.prompt_tokens or 0
-                output_tokens = chunk.usage.completion_tokens or 0
-            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                text = chunk.choices[0].delta.content
-                collected.append(text)
-                on_token(text)
-        return ''.join(collected), input_tokens, output_tokens, 0, 0
+def _openrouter_provider():
+    api_key = os.environ.get("OPEN_ROUTER_API_KEY")
+    if not api_key:
+        raise EnvironmentError("OPEN_ROUTER_API_KEY not found. Set it in .env or environment.")
+    base_url = os.environ.get("OPEN_ROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    return OpenAICompatProvider(
+        base_url, api_key, _openrouter_extras,
+        default_headers={
+            "HTTP-Referer": "https://github.com/pgalko/delv-e",
+            "X-Title": "delv-e",
+        })
 
 
 # ══════════════════════════════════════════════════
 # PROVIDER REGISTRY
 # ══════════════════════════════════════════════════
 
+# Values are zero-arg callables returning a provider instance: classes for the
+# genuinely distinct APIs, factories for the two endpoints that share
+# OpenAICompatProvider and differ only in construction.
 PROVIDER_CLASSES = {
     "anthropic":    AnthropicProvider,
     "openai":       OpenAIProvider,
-    "ollama":       OllamaProvider,
-    "openrouter":   OpenRouterProvider,
+    "ollama":       _ollama_provider,
+    "openrouter":   _openrouter_provider,
 }
 
 DEFAULT_PROVIDER = "anthropic"
@@ -613,22 +755,28 @@ class CostTracker:
         self.input_tokens = 0            # fresh / uncached input
         self.output_tokens = 0
         self.cache_creation_tokens = 0   # cache writes
-        self.cache_read_tokens = 0       # cache hits
+        self.cache_read_tokens = 0       # cache hits (Anthropic)
+        self.cached_tokens = 0           # cache hits (OpenAI-compatible)
+        self.cache_write_tokens = 0      # cache writes (OpenAI-compatible, billed 1.25x)
         self.total_cost = 0.0
         self.total_cost_uncached = 0.0   # counterfactual: price every input token at full rate
         self._lock = threading.Lock()
 
     def record(self, input_tokens, output_tokens, model=None,
-               cache_creation_tokens=0, cache_read_tokens=0):
+               cache_creation_tokens=0, cache_read_tokens=0, cached_tokens=0,
+               cache_write_tokens=0):
         with self._lock:
             self.calls += 1
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
             self.cache_creation_tokens += cache_creation_tokens
             self.cache_read_tokens += cache_read_tokens
+            self.cached_tokens += cached_tokens
+            self.cache_write_tokens += cache_write_tokens
             self.total_cost += compute_cost(
                 model or "", input_tokens, output_tokens,
-                cache_creation_tokens, cache_read_tokens)
+                cache_creation_tokens, cache_read_tokens, cached_tokens,
+                cache_write_tokens)
             # What this call would have cost with no caching: all input at full rate.
             total_in = input_tokens + cache_creation_tokens + cache_read_tokens
             self.total_cost_uncached += compute_cost(model or "", total_in, output_tokens)
@@ -636,8 +784,8 @@ class CostTracker:
     def report(self):
         total_input = self.input_tokens + self.cache_creation_tokens + self.cache_read_tokens
         lines = [f"{self.calls} API calls | ${self.total_cost:.4f}"]
-        if self.cache_creation_tokens or self.cache_read_tokens:
-            hit = (100 * self.cache_read_tokens / total_input) if total_input else 0
+        if self.cache_creation_tokens or self.cache_read_tokens or self.cached_tokens:
+            hit = (100 * (self.cache_read_tokens + self.cached_tokens) / total_input) if total_input else 0
             saved = self.total_cost_uncached - self.total_cost
             pct = (100 * saved / self.total_cost_uncached) if self.total_cost_uncached else 0
             lines.append(
@@ -674,14 +822,19 @@ class RunLogger:
 
     def log(self, agent, model, messages, response,
             input_tokens, output_tokens, elapsed_time, ttft=None,
-            cache_creation=0, cache_read=0):
-        cost = compute_cost(model, input_tokens, output_tokens, cache_creation, cache_read)
+            cache_creation=0, cache_read=0, cached_tokens=0, cache_write_tokens=0,
+            reasoning_chars=0):
+        cost = compute_cost(model, input_tokens, output_tokens, cache_creation, cache_read,
+                            cached_tokens=cached_tokens, cache_write_tokens=cache_write_tokens)
         entry = {
             "agent": agent,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "reasoning_chars": reasoning_chars,
             "cache_creation_input_tokens": cache_creation,
             "cache_read_input_tokens": cache_read,
             "total_tokens": input_tokens + output_tokens + cache_creation + cache_read,
@@ -795,11 +948,14 @@ def build_run_telemetry(run_logger, cost_tracker, run_stats, step_log,
     for e in entries:
         a = e.get("agent") or "unknown"
         s = per_agent.setdefault(a, {"calls": 0, "input": 0, "output": 0,
+                                     "cached": 0, "cached_write": 0,
                                      "cache_read": 0, "cache_write": 0,
                                      "cost_usd": 0.0, "time_s": 0.0, "_ttfts": []})
         s["calls"] += 1
         s["input"] += e.get("input_tokens", 0)
         s["output"] += e.get("output_tokens", 0)
+        s["cached"] += e.get("cached_tokens", 0)
+        s["cached_write"] += e.get("cache_write_tokens", 0)
         s["cache_read"] += e.get("cache_read_input_tokens", 0)
         s["cache_write"] += e.get("cache_creation_input_tokens", 0)
         s["cost_usd"] += e.get("cost_usd", 0.0)
@@ -947,7 +1103,7 @@ class LLMClient:
             return self._providers[provider_name]
 
     @staticmethod
-    def _reasoning_extra(provider_name, agent, override=None):
+    def _reasoning_extra(provider_name, agent, override=None, model=""):
         """Provider kwargs carrying the reasoning effort for this turn. Ollama and
         OpenRouter both accept a reasoning_effort kwarg (each formats it for its own
         API); direct OpenAI and Anthropic have no such control and get nothing.
@@ -956,8 +1112,17 @@ class LLMClient:
         OpenRouter's 'xhigh'). Keyed on the agent label so the client-call interface
         (and every mock that implements it) stays unchanged."""
         effort = override or default_reasoning_effort(agent)
-        mapped = _provider_effort(provider_name, effort)
-        return {} if mapped is None else {"reasoning_effort": mapped}
+        mapped = _provider_effort(provider_name, effort, model)
+        if provider_name not in ("ollama", "openrouter"):
+            return {}
+        return {"reasoning_effort": mapped}   # None = omit at the wire
+
+    def _sync_wire(self, provider):
+        """Pull the wire side-channels the provider captured for the last
+        request: cache reads, cache writes, and reasoning-channel size."""
+        self._last_cached = getattr(provider, "_last_cached", 0)
+        self._last_cache_write = getattr(provider, "_last_cache_write", 0)
+        self._last_reasoning_chars = getattr(provider, "_last_reasoning_chars", 0)
 
     def call(self, messages, model, max_tokens=DEFAULT_MAX_TOKENS, temperature=0, agent=None,
              return_meta=False, reasoning_effort=None):
@@ -972,16 +1137,28 @@ class LLMClient:
             max_tokens = DEFAULT_MAX_TOKENS
         if provider_name == "anthropic" and max_tokens > ANTHROPIC_MAX_TOKENS:
             max_tokens = ANTHROPIC_MAX_TOKENS  # non-streaming SDK timeout guard
-        extra = self._reasoning_extra(provider_name, agent, reasoning_effort)
+        extra = self._reasoning_extra(provider_name, agent, reasoning_effort, model=model)
         start_time = time.time()
 
         from contextlib import nullcontext
         spin = self._Spinner(agent or "working") if self._Spinner else nullcontext()
         try:
             with spin:
-                content, input_tokens, output_tokens, cache_creation, cache_read = provider.call(
-                    messages, model_name, max_tokens, temperature, **extra
-                )
+                # Empty-completion guard: dispatch once, retry once loudly if the
+                # content came back blank (the warning names the reasoning-channel
+                # size so channel misroutes and silent drops are distinguishable).
+                for attempt in range(2):
+                    content, input_tokens, output_tokens, cache_creation, cache_read = provider.call(
+                        messages, model_name, max_tokens, temperature, **extra
+                    )
+                    self._sync_wire(provider)
+                    if (content or "").strip() or attempt:
+                        break
+                    logger.warning(
+                        "Empty completion from %s/%s (agent=%s, reasoning_chars=%s): "
+                        "output likely landed on the reasoning channel or the request "
+                        "was silently dropped. Retrying once.",
+                        provider_name, model_name, agent, self._last_reasoning_chars)
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")
             raise
@@ -992,15 +1169,18 @@ class LLMClient:
 
         elapsed = time.time() - start_time
         self.cost_tracker.record(input_tokens, output_tokens, model_name,
-                                 cache_creation, cache_read)
+                                 cache_creation, cache_read, cached_tokens=self._last_cached,
+                                 cache_write_tokens=self._last_cache_write)
 
         if self.run_logger:
             self.run_logger.log(agent, f"{provider_name}:{model_name}", messages,
                                 content, input_tokens, output_tokens, elapsed,
-                                cache_creation=cache_creation, cache_read=cache_read)
+                                cache_creation=cache_creation, cache_read=cache_read, cached_tokens=self._last_cached, cache_write_tokens=self._last_cache_write, reasoning_chars=self._last_reasoning_chars)
         if return_meta:
             return content, {"input_tokens": input_tokens,
                              "output_tokens": output_tokens,
+                             "cached_tokens": getattr(self, "_last_cached", 0),
+                             "cache_write_tokens": getattr(self, "_last_cache_write", 0),
                              "max_tokens": max_tokens,
                              "truncated": bool(output_tokens) and output_tokens >= max_tokens}
         return content
@@ -1012,7 +1192,7 @@ class LLMClient:
         provider = self._get_provider(provider_name)
         if max_tokens is None:
             max_tokens = DEFAULT_MAX_TOKENS
-        extra = self._reasoning_extra(provider_name, agent, reasoning_effort)
+        extra = self._reasoning_extra(provider_name, agent, reasoning_effort, model=model)
         start_time = time.time()
         first_token_time = [None]  # mutable container for closure
 
@@ -1023,9 +1203,20 @@ class LLMClient:
                 output_manager.print_wrapper(text, end='', flush=True, chain_id=chain_id)
 
         try:
-            content, input_tokens, output_tokens, cache_creation, cache_read = provider.stream(
-                messages, model_name, max_tokens, temperature, on_token, **extra
-            )
+            # Same empty-completion guard shape as call(): dispatch once, retry
+            # once loudly. The retry reuses on_token, so a rescued stream still
+            # renders live.
+            for attempt in range(2):
+                content, input_tokens, output_tokens, cache_creation, cache_read = provider.stream(
+                    messages, model_name, max_tokens, temperature, on_token, **extra
+                )
+                self._sync_wire(provider)
+                if (content or "").strip() or attempt:
+                    break
+                logger.warning(
+                    "Empty streamed completion (agent=%s, reasoning_chars=%s): output "
+                    "likely landed on the reasoning channel. Retrying once.",
+                    agent, self._last_reasoning_chars)
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")
             raise
@@ -1036,12 +1227,13 @@ class LLMClient:
         elapsed = time.time() - start_time
         ttft = round(first_token_time[0] - start_time, 2) if first_token_time[0] else None
         self.cost_tracker.record(input_tokens, output_tokens, model_name,
-                                 cache_creation, cache_read)
+                                 cache_creation, cache_read, cached_tokens=self._last_cached,
+                                 cache_write_tokens=self._last_cache_write)
 
         if self.run_logger:
             self.run_logger.log(agent, f"{provider_name}:{model_name}", messages,
                                 content, input_tokens, output_tokens, elapsed, ttft,
-                                cache_creation=cache_creation, cache_read=cache_read)
+                                cache_creation=cache_creation, cache_read=cache_read, cached_tokens=self._last_cached, cache_write_tokens=self._last_cache_write, reasoning_chars=self._last_reasoning_chars)
         return content
 
     # Haiku is used for search regardless of search_model because web search
@@ -1077,6 +1269,10 @@ class LLMClient:
         self.cost_tracker.record(input_tokens, output_tokens, model_name)
 
         if self.run_logger:
+            # The Anthropic search path returns no cache or reasoning telemetry
+            # (3-tuple, no _sync_wire), so the log row carries the zero defaults.
+            # Reading self._last_* here would raise on a fresh client and would
+            # otherwise attribute the PREVIOUS call's wire stats to this row.
             self.run_logger.log(agent or "Literature Search",
                                 f"{provider_name}:{model_name}", messages,
                                 content, input_tokens, output_tokens, elapsed)

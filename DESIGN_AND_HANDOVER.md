@@ -7,7 +7,7 @@ references.
 
 This document ships alongside:
 
-- `delv-e.zip`: the complete, push-ready project (the 11 canonical modules, the `tests/`
+- `delv-e.zip`: the complete, push-ready project (the 13 canonical modules, the `tests/`
   directory with its bundled httpx stub, the docs, and the repo scaffolding).
 - `F1_GOAT_report.md`: the benchmark ground-truth report.
 - `f1_driver_vs_car.csv`: the benchmark dataset (26,668 driver-races × 67 columns).
@@ -63,7 +63,8 @@ network. Validation is done two ways, both already in place:
 `test_synth_gates`, `test_budget`, `test_toolkit`, `test_verify`, `test_compute`,
 `test_compute_cli`, `test_executor_reasoning_effort`, `test_truncation_retry`,
 `test_reasoning_ladder`, `test_function_reuse`, `test_checkpoint`, `test_compute_continue`,
-`test_verify_compute`. All 28 pass as of this handover.
+`test_verify_compute`, `test_gpt56_cache`, `test_compaction_budget`,
+`test_print_discipline`. All 31 pass as of this handover.
 The dataset-backed tests (`test_continue`, `test_extend`, `test_search`) read their dataset from `datasets/` (or a path given via an environment variable) and skip cleanly if it is absent, so a fresh
 clone runs the rest green. See `tests/README.md`.
 
@@ -143,7 +144,7 @@ confined to mechanical translation of a fully specified plan into code. This is 
 | `kernel.py` | `PersistentKernel`: the long-lived worker process, one namespace, crash isolation, checkpoint-anchored tail replay/restore, and the namespace registry (`describe_namespace`, which now also surfaces user-defined functions by signature). |
 | `executor.py` | Stateless code-handling helpers reused by the kernel and loop: the security `BLACKLIST` for generated code, code-fence extraction (`extract_code`), DataFrame serialization, and temp-file management. It no longer executes code; live execution is owned by `PersistentKernel` (the old out-of-process `CodeExecutor` and its runner machinery were removed in the 6.1 cleanup). |
 | `toolkit.py` | The vetted methods toolkit (section 6.8): three tested estimators (`paired_ability`, `cluster_bootstrap`, `rank_uncertainty`) preloaded into the kernel namespace at worker start. Pure numpy/pandas, print-free, defensive errors. Governed by the admission rule in its module docstring (evidence ticket required, cap of five). |
-| `llm.py` | Provider abstraction: `AnthropicProvider`, `OpenAIProvider`, `OllamaProvider`, `OpenRouterProvider`, the dispatching `LLMClient`, prompt caching (`build_cached_messages`, Anthropic only), `CostTracker`, `RunLogger` (writes `run_log.json` into `<output>/logs/<timestamp>/`), `RunStats` (a per-run events sink), `build_run_telemetry` (aggregates `run_telemetry.json`), `search_call` (Anthropic web search), and `parse_model_string`. |
+| `llm.py` | Provider abstraction: `AnthropicProvider`, `OpenAIProvider` (Responses API), `OpenAICompatProvider` (one chat-completions class behind the `_ollama_provider`/`_openrouter_provider` factories), the dispatching `LLMClient`, prompt caching (`build_cached_messages`: Anthropic `cache_control` blocks, GPT-5.6-via-OpenRouter `prompt_cache_breakpoint` parts, flattened strings elsewhere), `CostTracker` (cache reads and writes), `RunLogger` (writes `run_log.json` into `<output>/logs/<timestamp>/`), `RunStats` (a per-run events sink), `build_run_telemetry` (aggregates `run_telemetry.json`), `search_call` (Anthropic web search), and `parse_model_string`. |
 | `prompts.py` | All static model-facing text: system prompts and templates for the three agents, plus every directive template. The single place to edit instruction wording. |
 | `dataio.py` | Dataset loading (`load_dataset`) and data-derived schema construction (`build_schema`) with no domain hints. |
 | `ui.py` | Terminal styling and the run's human-readable console output (iteration banners, agent lines, synthesis status, search notices). |
@@ -246,9 +247,14 @@ cheap model for Executor. Model strings are parsed by `parse_model_string` into
 
 **Providers (`llm.py`).** Anthropic, OpenAI, Ollama, OpenRouter, behind a common `LLMClient`.
 
-- **Prompt caching is Anthropic only** (`build_cached_messages`). On Ollama there is no
-  caching, so the full (growing) context is re-sent and re-billed every turn. This is inherent
-  to the provider and is the backdrop for several context-size observations in section 7.
+- **Prompt caching is per provider** (`build_cached_messages`, 6.19). Anthropic models take
+  `cache_control` breakpoints; `openrouter:openai/gpt-5.6*` models take the equivalent explicit
+  `prompt_cache_breakpoint` markers on the first and last stable block (verified forwarded on
+  chat completions, and billed: reads at the 90% discount, writes at 1.25x input, both
+  accounted); xAI models rely on their automatic cache plus the per-run affinity header; and
+  every OpenRouter request carries a per-run `session_id` so sticky routing keeps hitting the
+  same cache. On Ollama there is no caching, so the full context is re-sent and re-billed every
+  turn, the backdrop for several context-size observations in section 7.
 - **`search_call`** is the Anthropic web-search path, pinned to a Haiku-class model and logged
   as "Literature Search."
 - **`CostTracker`** accumulates token usage and cost; **`RunLogger`** writes the per-call
@@ -256,8 +262,11 @@ cheap model for Executor. Model strings are parsed by `parse_model_string` into
 - **The Executor runs with reasoning disabled on Ollama** (`reasoning_effort="none"`, 6.10).
   It is a mechanical transcriber, so a chain-of-thought buys it nothing and a reasoning model in
   that seat truncates by spending its whole output budget thinking. The effort is a per-agent
-  module constant in `llm.py` (`EXECUTOR_REASONING_EFFORT`, `DEFAULT_REASONING_EFFORT`) and is
-  gated to Ollama, since OpenAI and OpenRouter reject the value.
+  module constant in `llm.py` (`EXECUTOR_REASONING_EFFORT`, `DEFAULT_REASONING_EFFORT`).
+  OpenRouter treats `none` as a first-class rung (6.11) and receives it verbatim; glm on Ollama
+  is the exception, where any explicit effort value triggers empty completions on their `/v1`
+  endpoint, so the field is omitted for that combination (`_provider_effort` returns None) and
+  the model thinks at its own default.
 - **The Investigator and Synthesizer reasoning effort is set by `--reasoning-effort`** (default
   `medium`, 6.15), the one reasoning knob exposed as a run flag. The value is translated per
   provider in `llm.py` (`_provider_effort`): Ollama unchanged, OpenRouter `max` to `xhigh`, and a
@@ -402,6 +411,38 @@ one-move compliance (7 of 13 multi-part), while run 2 held both disciplines clea
 ## 6. Recent fixes and enhancements
 
 This section is the most useful for picking up where we left off. Items are newest first.
+
+### 6.21 Print budget and kernel float format: attacking prompt weight at the source (shipped, validated on three live runs)
+
+**Why.** An audit of a real 17-turn heavy run, reading the final Investigator prompt the way the model does, located the noise precisely: 65% of the prompt was the 4-5 full resident steps, 83% of that raw mass was numeric table rows (median step stdout 17,991 chars, near the 20K resident ceiling), and about 6% of the whole prompt was float digits past the fourth significant figure. Cross-step duplication (383 chars) and registry staleness (0 stale objects) were measured and ruled out as targets. Compaction (6.20) bounds accumulation but deliberately never touches the last three residents, so the remaining mass had to be attacked where it is created: the prints the specs ask for.
+
+**Fix (files: `prompts.py`, `kernel.py`; test: `test_print_discipline.py`).** A PRINT BUDGET clause in both prompt modes' spec-writing rules, directly after the closure rule: decision-sufficient prints, not listings (top and bottom rows capped at ten per side, counts, summary statistics, correlations and shapes rather than every row), with the reminder that derived objects persist so any exact slice is one named print away. The clause itself passes the spec leakage audit it sits beside, which the test pins. The kernel worker prints floats at 4 significant digits (`display.float_format`), display-only, inside the existing anti-truncation block; stored values keep full precision.
+
+**Status.** Suite 31 files green. Validated on three live runs of the F1 seed. Median step stdout fell 17,991 to 2,766 chars (max 37,663 to 7,189); over-precise floats 2,098 to 25; the late-run prompt 136K to 58K chars, with input flat at 20-21K tokens from turn 12 of a 19-turn run; the Synthesizer's full-history feed (11 steps) fit in 21K tokens; zero REHYDRATE requests (the under-printing signal never fired) and zero empty completions; complete-run cost $0.43-0.67 against $1.22 for the pre-change heavy run. The history budget (6.20) never engaged at this step weight, which is the intended end state: a backstop. Watch item: top-and-bottom-k sorted views may lean ranking-flavored briefings toward outlier headlines; across three F1 runs the conclusions stayed coherent (the pooled-modern and era-local lenses of one answer), but if the lean recurs, the clause gains a line asking for the CI-overlap summary alongside rankings.
+
+### 6.20 History-budget compaction: tiered demotion with an inert default (shipped, verified live)
+
+**Why.** Same-seed runs vary in length, and every marginal turn is the priciest of the run: per-turn cost rose about 3x from turn 3 to turn 16 on measured heavy runs because the prompt floor grows with depth (full residents near the 20K ceiling, a ~1.9K-char headline per collapsed step forever, an 11-18K-char volatile tail). Compaction itself was verified healthy against those runs (collapse counts climbing, residents capped, the modules hash-identical to baseline); the issue was that the floor it compacts to rises with every completed step.
+
+**Fix (file: `investigation.py`; test: `test_compaction_budget.py`).** `_history_blocks` takes `char_budget` (default None, off; the Investigator's decide passes `HISTORY_CHAR_BUDGET = 90_000`). Under budget the rendering is byte-identical to the unbudgeted path. Over budget, steps demote oldest-first, cheapest-fidelity-first, re-measuring after each single demotion: collapsed headlines slim to a one-sentence SPEC (`SLIM_SPEC_CHARS`), the oldest slims fold into a single chronological ARCHIVED STEPS block (one line each, so size asymptotes instead of growing with every step), then older PROTECTED residents trim to `PROTECTED_SLIM_CEILING = 4_000` with a calm recovery notice. Red lines are never demoted whatever the budget: the last three recents, search blocks, and this turn's rehydrates; a run whose untouchable core exceeds the budget returns best effort. Every demoted form keeps the REHYDRATE affordance, the raw stays on disk, and the Synthesizer feed is untouched, so demotion is recoverable rather than lossy. Demotions rewrite deep history and reset the cached prefix at the first changed block; measured runs already reset to the seed almost every turn under one-collapse-per-turn churn, so the marginal cache cost is small against the fresh-input savings.
+
+**Status.** Suite 30 files green at ship. Replaying the real 17-step F1 log: byte-identical through turn 14, engagement exactly at the crossing, 30-35% late-turn reductions in the protected-resident scenario that matches the heaviest measured run. Verified live twice: a 9-iteration run crossed nothing (no markers, $0.44 total), and after 6.21 landed, a 19-iteration run stayed under budget for its whole length.
+
+### 6.19 GPT-5.6 explicit prompt caching via OpenRouter, cache-write accounting, and sticky sessions (shipped, validated live to the cent)
+
+**Why.** `openrouter:openai/gpt-5.6-terra` cached only its first call. GPT-5.6's GA (July 9) replaced automatic prefix matching with breakpoint-based matching under a mandatory `prompt_cache_key` (implicit mode places one breakpoint on the latest message), and delv-e's non-Anthropic shape is one giant rebuilt user message, so only byte-identical full prompts could ever hit. OpenRouter's docs said the new explicit breakpoints were Responses-API-only on their platform; a three-call probe showed chat completions forwards them (call 2, same stable block with a different tail: cached 2,775 of 2,790), so the small fix was viable.
+
+**Fix (files: `llm.py`; test: `test_gpt56_cache.py`).** `build_cached_messages` grew a branch for `openrouter:openai/gpt-5.6*` models with non-empty stable blocks: chat-parts content with `prompt_cache_breakpoint` on the first and last stable block (the Anthropic placement), staying in implicit mode so OpenAI's free latest-message breakpoint rides along. Part texts carry LEADING separators so appends never rewrite cached bytes, and the concatenated parts are byte-identical to the flattened prompt every other model receives (a pinned fidelity invariant). `_flatten_messages` passes marked part lists through untouched and flattens everything else byte-identically. Wire capture gained `_last_cache_write` beside `_last_cached` (both via a generic `_usage_detail`), flowing explicitly through `_sync_wire` into call meta, `CostTracker`, `RunLogger` rows, and the per-agent telemetry as `cached_write`. `compute_cost` takes `cache_write_tokens` with include-semantics (OpenAI's prompt_tokens INCLUDES the cached and written portions); the fallback write rate is 1.25x input (never under-report; the same premium the function already charges Anthropic writes). PRICING gained terra's `cached_write` 3.125 and the luna entry (1.00/6.0, cached 0.10, write 1.25). The per-run UUID was renamed `_XAI_CONV_ID` to `_RUN_ID` (it now feeds three affinity mechanisms), and every OpenRouter request carries `session_id`, because OpenRouter's default sticky-routing hash keys on the first non-system message, which delv-e rewrites every turn.
+
+**Status / findings.** Validated live: all nine charged rows of a terra run matched OpenRouter's console to the cent (reads 0.25/M, writes 3.125/M); cached climbed 0, 7,220, 17,036, 26,002 across turns with 42% of Investigator input served from cache; on frontier misses cached pinned at exactly the seed prefix, proving the first-block fallback marker is honored (multiple explicit breakpoints work). $0.00 console rows are OpenRouter's zero completion insurance on empty or error completions, not missing charges: the ledger books insured empty finals (safe-side over-report, $0.10 on the measured run) and never books unlogged guard first attempts. Churn economics: under collapse-every-turn history, 5.6's frontier rarely survives and the run pays 1.25x rewrites beyond the seed (implicit mode would write them anyway); a heavy luna run still netted +11% input-side. Grok is untouched byte-for-byte (xAI reports no write accounting; per-row math identical before and after). The direct `openai:` path (Responses API) is deliberately excluded from the branch. gen_id capture stays out per the standing rule, but the concrete need has now arrived (row-level invoice reconciliation and empty-attempt forensics), so it is queued as a small opt-in on the non-streaming path when wanted.
+
+### 6.18 llm.py structural refactor and two latent logging bugs (shipped, wire-diff-verified byte-identical)
+
+**Why.** Three near-identical provider classes carried the OpenAI-compatible dispatch in triplicate, and the stream wrapper's empty-completion guard still held a duplicated (and once misindent-scarred) dispatch. Reading every method before rewriting also surfaced two live bugs: `RunLogger.log` had a duplicate `"reasoning_chars"` dict key whose second, dead entry (a getattr on the logger's own self) shadowed the explicit parameter, so every logged row recorded reasoning_chars=0; and `search_call` read `self._last_cached`/`_last_reasoning_chars` directly off the client, raising AttributeError when a search was the first call and otherwise attributing the previous call's wire stats to the search row.
+
+**Fix (file: `llm.py`; tests: existing suite).** `OllamaProvider` and `OpenRouterProvider` collapsed into one `OpenAICompatProvider` (constructor takes a resolved base_url, api_key, an extras builder mapping (model, effort) to (extra_body, extra_headers), and optional default headers); zero-arg factories `_ollama_provider`/`_openrouter_provider` resolve env vars, and the registry keeps its name and shape (values are zero-arg callables, so test doubles drop in unchanged). Every provider quirk lives in the extras builders. `OpenAIProvider` stays separate deliberately: it speaks the Responses API (instructions/input, max_output_tokens, different stream events, no temperature), so folding it into a chat-completions class would have changed its wire behavior. Both LLMClient guard paths became a single for-attempt loop with the warning text intact. The logger fix deletes the dead shadowing line (rows now record real reasoning-channel sizes); search rows log honest zeros, since that path carries no cache or reasoning telemetry.
+
+**Status.** Suite green; behavior proven byte-identical by a wire-diff harness driving the pre- and post-refactor modules side by side through a fake SDK across a 16-scenario effort-and-quirk matrix: every recorded constructor and request kwarg, return tuple, meta dict, and side-channel identical, with the shared run-id and timeout contracts asserted. llm.py went 1,230 to 1,199 lines at that point (the earlier 200-250 line estimate assumed more removable mass than the 221-line source region contained).
 
 ### 6.0 Toolkit legend, anchor-SE fix, budget notice, GATES block, and the `--verify` feature (shipped over one session, suite green)
 
@@ -713,6 +754,17 @@ Pre-GitHub work, shipped together.
   run to confirm the Investigator names and calls a persisted function rather than ordering a rebuild.
 
 ---
+
+- **Ledger versus invoice on OpenRouter.** The ledger books what the work would cost; OpenRouter's
+  zero completion insurance refunds empty or error completions, so a run with guard-rescued
+  empties over-reports by those rows (visible as rows with empty output and nonzero `cost_usd`),
+  while insured guard FIRST attempts appear in neither ledger nor invoice (unlogged by design).
+  If the numbers ever need row-level reconciliation, that is the gen_id capture queued in 6.19.
+- **Watch ranking-flavored briefings for outlier lean under the print budget (6.21).**
+  Top-and-bottom-k views foreground "there is a #1" more than full overlapping tables do. Three
+  F1 runs stayed coherent (the pooled-modern and era-local lenses of one answer), but if the lean
+  recurs on other ranking seeds, add a clause line asking for the CI-overlap summary alongside
+  any ranking print.
 
 ## Appendix A: Path map
 

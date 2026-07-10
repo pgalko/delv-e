@@ -91,6 +91,10 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.width", None)
 pd.set_option("display.max_colwidth", 200)
 pd.set_option("display.max_rows", 2000)
+# Floats print at 4 significant digits: display-only, stored values keep full
+# precision. Measured on a live heavy run, digits past the 4th were ~6% of the
+# Investigator's prompt mass for zero decision value.
+pd.set_option("display.float_format", lambda v: f"{v:.4g}")
 
 _DONE = "__DELVE_KERNEL_DONE__"
 _READY = "__DELVE_KERNEL_READY__"

@@ -97,13 +97,22 @@ a verdict is accepted is shared across G1, G3, and G4 and is configurable.
 
 ### Long runs and cost
 
-The premium model uses prompt caching so that stable context is not paid for
-again on every turn. As evidence accumulates, older steps that no longer bear on
-an open question collapse to a pointer, which keeps the working context small and
-focused. The Investigator can rehydrate any collapsed step when it needs the
-detail again. The Synthesizer always reads the full raw evidence. A cost report
-summarizes token usage and dollar cost per provider, including the savings from
-caching.
+Stable context is cached wherever the provider allows it: Anthropic models use
+`cache_control` breakpoints, OpenAI GPT-5.6 models routed through OpenRouter use
+the equivalent explicit `prompt_cache_breakpoint` markers, xAI models get a
+per-run affinity header, and every OpenRouter request carries a per-run session
+id so sticky routing keeps hitting the same cache. Cache reads and cache writes
+are both accounted (GPT-5.6 bills writes at 1.25x input; the report shows savings
+net of that premium). As evidence accumulates, older steps that no longer bear on
+an open question collapse to a pointer, the Investigator can rehydrate any of
+them, and the Synthesizer always reads the full raw evidence. Two disciplines
+keep long runs from growing without bound: specs are written under a print
+budget (decision-sufficient prints rather than full table dumps, floats shown at
+four significant digits), and a history character budget
+(`HISTORY_CHAR_BUDGET` in `investigation.py`) acts as a backstop that slims,
+archives, and trims the oldest material if the rendered history ever exceeds it,
+staying byte-identical below the line. A cost report summarizes token usage and
+dollar cost per provider, including the savings from caching.
 
 ## Install
 
@@ -203,8 +212,11 @@ only transcribes a closed specification. The levels are `max`, `high`, `medium`
 Each level is mapped to the provider's own dial: Ollama takes it unchanged,
 OpenRouter's top level is `xhigh` so `max` maps to that, and a direct `anthropic:`
 model ignores the flag (it has no effort dial; an `openrouter:anthropic/...` model
-still honors it). Reasoning models also read the levels differently: GLM-5.2 already
-runs at its maximum for `medium` and `low`, so pass `high` to make it reason less.
+still honors it). Reasoning models also read the levels differently. GLM-5.2 is special-cased:
+on Ollama the field is omitted entirely, because any explicit value triggers empty
+completions on their `/v1` endpoint, so the flag is a no-op there and the model
+thinks at its own default; via OpenRouter, `none` is floored to `high` (their
+documented enum for GLM).
 
 ### Web search
 
