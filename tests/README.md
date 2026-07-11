@@ -57,3 +57,6 @@ of the suite still runs in a fresh clone. To run them, provide the dataset:
 - `test_gpt56_cache` — GPT-5.6 explicit caching: breakpoint emission, flatten pass-through, write-cost math pinned to a live probe
 - `test_compaction_budget` — history-budget tiered demotion: inert default, pass order, red lines
 - `test_print_discipline` — the PRINT BUDGET clause (both modes, leakage-clean) and the kernel float format
+- `test_charts` — briefing charts: CHART/SECTION/CAPTION/SPEC parsing, harness-owned placement, render-loop isolation
+- `test_reasoning_floors` — per-model effort floors (glm, x-ai) and the reasoning-rejection circuit breaker
+- `test_spec_selfcontainment` — the executor-visibility spec rule (both modes), the compute persist-as-function rule, and the blind-step-reference tripwire

@@ -34,6 +34,8 @@ import os
 import re
 
 from executor import extract_code
+from synthesis import apply_chart_results
+from prompts import CHART_STYLE_DIRECTIVE
 from kernel import PersistentKernel
 from nav_state import NavState
 from synthesis import Synthesizer
@@ -203,6 +205,47 @@ class Executor:
         return {"code": code, "stdout": stdout,
                 "error": error or "executor failed to produce runnable code",
                 "attempts": self.max_retries + 1}
+
+
+def _render_charts(executor, kernel, charts, output_dir, ui=None, stats=None):
+    """Run each chart spec through the Executor against the LIVE kernel
+    namespace, landing files in <output_dir>/charts (the kernel's patched
+    savefig routes bare filenames into the step's analysis_dir). Never raises:
+    charts must not break the briefing. Returns the set of produced filenames
+    and writes charts/manifest.json for provenance. Chart steps are
+    deliberately NOT appended to the investigation log: they run after
+    synthesis, carry no analytical state, and must not enter Investigator
+    history on a later --extend."""
+    charts_dir = os.path.join(output_dir, "charts")
+    produced, manifest = set(), []
+    for c in charts:
+        name, spec = c["name"], c["spec"]
+        full_spec = f"{spec}\n\n{CHART_STYLE_DIRECTIVE.format(name=name)}"
+        try:
+            registry_text = kernel.describe_namespace()
+            res = executor.run(full_spec, kernel, registry_text,
+                               analysis_dir=charts_dir)
+            ok = os.path.exists(os.path.join(charts_dir, name))
+            err = res.get("error")
+        except Exception as exc:        # noqa: BLE001 - isolation is the contract
+            ok, err = False, str(exc)
+        if ok:
+            produced.add(name)
+        if stats:
+            stats.bump("charts_rendered" if ok else "charts_failed")
+        logger.info("Chart %s: %s", name, "saved" if ok else f"FAILED ({err})")
+        manifest.append({"chart": name, "section": c.get("section"),
+                         "caption": c.get("caption"), "spec": spec,
+                         "produced": ok, "error": None if ok else err})
+    if manifest:
+        try:
+            os.makedirs(charts_dir, exist_ok=True)
+            with open(os.path.join(charts_dir, "manifest.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        except OSError as exc:
+            logger.warning("Could not write charts manifest: %s", exc)
+    return produced
 
 
 # Investigator turns use the shared DEFAULT_MAX_TOKENS budget. The output-token cap
@@ -560,8 +603,20 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
 
     def _final_synthesis(final=False):
         result = synthesizer.synthesize(seed, schema_text, log, nav, final=final,
-                                        prior_seeds=prior_seeds)
+                                        prior_seeds=prior_seeds,
+                                        registry_text=kernel.describe_namespace())
         if result["verdict"] == "FINAL" and result["briefing"]:
+            charts = result.get("charts") or []
+            if charts:
+                # Post-synthesis chart pass: cheap Executor calls against the
+                # still-live namespace. The briefing ships regardless of chart
+                # fate; apply_chart_results guarantees no broken links.
+                if ui:
+                    ui.agent("Executor", executor.model)
+                produced = _render_charts(executor, kernel, charts, output_dir,
+                                          ui=ui, stats=stats)
+                result["briefing"] = apply_chart_results(result["briefing"],
+                                                         charts, produced)
             try:
                 os.makedirs(output_dir, exist_ok=True)
                 with open(os.path.join(output_dir, "briefing.md"), "w", encoding="utf-8") as f:
@@ -593,7 +648,9 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
             # Retry it rather than letting the parser's markerless fallback finalize
             # the run prematurely. Attempt 1 above ran at the chosen effort; a retry
             # holds that effort but adds the think-less directive, and the FINAL retry
-            # forces reasoning off (the one reliable circuit-breaker across models),
+            # forces reasoning off where the endpoint allows it (models that
+            # cannot disable reasoning floor to their lowest accepted rung or a
+            # plain retry; see _provider_effort),
             # dropping the directive since 'none' is the fix rather than the nudge.
             # Only after the retries are exhausted do we emit a provisional briefing
             # (never end empty-handed).
@@ -781,7 +838,19 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                 ui.question(spec)
                 ui.agent("Executor", executor_model)
             analysis_dir = os.path.join(output_dir, "exploration", f"{step:02d}")
-            exec_registry = kernel.describe_namespace(names=_referenced_names(spec, kernel))
+            refs = _referenced_names(spec, kernel)
+            exec_registry = kernel.describe_namespace(names=refs)
+            if not refs and re.search(r"\bstep\s+\d+\b", spec, re.IGNORECASE):
+                # The executor sees only the spec plus the registry objects the
+                # spec NAMES. A step-number reference with zero named objects
+                # means it must rebuild the referenced method blind, and a
+                # "change only X" contrast against a blind rebuild is invalid.
+                logger.warning("Step %d: spec references a prior step by number "
+                               "but names no registry objects; the executor "
+                               "cannot see prior steps and will rebuild the "
+                               "method from the spec text alone.", step)
+                if stats:
+                    stats.bump("blind_step_references")
             result = executor.run(spec, kernel, exec_registry, analysis_dir=analysis_dir)
 
             entry = {

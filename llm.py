@@ -97,6 +97,16 @@ def _usage_detail(usage, key):
     return v or 0
 
 
+def _reasoning_rejected(exc):
+    """True for provider errors that reject the reasoning-effort FIELD itself
+    (e.g. xAI: "Reasoning is mandatory for this endpoint and cannot be
+    disabled"). The client strips the field and re-dispatches once instead of
+    letting a rescue rung's experiment kill the run; the mapping floors are the
+    first line of defense, this is the net for enums we have not met yet."""
+    msg = str(exc).lower()
+    return "reasoning" in msg and ("mandatory" in msg or "cannot be disabled" in msg)
+
+
 def _xai_conv_headers(model):
     return {"x-grok-conv-id": _RUN_ID} if (model or "").startswith("x-ai/") else {}
 
@@ -123,7 +133,12 @@ def _provider_effort(provider_name, effort, model=""):
 
     Model-aware floor: glm-5.x exposes only 'high' and 'max' and has no off
     switch; sending 'none' makes Ollama cloud return an instant empty completion.
-    So 'none' is floored to 'high' for glm on either route. Models that tolerate
+    So 'none' is floored to 'high' for glm on either route. xAI reasoning
+    models (grok-4.5) reject disabling reasoning outright (400: "Reasoning is
+    mandatory for this endpoint and cannot be disabled"); their documented dial
+    is low/medium/high with HIGH as the unspecified default, so 'none' floors
+    to 'low', the lowest accepted rung (omitting the field would mean MORE
+    reasoning, the opposite of the rescue's intent). Models that tolerate
     'none' (kimi and other non-thinking executors) are unaffected."""
     if provider_name not in ("ollama", "openrouter"):
         return None
@@ -137,6 +152,8 @@ def _provider_effort(provider_name, effort, model=""):
         return None
     if effort == "none" and "glm" in (model or ""):
         effort = "high"   # OpenRouter route: documented enum is high/max only
+    if effort == "none" and "x-ai/" in (model or ""):
+        effort = "low"    # grok cannot disable reasoning; low is its bottom rung
     if provider_name == "openrouter":
         return "xhigh" if effort == "max" else effort
     return effort
@@ -171,7 +188,7 @@ PRICING = {
     "x-ai/grok-4.3":              {"input": 1.25, "output": 2.50},
     "x-ai/grok-4.5":              {"input": 2.0, "output": 6.0, "cached_input": 0.50},
     "openai/gpt-5.6-terra":       {"input": 2.50, "output": 15.0, "cached_input": 0.25, "cached_write": 3.125},
-    "openai/gpt-5.6-luna":       {"input": 1.00, "output": 6.0, "cached_input": 0.10, "cached_write": 1.25},
+    "openai/gpt-5.6-luna":        {"input": 1.00, "output": 6.0, "cached_input": 0.10, "cached_write": 1.25},
     # Embeddings (output_tokens always 0)
     "text-embedding-3-small":     {"input": 0.02,  "output": 0.0},
     "text-embedding-3-large":     {"input": 0.13,  "output": 0.0},
@@ -1144,21 +1161,37 @@ class LLMClient:
         spin = self._Spinner(agent or "working") if self._Spinner else nullcontext()
         try:
             with spin:
-                # Empty-completion guard: dispatch once, retry once loudly if the
-                # content came back blank (the warning names the reasoning-channel
-                # size so channel misroutes and silent drops are distinguishable).
-                for attempt in range(2):
-                    content, input_tokens, output_tokens, cache_creation, cache_read = provider.call(
-                        messages, model_name, max_tokens, temperature, **extra
-                    )
-                    self._sync_wire(provider)
-                    if (content or "").strip() or attempt:
+                for effort_try in range(2):
+                    try:
+                        # Empty-completion guard: dispatch once, retry once loudly if
+                        # the content came back blank (the warning names the
+                        # reasoning-channel size so channel misroutes and silent
+                        # drops are distinguishable).
+                        for attempt in range(2):
+                            content, input_tokens, output_tokens, cache_creation, cache_read = provider.call(
+                                messages, model_name, max_tokens, temperature, **extra
+                            )
+                            self._sync_wire(provider)
+                            if (content or "").strip() or attempt:
+                                break
+                            logger.warning(
+                                "Empty completion from %s/%s (agent=%s, reasoning_chars=%s): "
+                                "output likely landed on the reasoning channel or the request "
+                                "was silently dropped. Retrying once.",
+                                provider_name, model_name, agent, self._last_reasoning_chars)
                         break
-                    logger.warning(
-                        "Empty completion from %s/%s (agent=%s, reasoning_chars=%s): "
-                        "output likely landed on the reasoning channel or the request "
-                        "was silently dropped. Retrying once.",
-                        provider_name, model_name, agent, self._last_reasoning_chars)
+                    except Exception as e:
+                        # A provider rejecting the reasoning-effort FIELD must not
+                        # kill the run: strip the field and re-dispatch once.
+                        if (effort_try == 0 and extra.get("reasoning_effort")
+                                and _reasoning_rejected(e)):
+                            logger.warning(
+                                "%s rejected reasoning_effort=%r for %s; retrying with "
+                                "the field omitted.", provider_name,
+                                extra["reasoning_effort"], model_name)
+                            extra = {**extra, "reasoning_effort": None}
+                            continue
+                        raise
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")
             raise
@@ -1203,20 +1236,33 @@ class LLMClient:
                 output_manager.print_wrapper(text, end='', flush=True, chain_id=chain_id)
 
         try:
-            # Same empty-completion guard shape as call(): dispatch once, retry
-            # once loudly. The retry reuses on_token, so a rescued stream still
-            # renders live.
-            for attempt in range(2):
-                content, input_tokens, output_tokens, cache_creation, cache_read = provider.stream(
-                    messages, model_name, max_tokens, temperature, on_token, **extra
-                )
-                self._sync_wire(provider)
-                if (content or "").strip() or attempt:
+            for effort_try in range(2):
+                try:
+                    # Same empty-completion guard shape as call(): dispatch once, retry
+                    # once loudly. The retry reuses on_token, so a rescued stream still
+                    # renders live.
+                    for attempt in range(2):
+                        content, input_tokens, output_tokens, cache_creation, cache_read = provider.stream(
+                            messages, model_name, max_tokens, temperature, on_token, **extra
+                        )
+                        self._sync_wire(provider)
+                        if (content or "").strip() or attempt:
+                            break
+                        logger.warning(
+                            "Empty streamed completion (agent=%s, reasoning_chars=%s): output "
+                            "likely landed on the reasoning channel. Retrying once.",
+                            agent, self._last_reasoning_chars)
                     break
-                logger.warning(
-                    "Empty streamed completion (agent=%s, reasoning_chars=%s): output "
-                    "likely landed on the reasoning channel. Retrying once.",
-                    agent, self._last_reasoning_chars)
+                except Exception as e:
+                    if (effort_try == 0 and extra.get("reasoning_effort")
+                            and _reasoning_rejected(e)):
+                        logger.warning(
+                            "%s rejected reasoning_effort=%r for %s; retrying with "
+                            "the field omitted.", provider_name,
+                            extra["reasoning_effort"], model_name)
+                        extra = {**extra, "reasoning_effort": None}
+                        continue
+                    raise
         except Exception as e:
             logger.error(f"{provider_name} API error: {e}")
             raise

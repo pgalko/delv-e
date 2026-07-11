@@ -109,7 +109,7 @@ def _parse_synth(text):
     # a live run wrote "### Subsection" headers inside its briefing and the
     # generic ### terminator cut the deliverable at the first one. \b keeps
     # e.g. BRIEFINGS from matching.
-    _END = r"(?=###\s*(?:GATES|VERDICT|BRIEFING)\b|\Z)"
+    _END = r"(?=###\s*(?:GATES|VERDICT|BRIEFING|CHARTS)\b|\Z)"
     def block(name):
         # Marker tolerance: a model occasionally malforms the trailing hashes
         # (a live glm run emitted "###BRIEFING##" and the exact-match regex
@@ -147,12 +147,108 @@ def _parse_synth(text):
             salvage = salvage.strip()
             if salvage.lower() not in ("none", "n/a", ""):
                 briefing = salvage
+    charts = _parse_charts(block("CHARTS"))
     if not verdict_raw and not briefing:
         return {"verdict": "FINAL", "reason": "", "briefing": text.strip(),
-                "preamble": "", "gates_review": gates}
+                "preamble": "", "gates_review": gates, "charts": charts}
     return {"verdict": "NEEDS_MORE_WORK" if needs else "FINAL",
             "reason": reason, "briefing": briefing, "preamble": preamble,
-            "gates_review": gates}
+            "gates_review": gates, "charts": charts}
+
+
+MAX_CHARTS = 3
+
+
+def sanitize_chart_name(raw):
+    """A chart filename the harness will trust: basename only, lowercase,
+    [a-z0-9_] with runs of anything else collapsed to one underscore, forced
+    .png. Returns None when nothing survives. Path mechanics never rest on
+    model output: the kernel's patched savefig additionally basenames and
+    routes every save into the step's analysis_dir."""
+    import os as _os
+    import re as _re
+    stem = _os.path.basename((raw or "").strip()).lower()
+    stem = _re.sub(r"\.png$", "", stem)
+    stem = _re.sub(r"[^a-z0-9_]+", "_", stem).strip("_")
+    return f"{stem}.png" if stem else None
+
+
+def _parse_charts(block_text):
+    """CHART entries from the ###CHARTS### block: tolerant of case and
+    spacing, names sanitized, duplicates dropped (first wins), capped at
+    MAX_CHARTS. Each entry is CHART/SECTION/CAPTION/SPEC (SECTION and CAPTION
+    optional); returns a list of dicts with keys name, section, caption, spec."""
+    import re as _re
+    if not (block_text or "").strip():
+        return []
+    charts, seen = [], set()
+    for chunk in _re.split(r"(?im)^\s*CHART:\s*", block_text)[1:]:
+        lines = chunk.splitlines()
+        name = sanitize_chart_name(lines[0] if lines else "")
+        rest = "\n".join(lines[1:])
+        m = _re.search(r"(?ims)^\s*SPEC:\s*(.*)\Z", rest)
+        spec = m.group(1).strip() if m else ""
+        def _field(f, _rest=rest):
+            fm = _re.search(rf"(?im)^\s*{f}:\s*(.*)$", _rest)
+            return fm.group(1).strip() if fm else ""
+        if not name or not spec or name in seen:
+            continue
+        seen.add(name)
+        charts.append({"name": name, "section": _field("SECTION"),
+                       "caption": _field("CAPTION"), "spec": spec})
+        if len(charts) >= MAX_CHARTS:
+            break
+    return charts
+
+
+def apply_chart_results(briefing, charts, produced):
+    """Place produced charts deterministically: placement is the HARNESS's job,
+    not the model's (a live glm run dumped every image link after the last
+    header despite instructions, so the contract moved to SECTION fields).
+    Every standalone image line the model wrote is stripped; each produced
+    chart is inserted at the end of the section its SECTION field names
+    (fuzzy, case-insensitive header match), or appended at the end when the
+    section is missing. A chart that failed simply does not appear, so the
+    shipped briefing never carries a broken link."""
+    import re as _re
+    img_line = _re.compile(r"\s*!\[[^\]]*\]\([^)]+\)\s*$")
+    lines = [ln for ln in briefing.split("\n") if not img_line.match(ln)]
+
+    def _norm(h):
+        return _re.sub(r"[^a-z0-9 ]+", "", (h or "").lower()).strip()
+
+    headers = [(i, _norm(_re.sub(r"^#+", "", ln)))
+               for i, ln in enumerate(lines) if _re.match(r"\s*##+\s", ln)]
+    inserts = {}
+    for c in charts:
+        if c["name"] not in produced:
+            continue
+        cap = c.get("caption") or c["name"][:-4].replace("_", " ")
+        img = f"![{cap}](charts/{c['name']})"
+        target = None
+        sec = _norm(c.get("section"))
+        if sec:
+            for k, (i, h) in enumerate(headers):
+                if sec in h or h in sec:
+                    target = headers[k + 1][0] if k + 1 < len(headers) else len(lines)
+                    break
+        if target is None:
+            target = len(lines)
+        inserts.setdefault(target, []).append(img)
+
+    out = []
+    for i, ln in enumerate(lines):
+        for img in inserts.get(i, ()):
+            if out and out[-1].strip():
+                out.append("")
+            out.append(img)
+            out.append("")
+        out.append(ln)
+    for img in inserts.get(len(lines), ()):
+        if out and out[-1].strip():
+            out.append("")
+        out.append(img)
+    return "\n".join(out)
 
 
 class Synthesizer:
@@ -165,7 +261,7 @@ class Synthesizer:
         self.reasoning_effort = reasoning_effort
 
     def synthesize(self, seed, schema, log, nav, max_tokens=None, final=False,
-                   prior_seeds=None):
+                   prior_seeds=None, registry_text=None):
         # Synthesis uses the shared DEFAULT_MAX_TOKENS budget (via call_with_ladder
         # below). A reasoning synthesizer on Ollama can otherwise spend its whole
         # budget on hidden reasoning and emit no briefing (seen live); call_with_ladder
@@ -173,6 +269,12 @@ class Synthesizer:
         # cap alone, and Anthropic's non-streaming limit is clamped inside llm.call.
         compute = self.p.compute
         evidence = assemble_evidence(log, nav)
+        if registry_text:
+            # For CHART specs: lets the Synthesizer reference the run's live
+            # derived objects by registry name instead of re-deriving from df.
+            evidence += ("\n\n=== CURRENT NAMESPACE REGISTRY "
+                         "(reference these objects by name in CHART specs) ===\n"
+                         + registry_text)
         nav_text = nav.render_for_investigator(log)
 
         if prior_seeds:

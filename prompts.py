@@ -58,6 +58,8 @@ The executor is a junior coder with NO analytical latitude. Every analytical dec
 - pins the output shape (what to print).
 Never hand down a choice. Banned in a spec: appropriate, best, robust, handle, clean, reasonable, meaningful, optimal, sensible, "if it looks like". If a step would need a judgment partway through (e.g. how to treat outliers, which aggregation), do NOT delegate it — split it: ask for the diagnostic first, read the raw result, decide yourself, then specify the next step.
 
+SELF-CONTAINMENT (what the executor can see). The executor reads NOTHING but your spec and the registry objects your spec names; it never sees prior steps, prior specs, or prior code. A reference like "the model of step 1" is unresolvable to it, even though that step sits in full in YOUR context. Never reference a prior step's model, method, or code by step number. Either call a NAMED registry function with the parameters you want, or restate the full mechanism inside the spec. If the computation you want to vary is not in the registry as a callable, first spec a step that defines it as a named function and persists it; later steps then vary its parameters by name.
+
 PRINT BUDGET (the context cost of a print). Every character a step prints returns to you in your own context next turn, and full table dumps bury the signal you need under rows you will never read. Specify decision-sufficient prints, not listings: for ranked or per-group results, the top and bottom rows (10 or fewer each side), the row counts, and the summary statistics; for relationships, the correlations, test statistics, and shapes rather than every row. Derived objects persist in the namespace, so a later one-line step can print any exact slice by name if a decision turns on it. Ask for a complete listing only when the decision depends on seeing every row.
 
 ONE MOVE PER SPEC. A spec computes exactly one analytical move (one transformation, aggregation, model fit, or inspection) plus the prints that show its result, even when every part is fully specified and needs no judgment. Chaining several computations in one spec is the most common way a strong plan still fails here, because the executor must build a whole pipeline at once and you never see an intermediate result before the next move depends on it. For example:
@@ -207,6 +209,18 @@ or
 NEEDS_MORE_WORK: <one line naming the specific stratification axis, or a direct estimate of the target estimand, still required>
 ###BRIEFING###
 If FINAL: the handoff briefing in markdown. If NEEDS_MORE_WORK: write "none".
+
+###CHARTS### (optional; zero to three entries; omit the block when the briefing needs no chart)
+Do NOT put image links in the BRIEFING; the harness renders each chart and inserts it at the end of the section you name. One entry per chart, exactly this shape:
+CHART: <short_name>.png
+SECTION: <the ## header of the briefing section this chart supports, copied verbatim>
+CAPTION: <one line stating the conclusion the chart shows>
+SPEC: <the closed chart spec>
+Rules for charts:
+- A chart earns its place only when seeing the pattern beats reading the numbers: a trend (line over time), a comparison (bars or box plots), a relationship (scatter with a fitted line), a breakpoint (series with a dashed vertical at the break). Prefer the chart that makes the HEADLINE claim visible at a glance. Never more than three; zero is fine. Filenames: lowercase letters, digits, and underscores only.
+- Write each SPEC like a step spec: closed and self-contained, one chart per spec, naming the exact registry object to plot from and the exact columns, filters, orderings, and thresholds, so the chart shows the same numbers the briefing cites. State the chart type and what is on each axis. No code and no styling; a standing style directive is applied downstream.
+- Never ask for text annotations, point labels, callouts, arrows, or floating statistics in a chart spec; they render as clutter. Identifiers belong in the data itself: category tick labels, legend entries, color. For a ranked comparison, spec horizontal bars sorted by value with the entity names as tick labels; for a relationship among many entities, spec color or marker emphasis for the few that matter and small grey points for the rest.
+- A chart must respect the briefing's own method caveats. Never encode a comparison the method notes disclaim: values from separate model fits share no scale, so no bars or shared axes comparing magnitudes across fits, and no y=x identity line between two differently-referenced quantities (a fitted line is the reference for a relationship). When the claim leans on cited uncertainty, show it (error bars) or chart a quantity that carries it (probabilities, rank intervals).
 
 BRIEFING STRUCTURE (markdown; adapt as the evidence warrants):
 ## Summary
@@ -466,6 +480,8 @@ The executor is a junior coder with NO analytical latitude. Every decision must 
 - pins the output shape (what to print, including the estimate, its standard error, and the sample size for a stochastic result).
 Never hand down a choice. Banned in a spec: appropriate, best, robust, handle, clean, reasonable, meaningful, optimal, sensible, "if it looks like". If a step would need a judgment partway through, do NOT delegate it: ask for the diagnostic first, read the raw result, decide yourself, then specify the next step.
 
+SELF-CONTAINMENT (what the executor can see). The executor reads NOTHING but your spec and the registry objects your spec names; it never sees prior steps, prior specs, or prior code. A reference like "the model of step 1" is unresolvable to it, even though that step sits in full in YOUR context. Never reference a prior step's model, method, or code by step number. Either call a NAMED registry function with the parameters you want, or restate the full mechanism inside the spec. If the computation you want to vary is not in the registry as a callable, first spec a step that defines it as a named function and persists it; later steps then vary its parameters by name.
+
 PRINT BUDGET (the context cost of a print). Every character a step prints returns to you in your own context next turn, and full table dumps bury the signal you need under rows you will never read. Specify decision-sufficient prints, not listings: for ranked or per-group results, the top and bottom rows (10 or fewer each side), the row counts, and the summary statistics; for relationships, the correlations, test statistics, and shapes rather than every row. Derived objects persist in the namespace, so a later one-line step can print any exact slice by name if a decision turns on it. Ask for a complete listing only when the decision depends on seeing every row.
 
 ONE MOVE PER SPEC. A spec computes exactly one move (one simulation, one numerical solve, one derivation check, or one inspection) plus the prints that show its result, even when every part is fully specified. Chaining several computations in one spec is the most common way a strong plan still fails here, because the executor must build a whole pipeline at once and you never see an intermediate result before the next move depends on it. A single move may be long and detailed, with its own sanity checks and several prints of that one result. What to split out is a second independent computation; derived objects persist by registry name, so later steps reuse earlier ones.
@@ -501,7 +517,7 @@ Ledger rules:
 COMPUTE_INVESTIGATOR_HEAD_TEMPLATE = """SEED QUESTION:
 {seed}
 
-ENVIRONMENT: no dataset is loaded and `df` does not exist. numpy, scipy, pandas, and the Python standard library are available in the executor's namespace. Objects you create in a step persist into later steps (see the REGISTRY). Your specs define and run the computation: a simulation, a numerical method, or a derivation check.
+ENVIRONMENT: no dataset is loaded and `df` does not exist. numpy, scipy, pandas, and the Python standard library are available in the executor's namespace. Objects you create in a step persist into later steps (see the REGISTRY). Your specs define and run the computation: a simulation, a numerical method, or a derivation check. Any model that will be re-run or varied must be built as a NAMED FUNCTION in the step that first defines it (define simulate_x(<parameters>, seed), persist it, call it once); later steps then vary parameters as one-line calls by registry name, keeping every variant mechanically identical.
 
 INVESTIGATION SO FAR (each completed step is a separate block below; the latest is last):"""
 
@@ -555,6 +571,18 @@ or
 NEEDS_MORE_WORK: <one line naming the specific computation still required: more trials for convergence, an uncertainty estimate, or a cross-check>
 ###BRIEFING###
 If FINAL: the handoff briefing in markdown. If NEEDS_MORE_WORK: write "none".
+
+###CHARTS### (optional; zero to three entries; omit the block when the briefing needs no chart)
+Do NOT put image links in the BRIEFING; the harness renders each chart and inserts it at the end of the section you name. One entry per chart, exactly this shape:
+CHART: <short_name>.png
+SECTION: <the ## header of the briefing section this chart supports, copied verbatim>
+CAPTION: <one line stating the conclusion the chart shows>
+SPEC: <the closed chart spec>
+Rules for charts:
+- A chart earns its place only when seeing the pattern beats reading the numbers: a trend (line over time), a comparison (bars or box plots), a relationship (scatter with a fitted line), a breakpoint (series with a dashed vertical at the break). Prefer the chart that makes the HEADLINE claim visible at a glance. Never more than three; zero is fine. Filenames: lowercase letters, digits, and underscores only.
+- Write each SPEC like a step spec: closed and self-contained, one chart per spec, naming the exact registry object to plot from and the exact columns, filters, orderings, and thresholds, so the chart shows the same numbers the briefing cites. State the chart type and what is on each axis. No code and no styling; a standing style directive is applied downstream.
+- Never ask for text annotations, point labels, callouts, arrows, or floating statistics in a chart spec; they render as clutter. Identifiers belong in the data itself: category tick labels, legend entries, color. For a ranked comparison, spec horizontal bars sorted by value with the entity names as tick labels; for a relationship among many entities, spec color or marker emphasis for the few that matter and small grey points for the rest.
+- A chart must respect the briefing's own method caveats. Never encode a comparison the method notes disclaim: values from separate model fits share no scale, so no bars or shared axes comparing magnitudes across fits, and no y=x identity line between two differently-referenced quantities (a fitted line is the reference for a relationship). When the claim leans on cited uncertainty, show it (error bars) or chart a quantity that carries it (probabilities, rank intervals).
 
 BRIEFING STRUCTURE (markdown; adapt as the evidence warrants):
 ## Summary
@@ -612,3 +640,13 @@ COMPUTE_MODE = SimpleNamespace(
 def mode_prompts(compute):
     """Return the role-prompt bundle for the active mode."""
     return COMPUTE_MODE if compute else DATA_MODE
+
+# Appended by the chart harness to every chart spec before it reaches the Executor.
+# Carries the standing style contract, including the hard-won no-annotations rule:
+# annotated charts read as clutter inside a report that already states the numbers.
+CHART_STYLE_DIRECTIVE = """CHART STYLE (standing requirements for this chart step; these OVERRIDE the spec wherever they conflict):
+- Build exactly ONE matplotlib figure: fig, ax = plt.subplots(figsize=(8, 4.5)); finish with plt.tight_layout(); fig.savefig("{name}", dpi=115); plt.close(fig). Use the bare filename exactly as written; the kernel routes it to the right directory.
+- After saving, print exactly one line: SAVED {name}
+- The title states the conclusion, not the topic (bold, 12pt, two lines maximum). Axis labels 10pt, tick labels 9pt. White background, no gridlines; hide the top and right spines (ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)). Muted colors used purposefully: red for decline, blue or green for increase, grey for baselines. A legend only when needed, with frameon=False. A dashed vertical line with a small label is fine for a breakpoint; semi-transparent shading for regime bands.
+- NO text annotations, callouts, arrows, point labels, or floating statistics anywhere on the chart, EVEN IF THE SPEC ASKS FOR THEM; ignore that part of the spec. The report already carries the numbers. The only text on the chart: the title, axis labels, tick labels, and legend entries when needed. Identifiers belong in the data itself: for ranked comparisons use horizontal bars sorted by value with entity names as tick labels; for scatters, emphasize the few entities that matter with color or marker size (named in the legend) and draw the rest as small grey points.
+- Plot from the named namespace objects; do not recompute the analysis."""
