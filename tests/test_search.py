@@ -59,7 +59,7 @@ class MockA:
             cap["synth_msg"]=txt
             return "###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\ncalibrated briefing\n"
         return ""
-    def search_call(s, messages, model, max_tokens=8000, temperature=0, agent=None, max_uses=5):
+    def search_call(s, messages, model, max_tokens=8000, temperature=0, agent=None, max_uses=5, query=None):
         cap["search_prompts"].append(messages[-1]["content"])
         return "[PUBLISHED] Altitude pace penalty ~5-8% at threshold (Jones 2019)."
 
@@ -99,7 +99,7 @@ class MockB:
         if agent=="Investigator": r=INVB[s.i]; s.i+=1; return r
         if agent=="Synthesizer": return "###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nb\n"
         return ""
-    def search_call(s,messages,model,max_tokens=8000,temperature=0,agent=None,max_uses=5):
+    def search_call(s,messages,model,max_tokens=8000,temperature=0,agent=None,max_uses=5,query=None):
         capB["searches"]+=1; return "[PUBLISHED] x."
 k=PersistentKernel(df=df)
 logB,_,_,_=run_investigation(seed="q",df=df,client=MockB(),

@@ -90,7 +90,7 @@ cm = _CaptureMock()
 verify.extract_claims(cm, "m:x", "## Summary\nP is 0.49.\n", compute=True)
 verify.reconcile(cm, "m:x", "Q?", "orig", "audit", compute=True)
 assert "computational briefing" in cm.seen["ClaimExtractor"], "extractor used the data template"
-assert "What the computation shows" in cm.seen["Reconciler"], "reconciler used the data template"
+assert "How the computation reached this result" in cm.seen["Reconciler"], "reconciler used the data template"
 print("A2) extract_claims and reconcile route to the compute templates: OK")
 
 cm2 = _CaptureMock()

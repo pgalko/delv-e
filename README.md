@@ -183,7 +183,7 @@ csv, tsv, xlsx, parquet, json, and jsonl.
 | `--data-dictionary FILE` | none | Markdown file describing columns and caveats, appended to the schema. |
 | `--periodic-every N` | 0 | Take a holistic re-derivation snapshot every N steps. 0 turns it off. |
 | `--g1-pushback N` | 2 | How many times the synthesis gates (G1, G3, G4) may collectively force more work before a verdict is accepted. |
-| `--search-model M` | none | Enables mid-stream web search for external calibration. Anthropic models only. Off when unset. |
+| `--no-search` | off | Disables mid-stream web search. Search is otherwise auto-seated on the first run model whose provider can search. |
 | `--search-budget N` | 3 | Hard cap on web searches per run when search is enabled. |
 | `--resume` | off | Continue an interrupted or finished run from the saved state in the output directory. |
 | `--extend` | off | Continue a finished run with a new question that can revise the earlier conclusion. Requires a new question. |
@@ -220,12 +220,25 @@ documented enum for GLM).
 
 ### Web search
 
-Search is off by default. Setting `--search-model` (an Anthropic model) lets the
-Investigator request a web search mid-run when an external reference value would
-help calibrate a finding. Each search is recorded in the evidence log and in
-`exploration/NN/search.md`, and `--search-budget` caps how many searches one run
-may use. Search results serve as calibration context; the analysis itself always
-comes from the data.
+Search is on by default and the Investigator alone decides when to use it. A
+search step is an independent call, so it never runs on the run's premium model:
+each provider has one designated search model (`SEARCH_MODELS` in `llm.py`), and
+the search follows the Investigator's provider.
+
+| Investigator | Search runs on |
+| --- | --- |
+| OpenRouter model (grok, terra, luna, glm, kimi, ...) | `x-ai/grok-4.3`: xAI's native web and X search, agentic (it chooses how many searches to run), at a fraction of a frontier model's token rate |
+| Anthropic model | `claude-haiku-4-5` with the native web_search tool |
+| Ollama model, with `OLLAMA_API_KEY` | Ollama's hosted search endpoint, distilled by the run's own model. Free on any ollama account (rate-limited, never billed), so an all-Ollama run stays free |
+
+When the Investigator's own provider cannot serve search (an Ollama seat with no
+`OLLAMA_API_KEY`, or a direct OpenAI seat, which has no search route), it falls
+through to OpenRouter, then Anthropic, whichever is credentialed. If none is,
+search is disabled from the start, the run says so, and the Investigator is never
+told search exists. `--no-search` disables it explicitly. `--no-search` disables it, and
+`--search-budget` caps how many searches one run may use. Each search is recorded
+in the evidence log and in `exploration/NN/search.md`. Search results serve as
+calibration context; the analysis itself always comes from the data.
 
 ### Computation-only mode
 

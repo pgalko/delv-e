@@ -792,7 +792,8 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                     sresult = client.search_call(
                         [{"role": "user", "content":
                           SEARCH_MIDSTREAM_TEMPLATE.format(brief_context=brief, query=query)}],
-                        search_model, max_tokens=4000, agent="Literature Search", max_uses=3)
+                        search_model, max_tokens=4000, agent="Literature Search", max_uses=3,
+                        query=query)
                 except Exception as exc:
                     logger.warning("Step %d: search failed: %s", step, exc)
                     directive = DIRECTIVE_SEARCH_FAILED

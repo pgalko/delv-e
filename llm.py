@@ -97,6 +97,144 @@ def _usage_detail(usage, key):
     return v or 0
 
 
+def _usage_cost(usage):
+    """OpenRouter's authoritative all-in cost for a request (USD), returned in
+    the usage object because every request carries `usage: {include: true}`.
+    It is the number the invoice charges: tokens at the real rates, minus the
+    cache-read discount, PLUS non-token fees our PRICING table cannot see
+    (notably per-call server-tool fees: a native xAI web/X search loop bills
+    $5 per 1,000 tool calls, so one agentic search step can add ~$0.065).
+    Returns None when the provider reports no cost (anthropic, ollama), which
+    means "fall back to the computed estimate"; 0.0 is a REAL value (zero
+    completion insurance) and must not be confused with absent."""
+    if not usage:
+        return None
+    v = getattr(usage, "cost", None)
+    if v is None:
+        try:
+            d = usage.model_dump()
+        except Exception:                                       # noqa: BLE001
+            d = getattr(usage, "__dict__", {}) or {}
+        v = d.get("cost")
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# A SEARCH step is an independent call with its own model string, so it never has
+# to run on the run's premium seats, and it should not: a search is a bulky,
+# low-judgment job (an agentic tool loop pulls in tens of thousands of tokens of
+# results, then the model distills them). Each provider therefore has ONE
+# designated search model, so search behaves and costs the same whichever model
+# of that provider the run happens to seat:
+#   openrouter -> grok-4.3: native web AND X search, agentic (it chooses how many
+#                 searches to run), at 1.25/2.50 against grok-4.5's 2.0/6.0. The
+#                 per-call server-tool fees are model-independent, so only the
+#                 token rate moves. A terra, luna, glm, kimi or grok-4.5 run all
+#                 search identically through it.
+#   anthropic  -> Haiku with the native web_search tool, agentic (max_uses).
+# Ollama is not in this map: its search is not an inference feature but a REST
+# endpoint (see _ollama_web_search) whose results the run's OWN model distills,
+# and it is FREE on any ollama account (rate-limited, never billed), so an
+# ollama-seated run keeps its search free rather than paying for a seat.
+SEARCH_MODELS = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "openrouter": "x-ai/grok-4.3",
+}
+
+# When the investigator's own provider cannot serve search (an ollama seat with no
+# OLLAMA_API_KEY; a direct-openai seat, which has no search route at all), search
+# falls through to the first of these whose credentials exist, and is disabled only
+# when none does. Ollama cannot appear here: its route needs a seated ollama model
+# to distill with, which by construction this run does not have.
+SEARCH_FALLBACK_PROVIDERS = ("openrouter", "anthropic")
+
+
+def _search_provider_ready(provider_name):
+    """Whether a provider can serve a search step right now: its credentials
+    exist. Mirrors what the provider factories require, so seat resolution
+    never hands back a seat whose first call would raise."""
+    if provider_name == "openrouter":
+        return bool(os.environ.get("OPEN_ROUTER_API_KEY"))
+    if provider_name == "anthropic":
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if provider_name == "ollama":
+        return bool(os.environ.get("OLLAMA_API_KEY"))   # hosted search endpoint
+    return False                                        # direct openai: no route
+
+
+def _ollama_web_search(query, max_results=5):
+    """Ollama's hosted web-search endpoint (https://ollama.com/api/web_search):
+    a plain REST service, separate from inference, authenticated with an
+    OLLAMA_API_KEY from a free ollama.com account (the same account cloud
+    models sign into). Returns the raw results list."""
+    api_key = os.environ.get("OLLAMA_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "OLLAMA_API_KEY not found. Web search on the ollama provider uses "
+            "https://ollama.com/api/web_search; create a key at "
+            "ollama.com/settings/keys or run with --search-model none.")
+    resp = httpx.post("https://ollama.com/api/web_search",
+                      headers={"Authorization": f"Bearer {api_key}"},
+                      json={"query": query, "max_results": max_results},
+                      timeout=30.0)
+    resp.raise_for_status()
+    return (resp.json() or {}).get("results", []) or []
+
+
+def _format_web_results(results, max_results=5, per_result=2000):
+    """Search results as a compact markdown block: linked title plus a capped
+    content excerpt per result (Ollama results can run thousands of tokens)."""
+    lines = []
+    for r in results[:max_results]:
+        title = (r.get("title") or "").strip() or "(untitled)"
+        url = (r.get("url") or "").strip()
+        content = (r.get("content") or "").strip()[:per_result]
+        lines.append(f"[{title}]({url})\n{content}")
+    return "\n\n".join(lines) if lines else "(no results)"
+
+
+def default_search_model(model):
+    """The search seat this run model implies through its OWN provider:
+    openrouter -> grok-4.3, anthropic -> Haiku, ollama -> the model itself (it
+    distills results from Ollama's free hosted endpoint). None when the
+    provider cannot serve search: an ollama seat with no OLLAMA_API_KEY, or a
+    direct-openai seat, which has no search route."""
+    provider_name, _ = parse_model_string(model or "")
+    if not _search_provider_ready(provider_name):
+        return None
+    if provider_name in SEARCH_MODELS:
+        return f"{provider_name}:{SEARCH_MODELS[provider_name]}"
+    if provider_name == "ollama":
+        return model
+    return None
+
+
+def resolve_search_seat(investigator_model):
+    """The seat that serves this run's SEARCH steps.
+
+    Search follows the INVESTIGATOR's provider, since search is the
+    Investigator's instrument and the free route needs a seated ollama model to
+    distill with:
+        openrouter seat -> grok-4.3   (agentic native web + X search, cheap)
+        anthropic seat  -> Haiku      (native web_search tool)
+        ollama seat     -> its own model + Ollama's hosted endpoint, FREE on any
+                           ollama account, so an all-ollama run stays all-free
+    When the investigator's provider cannot serve search (ollama without
+    OLLAMA_API_KEY; direct openai, which has no route), fall through to the
+    first credentialed provider in SEARCH_FALLBACK_PROVIDERS: OpenRouter, then
+    Anthropic. With none of the three available, search is disabled from the
+    start and the Investigator is never told it exists."""
+    seat = default_search_model(investigator_model)
+    if seat:
+        return seat
+    for provider_name in SEARCH_FALLBACK_PROVIDERS:
+        if _search_provider_ready(provider_name):
+            return f"{provider_name}:{SEARCH_MODELS[provider_name]}"
+    return None
+
+
 def _reasoning_rejected(exc):
     """True for provider errors that reject the reasoning-effort FIELD itself
     (e.g. xAI: "Reasoning is mandatory for this endpoint and cannot be
@@ -187,6 +325,11 @@ PRICING = {
     "google/gemini-3.5-flash":    {"input": 1.5, "output": 9.00},
     "x-ai/grok-4.3":              {"input": 1.25, "output": 2.50},
     "x-ai/grok-4.5":              {"input": 2.0, "output": 6.0, "cached_input": 0.50},
+    # The OpenRouter search seat (SEARCH_MODELS): native web + X search at a
+    # fraction of 4.5's rates. Server-tool fees ($5/1K tool calls) are NOT in
+    # this table and never can be; OpenRouter reports them in usage.cost, which
+    # the ledger books verbatim.
+    "x-ai/grok-4.3":              {"input": 1.25, "output": 2.50, "cached_input": 0.20},
     "openai/gpt-5.6-terra":       {"input": 2.50, "output": 15.0, "cached_input": 0.25, "cached_write": 3.125},
     "openai/gpt-5.6-luna":        {"input": 1.00, "output": 6.0, "cached_input": 0.10, "cached_write": 1.25},
     # Embeddings (output_tokens always 0)
@@ -392,6 +535,7 @@ class AnthropicProvider:
         self._last_cached = 0
         self._last_cache_write = 0
         self._last_reasoning_chars = 0
+        self._last_provider_cost = None   # provider-reported cost; None = use ours
         system_msg, api_messages = self._split_system(messages)
         kwargs = dict(
             model=model, system=system_msg, messages=api_messages,
@@ -545,7 +689,9 @@ class OpenAIProvider:
         return ''.join(collected), input_tokens, output_tokens, 0, 0
 
 
-def _ollama_extras(model, reasoning_effort):
+def _ollama_extras(model, reasoning_effort, web_search=False):
+    # web_search is accepted for signature uniformity and ignored: search on
+    # ollama is a REST pre-step (see _ollama_web_search), never an inference flag.
     """(extra_body, extra_headers) for Ollama's /v1 endpoint: just the effort
     field, and only when set. A falsy effort must never serialize; glm on
     Ollama arrives here as None precisely so the field is omitted at the wire
@@ -553,11 +699,15 @@ def _ollama_extras(model, reasoning_effort):
     return ({"reasoning_effort": reasoning_effort} if reasoning_effort else {}), {}
 
 
-def _openrouter_extras(model, reasoning_effort):
+def _openrouter_extras(model, reasoning_effort, web_search=False):
     """(extra_body, extra_headers) for OpenRouter: the effort dict only when
-    set, the openai/* prompt cache key, detailed usage accounting, and the
-    x-ai/* cache-affinity header."""
+    set, the openai/* prompt cache key, detailed usage accounting, the x-ai/*
+    cache-affinity header, and, ONLY when this call is a search step, the
+    universal `web` plugin (native engine for xAI/OpenAI/Anthropic-hosted
+    models, Exa elsewhere; ~$0.005 per search, billed by OpenRouter outside
+    token pricing)."""
     body = {**({"reasoning": {"effort": reasoning_effort}} if reasoning_effort else {}),
+            **({"plugins": [{"id": "web", "max_results": 5}]} if web_search else {}),
             **_openai_cache_body(model),
             "usage": {"include": True},   # detailed accounting incl. cached tokens
             # Sticky provider routing from the first request. OpenRouter's
@@ -596,8 +746,9 @@ class OpenAICompatProvider:
         self.client = OpenAI(api_key=api_key, base_url=base_url, **kwargs)
         self._extras = extras
 
-    def call(self, messages, model, max_tokens, temperature, reasoning_effort="medium"):
-        extra_body, extra_headers = self._extras(model, reasoning_effort)
+    def call(self, messages, model, max_tokens, temperature, reasoning_effort="medium",
+             web_search=False):
+        extra_body, extra_headers = self._extras(model, reasoning_effort, web_search)
         response = self.client.chat.completions.create(
             model=model,
             messages=_flatten_messages(messages),
@@ -612,6 +763,7 @@ class OpenAICompatProvider:
         _u = response.usage
         self._last_cached = _usage_detail(_u, "cached_tokens")
         self._last_cache_write = _usage_detail(_u, "cache_write_tokens")
+        self._last_provider_cost = _usage_cost(_u)
         _msg = response.choices[0].message if response.choices else None
         self._last_reasoning_chars = len(
             (getattr(_msg, "reasoning", None) or
@@ -623,8 +775,9 @@ class OpenAICompatProvider:
             0, 0,
         )
 
-    def stream(self, messages, model, max_tokens, temperature, on_token, reasoning_effort="medium"):
-        extra_body, extra_headers = self._extras(model, reasoning_effort)
+    def stream(self, messages, model, max_tokens, temperature, on_token, reasoning_effort="medium",
+               web_search=False):
+        extra_body, extra_headers = self._extras(model, reasoning_effort, web_search)
         collected = []
         input_tokens = 0
         output_tokens = 0
@@ -640,12 +793,14 @@ class OpenAICompatProvider:
             extra_headers=extra_headers,
         )
         self._last_reasoning_chars = 0
+        self._last_provider_cost = None
         for chunk in stream:
             if chunk.usage:
                 input_tokens = chunk.usage.prompt_tokens or 0
                 output_tokens = chunk.usage.completion_tokens or 0
                 self._last_cached = _usage_detail(chunk.usage, "cached_tokens")
                 self._last_cache_write = _usage_detail(chunk.usage, "cache_write_tokens")
+                self._last_provider_cost = _usage_cost(chunk.usage)
             _d = chunk.choices[0].delta if chunk.choices else None
             _r = (getattr(_d, "reasoning", None) or
                   getattr(_d, "reasoning_content", None)) if _d else None
@@ -781,7 +936,15 @@ class CostTracker:
 
     def record(self, input_tokens, output_tokens, model=None,
                cache_creation_tokens=0, cache_read_tokens=0, cached_tokens=0,
-               cache_write_tokens=0):
+               cache_write_tokens=0, provider_cost=None):
+        """provider_cost, when not None, is the provider's own all-in charge for
+        the call (OpenRouter's `usage.cost`) and is booked verbatim: it is the
+        invoice, and it captures what PRICING cannot (server-tool fees on
+        agentic searches, zero completion insurance on empty finals). Our
+        computed cost remains the fallback for providers that report none, and
+        still supplies the no-caching counterfactual: the cache-savings delta
+        comes from our table, the LEVEL from the invoice, so the pair
+        reconciles with OpenRouter's own subtotal/discount/final breakdown."""
         with self._lock:
             self.calls += 1
             self.input_tokens += input_tokens
@@ -790,13 +953,16 @@ class CostTracker:
             self.cache_read_tokens += cache_read_tokens
             self.cached_tokens += cached_tokens
             self.cache_write_tokens += cache_write_tokens
-            self.total_cost += compute_cost(
+            computed = compute_cost(
                 model or "", input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens, cached_tokens,
                 cache_write_tokens)
             # What this call would have cost with no caching: all input at full rate.
             total_in = input_tokens + cache_creation_tokens + cache_read_tokens
-            self.total_cost_uncached += compute_cost(model or "", total_in, output_tokens)
+            computed_uncached = compute_cost(model or "", total_in, output_tokens)
+            actual = computed if provider_cost is None else provider_cost
+            self.total_cost += actual
+            self.total_cost_uncached += actual + (computed_uncached - computed)
 
     def report(self):
         total_input = self.input_tokens + self.cache_creation_tokens + self.cache_read_tokens
@@ -840,9 +1006,11 @@ class RunLogger:
     def log(self, agent, model, messages, response,
             input_tokens, output_tokens, elapsed_time, ttft=None,
             cache_creation=0, cache_read=0, cached_tokens=0, cache_write_tokens=0,
-            reasoning_chars=0):
+            reasoning_chars=0, provider_cost=None):
         cost = compute_cost(model, input_tokens, output_tokens, cache_creation, cache_read,
                             cached_tokens=cached_tokens, cache_write_tokens=cache_write_tokens)
+        if provider_cost is not None:
+            cost = provider_cost      # the provider's own charge, fees included
         entry = {
             "agent": agent,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -858,6 +1026,7 @@ class RunLogger:
             "elapsed_time_s": round(elapsed_time, 2),
             "tokens_per_second": round(output_tokens / max(elapsed_time, 0.01), 1),
             "cost_usd": round(cost, 6),
+            "cost_source": "provider" if provider_cost is not None else "computed",
             "input": messages,
             "output": response,
         }
@@ -1136,13 +1305,15 @@ class LLMClient:
 
     def _sync_wire(self, provider):
         """Pull the wire side-channels the provider captured for the last
-        request: cache reads, cache writes, and reasoning-channel size."""
+        request: cache reads, cache writes, reasoning-channel size, and the
+        provider-reported cost (OpenRouter only; None elsewhere)."""
         self._last_cached = getattr(provider, "_last_cached", 0)
         self._last_cache_write = getattr(provider, "_last_cache_write", 0)
         self._last_reasoning_chars = getattr(provider, "_last_reasoning_chars", 0)
+        self._last_provider_cost = getattr(provider, "_last_provider_cost", None)
 
     def call(self, messages, model, max_tokens=DEFAULT_MAX_TOKENS, temperature=0, agent=None,
-             return_meta=False, reasoning_effort=None):
+             return_meta=False, reasoning_effort=None, web_search=False):
         """Non-streaming call. Returns response text (always a string, never None).
         When return_meta=True, returns (text, meta) where meta carries token usage
         and a `truncated` flag (the model hit the output-token cap). reasoning_effort
@@ -1155,6 +1326,8 @@ class LLMClient:
         if provider_name == "anthropic" and max_tokens > ANTHROPIC_MAX_TOKENS:
             max_tokens = ANTHROPIC_MAX_TOKENS  # non-streaming SDK timeout guard
         extra = self._reasoning_extra(provider_name, agent, reasoning_effort, model=model)
+        if web_search:
+            extra["web_search"] = True   # search steps only; never Executor/Synthesizer
         start_time = time.time()
 
         from contextlib import nullcontext
@@ -1203,17 +1376,19 @@ class LLMClient:
         elapsed = time.time() - start_time
         self.cost_tracker.record(input_tokens, output_tokens, model_name,
                                  cache_creation, cache_read, cached_tokens=self._last_cached,
-                                 cache_write_tokens=self._last_cache_write)
+                                 cache_write_tokens=self._last_cache_write,
+                                 provider_cost=self._last_provider_cost)
 
         if self.run_logger:
             self.run_logger.log(agent, f"{provider_name}:{model_name}", messages,
                                 content, input_tokens, output_tokens, elapsed,
-                                cache_creation=cache_creation, cache_read=cache_read, cached_tokens=self._last_cached, cache_write_tokens=self._last_cache_write, reasoning_chars=self._last_reasoning_chars)
+                                cache_creation=cache_creation, cache_read=cache_read, cached_tokens=self._last_cached, cache_write_tokens=self._last_cache_write, reasoning_chars=self._last_reasoning_chars, provider_cost=self._last_provider_cost)
         if return_meta:
             return content, {"input_tokens": input_tokens,
                              "output_tokens": output_tokens,
                              "cached_tokens": getattr(self, "_last_cached", 0),
                              "cache_write_tokens": getattr(self, "_last_cache_write", 0),
+                             "provider_cost": getattr(self, "_last_provider_cost", None),
                              "max_tokens": max_tokens,
                              "truncated": bool(output_tokens) and output_tokens >= max_tokens}
         return content
@@ -1274,12 +1449,13 @@ class LLMClient:
         ttft = round(first_token_time[0] - start_time, 2) if first_token_time[0] else None
         self.cost_tracker.record(input_tokens, output_tokens, model_name,
                                  cache_creation, cache_read, cached_tokens=self._last_cached,
-                                 cache_write_tokens=self._last_cache_write)
+                                 cache_write_tokens=self._last_cache_write,
+                                 provider_cost=self._last_provider_cost)
 
         if self.run_logger:
             self.run_logger.log(agent, f"{provider_name}:{model_name}", messages,
                                 content, input_tokens, output_tokens, elapsed, ttft,
-                                cache_creation=cache_creation, cache_read=cache_read, cached_tokens=self._last_cached, cache_write_tokens=self._last_cache_write, reasoning_chars=self._last_reasoning_chars)
+                                cache_creation=cache_creation, cache_read=cache_read, cached_tokens=self._last_cached, cache_write_tokens=self._last_cache_write, reasoning_chars=self._last_reasoning_chars, provider_cost=self._last_provider_cost)
         return content
 
     # Haiku is used for search regardless of search_model because web search
@@ -1288,16 +1464,43 @@ class LLMClient:
     # control cost. The search tool type itself is configured in
     # AnthropicProvider.search_call and defaults to the broadly compatible
     # web_search_20250305 tool.
-    SEARCH_MODEL_OVERRIDE = "claude-haiku-4-5-20251001"
+    SEARCH_MODEL_OVERRIDE = SEARCH_MODELS["anthropic"]
 
     def search_call(self, messages, model, max_tokens=8000, temperature=0,
-                    agent=None, max_uses=5):
-        """Non-streaming call with web search tool. Anthropic only.
-        Returns response text with search results synthesised.
-        Always uses Haiku to control cost from large search result inputs."""
+                    agent=None, max_uses=5, query=None):
+        """Mid-stream web search, dispatched by the model's provider:
+        - anthropic: the native web_search tool (always on Haiku for cost);
+        - openrouter: the same chat completion plus the universal `web` plugin
+          (native search engine where the provider has one, Exa elsewhere);
+          one call reads the injected results and writes the findings;
+        - ollama: two-phase; the hosted /api/web_search REST endpoint fetches
+          results (needs `query`), then the run's own model distills them.
+        `max_uses` applies to the Anthropic tool only; the plugin performs one
+        search per request. Only the Investigator's SEARCH status reaches this
+        method; Executor and Synthesizer calls never carry the plugin."""
         provider_name, _ = parse_model_string(model)
+        if provider_name == "openrouter":
+            seat = f"openrouter:{SEARCH_MODELS['openrouter']}"
+            return self.call(messages, seat, max_tokens=max_tokens,
+                             temperature=temperature,
+                             agent=agent or "Literature Search", web_search=True)
+        if provider_name == "ollama":
+            if not query:
+                raise ValueError("ollama web search needs the query text")
+            results = _ollama_web_search(query, max_results=5)
+            distill = [dict(m) for m in messages]
+            distill[-1] = {"role": distill[-1].get("role", "user"),
+                           "content": (str(distill[-1].get("content", ""))
+                                       + "\n\nWEB SEARCH RESULTS (use ONLY these; "
+                                         "cite sources by domain):\n"
+                                       + _format_web_results(results))}
+            return self.call(distill, model, max_tokens=max_tokens,
+                             temperature=temperature,
+                             agent=agent or "Literature Search")
         if provider_name != 'anthropic':
-            raise ValueError(f"Web search requires Anthropic provider, got '{provider_name}'")
+            raise ValueError(
+                f"Web search is not supported on the '{provider_name}' provider; "
+                f"use an anthropic, openrouter, or ollama search model.")
         provider = self._get_provider(provider_name)
         model_name = self.SEARCH_MODEL_OVERRIDE
         start_time = time.time()

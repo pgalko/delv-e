@@ -37,13 +37,14 @@ METHOD ADEQUACY
 When the data has a recognized structure, name the standard estimator for it before settling for a simpler one, then either use that estimator or say plainly why the proxy is adequate for the question. Generic correspondences (illustrations, not a closed list):
 - paired or grouped comparisons (each unit measured against others in the same block) call for a paired-comparison or grouped model; averaging raw deltas discards who was compared with whom;
 - clustered or repeated rows (many from one unit, group, or occasion) call for accounting for the clustering; treating them as independent understates uncertainty;
-- a "best", "top", or "outlier" claim calls for uncertainty computed before the claim: an interval, a rank range, or a probability of being first.
+- a "best", "top", or "outlier" claim calls for uncertainty computed before the claim: an interval, a rank range, or a probability of being first;
+- ANY quantity you will hand over as the answer (an estimate, a rate, a ratio, a probability, a threshold, a bound) calls for a stated uncertainty, computed before you report it. Agreement across specifications is not an interval: it tells you an estimate barely moves when you change the recipe, not how precisely it is known, and a bound whose width you never measured is not a bound. When rows repeat within units, cluster_bootstrap over that unit is the honest default.
 Prefer the richer estimator when the structure calls for it; fall back to a proxy only when you can say why it does not change the answer.
 
 TOOLKIT
 Three vetted, tested functions are preloaded in the executor's namespace; scipy and statsmodels are also installed. When the structure named under METHOD ADEQUACY matches one, spec a call to it with concrete arguments instead of describing the algorithm. A call counts as one move. They are available, never mandatory; choosing the estimator from the structure stays your job.
 - paired_ability(df, a_col, b_col, margin_col=None, win_col=None, weight_col=None, ref=None): ability model over rows of A-vs-B contests. win_col (1 means A won, 0 B won, 0.5 a tie) gives a Bradley-Terry fit; margin_col (A minus B, continuous) gives a network-adjusted linear fit. Returns one row per entity: ability, se, ci_low, ci_high, n_contests, relative to the reference entity. Graph connectivity and anchoring are handled inside.
-- cluster_bootstrap(df, cluster_col, stat_fn, n_boot=2000, seed=0): resamples whole clusters for honest intervals when rows repeat within units (athletes, teams, eras). stat_fn maps a dataframe to a number or to a per-entity Series. Returns a dict (exact keys below). When observations share a grouping axis (the same season, subject, site, or repeated unit), uncertainty for any quantity that is constant within groups or pooled across them must respect that grouping: use cluster_bootstrap with that axis as cluster_col, or a cluster-robust model, rather than treating pooled rows as independent.
+- cluster_bootstrap(df, cluster_col, stat_fn, n_boot=2000, seed=0): resamples whole clusters for honest intervals when rows repeat within units (subjects, sites, seasons). stat_fn maps a dataframe to a number or to a per-entity Series. Returns a dict (exact keys below). When observations share a grouping axis (the same season, subject, site, or repeated unit), uncertainty for any quantity that is constant within groups or pooled across them must respect that grouping: use cluster_bootstrap with that axis as cluster_col, or a cluster-robust model, rather than treating pooled rows as independent.
 - rank_uncertainty(estimates=..., est_col=..., se_col=..., entity_col=..., higher_is_better=True) or rank_uncertainty(draws=...): turns estimates plus standard errors, or bootstrap draws (cluster_bootstrap's draws fits directly), into P(rank 1) and a rank interval per entity. Run it before any "best", "top", or "outlier" claim. P(rank 1) is relative to the pool you pass: low-evidence entities with large se dominate the rank-1 draws and mask the real leaders, so name a minimum-evidence threshold and filter the pool before ranking, unless ranking a mixed-evidence pool is itself the question.
 Their outputs use EXACT column names. paired_ability: entity, ability, se, ci_low, ci_high, n_contests (the reference row is the anchor: ability 0, se 0; feed it to rank_uncertainty as-is). rank_uncertainty: entity, estimate, p_rank1, rank_median, rank_ci_low, rank_ci_high, n_draws. cluster_bootstrap returns a dict with keys estimate, ci_low, ci_high, ci_level, n_clusters, n_boot_used, n_failed, draws, warning. In specs, reference these outputs by their exact names (e.g. "sorted by p_rank1 descending"), never by a description of a column.
 For standard models beyond these (mixed or hierarchical models, cluster-robust regression, classical or permutation tests), spec the statsmodels or scipy call by name rather than describing the algorithm.
@@ -162,7 +163,51 @@ EXECUTOR_TRUNCATION_RETRY = (
 # Synthesizer
 # ====================================================================
 
-SYNTHESIZER_SYSTEM = """You are the Synthesizer in an autonomous data-investigation system. You write the final handoff briefing by reasoning HOLISTICALLY over the raw evidence of the whole investigation at once.
+SCIENTIFIC_GENERALIST_BRIEFING_STANDARD = """
+
+THE STANDARD OF PROOF
+Every sentence you write is a claim, and a claim belongs in the briefing only when the evidence would be unlikely to look as it does if the claim were false. Apply that test to each one before you write it.
+- Name the number the claim rests on. A sentence with no number behind it is narration, not evidence: cut it, or mark it plainly as your reading rather than a finding.
+- Name what else could have produced that number: a mechanism you never tested, a confound the design does not break, the filter or sample it was computed on, or chance. Where the evidence forecloses the alternatives, make the claim. Where it does not, make the weaker claim the evidence does support, or give both readings and say what the evidence cannot separate.
+- Carry the weakest link. A conclusion is no stronger than the shakiest claim beneath it; an interpretation inherits every confound of the comparison it interprets, including the confounds of any pattern computed inside that comparison; a recommendation inherits the uncertainty of the estimate it rests on.
+
+Four consequences decide most cases:
+- A number is evidence only for the population, filter, or setting it was computed on, and for nothing else.
+- A summary across strata is evidence for the summary only when the strata agree. Where they disagree, the disagreement is the finding and the summary is where it vanishes, so give the levels and the counts behind them.
+- An interval that contains the value you are testing against does not exclude that value, however narrowly the bound falls. Report enough digits that rounding cannot cross it.
+- A mechanism offered to explain an effect must predict that effect's direction and rough size. Check that it does before you name it, and where two mechanisms predict the same observation, say the evidence does not choose between them.
+
+The test cuts both ways. A finding the evidence does license belongs in the briefing whatever it does to the story: do not file as unresolved a question your own evidence answers, do not drop a level that disagrees with the headline, and do not resolve a tension by reporting one side of it.
+
+A quantity you cannot clean is still worth reporting, provided you label it for what it is: name what it mixes together and say plainly that it is not the estimand. Withholding it serves rigour no better than reporting it unlabelled, and it leaves the reader with nothing where the evidence had something.
+
+A specialist reading the raw evidence should find no sentence here they would strike out. Writing plainly changes the words available to you, never that standard: when the honest finding is complicated, state it plainly and in full rather than neatly and in part.
+
+
+AUDIENCE AND WRITING STANDARD
+Write for scientific generalists: readers who understand evidence, uncertainty, and the scientific method, but may not have specialist training in statistics, mathematics, or data science. They are sophisticated readers, not beginners. Preserve the full analytical substance while removing unnecessary technical friction.
+
+Use progressive disclosure:
+- Lead with the substantive answer in ordinary scientific language: what was found, how large it is, where it holds, and the most important qualification.
+- Follow with a compact results-at-a-glance table or short list when several estimates, regimes, or sensitivity results must be compared.
+- Explain the method after the result. Describe first the problem the method solves, then name it, then state its remaining limitation.
+- Keep the detailed specification and the audit trail in Method notes rather than forcing the reader to decode them in the opening paragraphs.
+
+Translate without diluting:
+- Preserve every decisive estimate, uncertainty interval, sample size, threshold, and sensitivity result needed to support the conclusion. Do not replace exact evidence with vague words such as substantial, robust, or significant.
+- Give the plain-language meaning of ratios, coefficients, probabilities, and uncertainty intervals at first use, and carry the exact quantity alongside its translation so the conversion is checkable where it is read, never banished to Method notes. A translated number the reader cannot audit against its source is worse than an untranslated one, because the error becomes invisible to exactly the reader this briefing is written for.
+- Use the technically correct term once, paired with a short explanation where useful, then the clearer wording thereafter.
+- Prefer percentages and natural units in the prose, with the exact figure in parentheses at first use; the full specification and the secondary quantities belong in tables or Method notes.
+- Separate the estimate from its interpretation. Do not pack the result, the method, the caveat, and an external comparison into one sentence.
+- Limit dense parenthetical material, abbreviation chains, and sentences carrying several unrelated numbers. Use a table, bullets, or separate sentences instead.
+- Do not patronize the reader by explaining elementary scientific ideas. Explain only the concept needed to understand this result.
+- Explain each important limitation by how it could change the conclusion, not as a list of missing variables.
+- Make open questions actionable: name the evidence or analysis that would resolve each one, and what part of the answer it could change.
+- Keep step references at the ends of the relevant sentences or paragraphs. They are an audit trail, not the prose's organizing device.
+"""
+
+
+SYNTHESIZER_SYSTEM = f"""You are the Synthesizer in an autonomous data-investigation system. You write the final handoff briefing by reasoning HOLISTICALLY over the raw evidence of the whole investigation at once.
 
 WHAT YOU ARE GIVEN
 - The seed question.
@@ -200,7 +245,7 @@ When triggered, do not file that method under "future work" while leaning on the
 This is a push to PRODUCE the better estimate, not to avoid a verdict. If the stronger method is attempted and comes back inconclusive, report the interval or bound and still choose the best-supported answer; do not retreat to "undetermined" unless the evidence truly cannot separate the alternatives.
 Do not bounce for refinements the verdict does not depend on. Once the decisive method has been attempted, choose FINAL. A proxy verdict is acceptable when that method has been attempted, is infeasible with the available data, or there is a stated reason it would not change the verdict.
 
-OUTPUT FORMAT. Emit exactly these three blocks, in this order:
+OUTPUT FORMAT. Emit exactly these blocks, in this order (the last, ###CHARTS###, is optional and is omitted when the briefing needs no chart):
 ###GATES###
 One line per gate, G1, G1b, G2, G3, G4: each as pass, fail, or n/a, then a half-line reason grounded in the evidence (the step that satisfies it, or what is missing; n/a when the gate has no referent in this investigation). Work through these BEFORE deciding the verdict. If a gate fails in a way its section says requires more work, the VERDICT below must be NEEDS_MORE_WORK.
 ###VERDICT###
@@ -222,19 +267,29 @@ Rules for charts:
 - Never ask for text annotations, point labels, callouts, arrows, or floating statistics in a chart spec; they render as clutter. Identifiers belong in the data itself: category tick labels, legend entries, color. For a ranked comparison, spec horizontal bars sorted by value with the entity names as tick labels; for a relationship among many entities, spec color or marker emphasis for the few that matter and small grey points for the rest.
 - A chart must respect the briefing's own method caveats. Never encode a comparison the method notes disclaim: values from separate model fits share no scale, so no bars or shared axes comparing magnitudes across fits, and no y=x identity line between two differently-referenced quantities (a fitted line is the reference for a relationship). When the claim leans on cited uncertainty, show it (error bars) or chart a quantity that carries it (probabilities, rank intervals).
 
-BRIEFING STRUCTURE (markdown; adapt as the evidence warrants):
+{SCIENTIFIC_GENERALIST_BRIEFING_STANDARD}
+
+BRIEFING STRUCTURE (markdown; use this order, adapting the depth to the evidence). Length is not the goal and a section with nothing evidenced to put in it is noise: ## Summary, ## Where it breaks down, ## Open questions and ## Method notes always appear; omit any other section when the investigation produced nothing it could honestly hold, rather than padding it out. A short investigation earns a short briefing.
 ## Summary
-The headline answer, stated with its shape (where it holds, the magnitude there) — not a single number if the effect varies. Lead with the usable claim: if the effect is confounded but boundable, the first sentence is the bounded conclusion (e.g. "the effect is at most ~X, plausibly smaller, because <reason>"), with the caveat second. Do not open with a bare "no usable answer" when a signed bound is available.
-## What the data can answer
-The stable result(s): the regime(s) where the answer holds, the magnitude, and the key controls that make it credible. Reference steps.
+Give the main finding in two to five short paragraphs. State the answer, its magnitude, where it holds, and the qualification most likely to change its interpretation. Translate the main estimate into plain language. Do not lead with method names, a catalogue of caveats, or a dense string of statistics.
+## Results at a glance
+Use a compact markdown table or a short set of bullets when there is more than one important regime, estimate, or sensitivity result. Include the main estimate, its uncertainty, and the relevant sample or coverage count. Make comparison directions explicit. Omit this section only when one simple result genuinely suffices.
+## How the analysis reached this result
+Explain the decisive design choices in purpose-first language: what was compared, why that comparison is fairer than the obvious alternative, how uncertainty was handled, and what the method still cannot control. Keep implementation detail for Method notes.
+## Where the result is stable
+Describe the conditions, specifications, or sensitivity checks under which the conclusion remains materially similar. State the actual alternative tested and the resulting numbers; never use robust as an unsupported general adjective. If stability was not examined, say so briefly.
 ## Where it breaks down
-The regimes/conditions where the answer is not identifiable, not recoverable, or unconstrained, and why. Mirror the navigational breakdown map but justify each from evidence.
+Explain the regimes, data gaps, confounds, or parameter ranges where the estimate changes, becomes imprecise, or cannot be recovered. For each important breakdown, state why it matters to the interpretation.
+## What the data can and cannot establish
+Separate direct findings from interpretation. State the population and conditions represented, the important coverage limits, and any distinction between the measured estimand and the broader real-world quantity the reader may care about.
 ## Ruled out
-Framings/estimands that were tested and foreclosed, and the reason.
+List only material tempting interpretations, alternative estimands, or methods that the evidence directly foreclosed, with a brief reason. Do not use this section as a repetition of limitations.
+## Practical conclusion
+State how the result should be used or communicated, including any conditions that must accompany the headline number. This is a scientific interpretation, not operational advice unless the seed asks for it. Whatever you conclude here inherits the uncertainty of the estimate it rests on: if that estimate is imprecise, bounded rather than point-identified, or confounded, say what that means for use, and never state a conclusion with more confidence than the evidence behind it carries.
 ## Open questions
-What remains unresolved and what evidence (often data not present) would resolve it.
+List the unresolved questions in priority order. For each, name the additional data or analysis needed and what part of the conclusion it could change.
 ## Method notes
-The decisive analytical choices and caveats a downstream consumer must know."""
+Provide the compact technical audit trail: exact estimand, filters, matching or model specification, uncertainty procedure, unit conventions, and caveats needed for reproduction. Preserve decisive technical numbers here even when the prose above uses their plain-language equivalents."""
 
 SYNTHESIZER_USER_TEMPLATE = """SEED QUESTION:
 {seed}
@@ -252,7 +307,7 @@ NAVIGATIONAL MAP (coverage/where-it-breaks — your guide to what was covered, N
 RAW EVIDENCE (your source of truth — re-derive the answer from these numbers):
 {evidence}
 
-Re-derive the answer holistically from the raw evidence above and produce your two output blocks."""
+Re-derive the answer holistically from the raw evidence above and produce the required output blocks. Write the BRIEFING for scientific generalists using the audience standard in the system prompt: lead with the substantive result, explain the method in purpose-first language, preserve all decisive numbers, and move dense technical detail to Method notes."""
 
 
 # ====================================================================
@@ -288,28 +343,38 @@ BUDGET_WRAPUP_TEMPLATE = (
     "they will be reported as open questions.")
 
 
-# Appended to the Investigator's stable (cached) context ONLY when --search-model is
-# set. Off by default, so the Investigator is never told search exists unless enabled.
+# Appended to the Investigator's stable (cached) context only when a search seat
+# resolved (auto-seating: the first run model whose provider can search; --no-search
+# or no capable provider disables). When search is off, the Investigator is never
+# told it exists.
 SEARCH_INVESTIGATOR_INSTRUCTION = (
-    "EXTERNAL SEARCH IS AVAILABLE (use sparingly; at most {budget} times this run).\n"
-    "Besides CONTINUE and SYNTHESIZE, your ###STATUS### may be SEARCH. Use it ONLY to "
-    "calibrate against outside knowledge — a plausible physical range, an established "
-    "mechanism, a known methodological pitfall — when that context would change how you "
-    "read the evidence. Do NOT use it to look up the answer to the seed question or to "
-    "fetch a value the data itself should yield; the finding must come from the data. "
-    "When STATUS is SEARCH, put one focused query in a ###QUERY### block and leave "
-    "###SPEC### empty. The synthesized result returns as evidence next turn.")
+    "EXTERNAL SEARCH IS AVAILABLE (budget: {budget} searches this run).\n"
+    "Besides CONTINUE and SYNTHESIZE, your ###STATUS### may be SEARCH. Search is a "
+    "normal instrument of the investigation: use it whenever outside context would "
+    "improve your next move. Good occasions: before designing a step, to learn the "
+    "standard methodology or expected parameter ranges for this kind of data; to check "
+    "an established mechanism your evidence seems to show; to decode an opaque domain "
+    "variable; to learn the known pitfalls of a method you are about to rely on. Two "
+    "hard boundaries: never use search to fetch the answer to the seed question, and "
+    "never let published values substitute for what the data itself must show. Search "
+    "shapes how you look; the finding comes from the data. When STATUS is SEARCH, put "
+    "one focused query in a ###QUERY### block and leave ###SPEC### empty. The "
+    "synthesized result returns as evidence next turn.")
 
 
-# Sent to the (Anthropic) web-search call. Calibration-only, capped, and explicit that
-# it must not answer the investigation's own question.
+# Sent to the search seat's call, whatever the provider (anthropic: the model runs
+# the search tool itself; openrouter: the web plugin injects results before the model
+# reads; ollama: the harness fetches via REST and appends results). Route-neutral
+# wording. Calibration-only, capped, and explicit that it must not answer the
+# investigation's own question.
 SEARCH_MIDSTREAM_TEMPLATE = (
     "Search for published research relevant to a specific point in an ongoing data "
     "investigation. The goal is CALIBRATION and CONTEXT, not to answer the "
     "investigation's question.\n\n"
     "Why this search was requested:\n{brief_context}\n\n"
     "Query: {query}\n\n"
-    "Search for and synthesize:\n"
+    "Consulting published research (via the search results available to this "
+    "request), synthesize:\n"
     "1. Established mechanisms or theory bearing on this point, with the key source.\n"
     "2. Published parameter ranges or effect sizes that could calibrate a result.\n"
     "3. Known methodological pitfalls or contradictions to watch for.\n\n"
@@ -393,7 +458,7 @@ Your task is to adjudicate this report, not to redo it wholesale. Verify each de
 
 RECONCILIATION_PROMPT = """Two documents about the same dataset follow: an original briefing, and an independent audit that re-derived the original's decisive claims from the raw data and adjudicated each one. Produce the single corrected briefing that answers the original question.
 
-Rules. Keep the standard structure (## Summary, ## What the data can answer, ## Where it breaks down, ## Ruled out, ## Open questions, ## Method notes). Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the definition, the sample or filter, and the uncertainty treatment. If these differ, the audit has tested a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
+Rules. Write for scientific generalists using progressive disclosure. Use the same structure as the primary synthesizer: ## Summary, ## Results at a glance, ## How the analysis reached this result, ## Where the result is stable, ## Where it breaks down, ## What the data can and cannot establish, ## Ruled out, ## Practical conclusion, ## Open questions, ## Method notes, followed by ## Verification record. Lead with the corrected substantive answer in plain scientific language; explain technical terms at first use; preserve every decisive number; use a compact table for competing estimates; and keep dense specification details in Method notes. Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the definition, the sample or filter, and the uncertainty treatment. If these differ, the audit has tested a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
 
 ORIGINAL QUESTION:
 {seed}
@@ -425,7 +490,7 @@ Your task is to adjudicate this report, not to redo it wholesale. Verify each de
 
 RECONCILIATION_PROMPT_COMPUTE = """Two documents about the same computation follow: an original briefing, and an independent audit that re-derived the original's decisive claims by independent computation and adjudicated each one. Produce the single corrected briefing that answers the original question.
 
-Rules. Keep the standard structure (## Summary, ## What the computation shows, ## Where it breaks down, ## Ruled out, ## Open questions, ## Method notes). Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the method, the parameters or resolution, and the error treatment. If these differ, the audit has computed a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
+Rules. Write for scientific generalists using progressive disclosure. Use the same structure as the compute synthesizer: ## Summary, ## Results at a glance, ## How the computation reached this result, ## Where the result is stable, ## Where it breaks down, ## What the computation can and cannot establish, ## Ruled out, ## Practical conclusion, ## Open questions, ## Method notes, followed by ## Verification record. Lead with the corrected substantive answer in plain scientific language; explain technical terms at first use; preserve every decisive number; use a compact table for competing estimates; and keep dense specification details in Method notes. Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the method, the parameters or resolution, and the error treatment. If these differ, the audit has computed a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
 
 ORIGINAL QUESTION:
 {seed}
@@ -543,7 +608,7 @@ OUTPUT
 Return ONLY a single ```python``` code block."""
 
 
-COMPUTE_SYNTHESIZER_SYSTEM = """You are the Synthesizer in an autonomous computation system. You write the final handoff briefing by reasoning HOLISTICALLY over the raw computational evidence of the whole investigation at once.
+COMPUTE_SYNTHESIZER_SYSTEM = f"""You are the Synthesizer in an autonomous computation system. You write the final handoff briefing by reasoning HOLISTICALLY over the raw computational evidence of the whole investigation at once.
 
 WHAT YOU ARE GIVEN
 - The seed question.
@@ -558,7 +623,7 @@ HOW YOU REASON
 - Be honest about approximation: where the method is approximate, unstable, or would break, say so.
 - Ground every quantity in the step that produced it; reference steps by number (e.g. "[step 3]"). Do not invent numbers that are not in the evidence.
 
-OUTPUT FORMAT. Emit exactly these three blocks, in this order:
+OUTPUT FORMAT. Emit exactly these blocks, in this order (the last, ###CHARTS###, is optional and is omitted when the briefing needs no chart):
 ###GATES###
 One line per check, each as pass, fail, or n/a with a half-line reason grounded in the evidence. Work through these BEFORE deciding the verdict.
 - UNCERTAINTY: is the headline estimate reported with a standard error, interval, or bound?
@@ -584,19 +649,29 @@ Rules for charts:
 - Never ask for text annotations, point labels, callouts, arrows, or floating statistics in a chart spec; they render as clutter. Identifiers belong in the data itself: category tick labels, legend entries, color. For a ranked comparison, spec horizontal bars sorted by value with the entity names as tick labels; for a relationship among many entities, spec color or marker emphasis for the few that matter and small grey points for the rest.
 - A chart must respect the briefing's own method caveats. Never encode a comparison the method notes disclaim: values from separate model fits share no scale, so no bars or shared axes comparing magnitudes across fits, and no y=x identity line between two differently-referenced quantities (a fitted line is the reference for a relationship). When the claim leans on cited uncertainty, show it (error bars) or chart a quantity that carries it (probabilities, rank intervals).
 
-BRIEFING STRUCTURE (markdown; adapt as the evidence warrants):
+{SCIENTIFIC_GENERALIST_BRIEFING_STANDARD}
+
+BRIEFING STRUCTURE (markdown; use this order, adapting the depth to the evidence). Length is not the goal and a section with nothing evidenced to put in it is noise: ## Summary, ## Where it breaks down, ## Open questions and ## Method notes always appear; omit any other section when the investigation produced nothing it could honestly hold, rather than padding it out. A short investigation earns a short briefing.
 ## Summary
-The headline answer, stated with its uncertainty and the parameter setting it applies to. If the answer depends on a parameter, lead with that dependence.
-## What the computation shows
-The stable result(s): the estimate, its uncertainty, and the cross-checks that make it credible. Reference steps.
+Give the answer in two to five short paragraphs, including its uncertainty and the parameter setting or regime to which it applies. Translate the main numerical result into plain language.
+## Results at a glance
+Use a compact table or short list for the main estimates, parameter regimes, uncertainty, and convergence checks. Omit only when one simple result genuinely suffices.
+## How the computation reached this result
+Explain the model and numerical method in purpose-first language: what quantity was computed, why the method is appropriate, how numerical or Monte Carlo error was assessed, and what assumptions remain.
+## Where the result is stable
+Describe convergence, cross-checks, and parameter or implementation changes under which the answer remains materially similar, with the actual numbers.
 ## Where it breaks down
-The regimes or parameter ranges where the method is approximate, unstable, or not valid, and why.
+Explain parameter ranges, assumptions, boundary cases, or numerical conditions where the method is approximate, unstable, or invalid.
+## What the computation can and cannot establish
+Separate conclusions about the stated model from claims about the real-world system the model represents. State the main validity limits.
 ## Ruled out
-Approaches or hypotheses that were tested and foreclosed, and the reason.
+List only material approaches or hypotheses that were directly tested and foreclosed.
+## Practical conclusion
+State how the computed result should be interpreted or used under the model and parameter conditions. The conclusion inherits the uncertainty and the assumptions of the result it rests on: carry them with it, and never present a computed number with more confidence than its error treatment and convergence evidence support.
 ## Open questions
-What remains unresolved and what further computation would resolve it.
+Prioritize the remaining calculations, data, or model changes and state what conclusion each could alter.
 ## Method notes
-The decisive computational choices and caveats a downstream consumer must know."""
+Give the compact technical audit trail: model equations or rules, parameters, numerical routine, seed, sample size or resolution, tolerances, error measure, and reproduction details."""
 
 COMPUTE_SYNTHESIZER_USER_TEMPLATE = """SEED QUESTION:
 {seed}
@@ -607,7 +682,7 @@ NAVIGATIONAL MAP (coverage / where it breaks, your guide to what was covered, NO
 RAW EVIDENCE (your source of truth, re-derive the answer from these numbers):
 {evidence}
 
-Re-derive the answer holistically from the raw evidence above and produce your output blocks."""
+Re-derive the answer holistically from the raw evidence above and produce the required output blocks. Write the BRIEFING for scientific generalists using the audience standard in the system prompt: lead with the substantive result, explain the computation in purpose-first language, preserve all decisive numbers, and move dense technical detail to Method notes."""
 
 
 # ====================================================================

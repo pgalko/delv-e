@@ -69,13 +69,15 @@ def main():
     parser.add_argument("--g1-pushback", type=int, default=2,
                         help="How many times the G1 gate may force more work before "
                              "allowing synthesis. Default 2.")
-    parser.add_argument("--search-model", default=None,
-                        help="Enable mid-stream web search for external calibration, "
-                             "using this Anthropic model (provider must be anthropic). "
-                             "Off by default. The Investigator decides when to search.")
+    parser.add_argument("--no-search", action="store_true",
+                        help="Disable mid-stream web search. By default search is "
+                             "auto-seated on the first run model (investigator, then "
+                             "synthesizer, then executor) whose provider can search: "
+                             "anthropic (native tool), openrouter (web plugin), or "
+                             "ollama (hosted endpoint, requires OLLAMA_API_KEY).")
     parser.add_argument("--search-budget", type=int, default=3,
-                        help="Hard cap on web searches per run when --search-model is "
-                             "set. Default 3.")
+                        help="Hard cap on web searches per run when search is "
+                             "enabled. Default 3.")
     parser.add_argument("--resume", dest="resume_run", action="store_true",
                         help="Recover an interrupted run: rehydrate the saved state in "
                              "--output (kernel history, nav ledger, log) and finish the "
@@ -110,16 +112,29 @@ def main():
     executor_model = args.executor_model or DEFAULT_EXECUTOR_MODEL
     synth_model = args.synth_model or investigator_model
 
-    # Web search is Anthropic-only (the web_search tool). Validate or disable.
-    search_model = args.search_model
-    if search_model and not search_model.startswith("anthropic:"):
-        print(f"Web search requires an Anthropic --search-model (got '{search_model}'). "
-              f"Search disabled for this run.", file=sys.stderr)
-        search_model = None
-
     # Local imports so --help is fast and import errors are actionable.
     from dotenv import load_dotenv
     load_dotenv()
+
+    # Web search seat. MUST come after load_dotenv(): the seat is credential-gated
+    # (see llm.resolve_search_seat), so resolving it before .env is read would find
+    # no keys and silently disable search on every run. Search follows the
+    # Investigator's provider: openrouter -> grok-4.3, anthropic -> Haiku, ollama ->
+    # its own model + Ollama's free hosted endpoint; when the investigator's provider
+    # cannot serve search, it falls through to OpenRouter, then Anthropic.
+    from llm import resolve_search_seat, parse_model_string
+    search_model = None if args.no_search else resolve_search_seat(investigator_model)
+    if not args.no_search:
+        if search_model is None:
+            print("Web search disabled: no provider can serve it (an ollama-seated "
+                  "run needs OLLAMA_API_KEY for its free search; otherwise set "
+                  "OPEN_ROUTER_API_KEY or ANTHROPIC_API_KEY).", file=sys.stderr)
+        elif (parse_model_string(search_model)[0]
+              != parse_model_string(investigator_model)[0]):
+            # The investigator's own provider cannot search, so search fell through
+            # to another provider and will bill it. Say so once.
+            print(f"Web search runs on {search_model} (the investigator's provider "
+                  f"cannot serve search).", file=sys.stderr)
 
     # Quiet the run: suppress library warnings and keep INFO logs off the console
     # so the styled output stays clean. (Real warnings/errors still surface; the
