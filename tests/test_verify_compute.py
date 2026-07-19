@@ -90,7 +90,8 @@ cm = _CaptureMock()
 verify.extract_claims(cm, "m:x", "## Summary\nP is 0.49.\n", compute=True)
 verify.reconcile(cm, "m:x", "Q?", "orig", "audit", compute=True)
 assert "computational briefing" in cm.seen["ClaimExtractor"], "extractor used the data template"
-assert "How the computation reached this result" in cm.seen["Reconciler"], "reconciler used the data template"
+assert "the same computation follow" in cm.seen["Reconciler"], "reconciler used the data template"
+assert "the parameters or resolution" in cm.seen["Reconciler"], "compute adjudication vocabulary"
 print("A2) extract_claims and reconcile route to the compute templates: OK")
 
 cm2 = _CaptureMock()
@@ -106,7 +107,7 @@ prior = _tmpdir("vc_prior")
 ORIG_BRIEFING = ("## Summary\nV is 0.49 by Monte Carlo.\n"
                  "## What the computation shows\nThe estimate is 0.4900 (n=20000).\n"
                  "## Method notes\n- numpy default_rng(0).\n")
-with open(os.path.join(prior, "briefing.md"), "w", encoding="utf-8") as f:
+with open(os.path.join(prior, "technical_briefing.md"), "w", encoding="utf-8") as f:
     f.write(ORIG_BRIEFING)
 with open(os.path.join(prior, "run_meta.json"), "w", encoding="utf-8") as f:
     json.dump({"compute": True}, f)
@@ -174,11 +175,12 @@ assert err is None, f"compute verify failed: {err!r}"
 assert _newest_telemetry(audit)["run"]["dataset"] == {"rows": 0, "cols": 0}, \
     "the audit did not run in compute mode (telemetry not 0x0)"
 # the four-document set is present, with the original carried across verbatim
-for name in ["briefing.md", "briefing_original.md", "briefing_audit.md", "claims.md"]:
+for name in ["technical_briefing.md", "technical_briefing_original.md",
+             "technical_briefing_audit.md", "claims.md"]:
     assert os.path.exists(os.path.join(audit, name)), f"missing {name}"
-with open(os.path.join(audit, "briefing_original.md"), encoding="utf-8") as f:
+with open(os.path.join(audit, "technical_briefing_original.md"), encoding="utf-8") as f:
     assert f.read() == ORIG_BRIEFING, "original briefing not preserved"
-with open(os.path.join(audit, "briefing.md"), encoding="utf-8") as f:
+with open(os.path.join(audit, "technical_briefing.md"), encoding="utf-8") as f:
     assert "Reconciled" in f.read(), "briefing.md is not the reconciled document"
 # the compute verify templates were the ones actually used
 assert "computational briefing" in vf.seen["ClaimExtractor"]

@@ -42,3 +42,12 @@ Thumbs.db
 # Verification runs and the last-run pointer (regenerated; see --verify)
 output_verify/
 .delve_last_run
+# Eval harness: generated data and run results are never committed.
+# Tracked: eval/*.py, eval/DESIGN.md, and the frozen seed banks
+# (eval/seeds_f1.json, eval/seeds_planted.json). The synthetic dataset and
+# its answer key are regenerated deterministically (eval/planted_dgp.py,
+# fixed --seed), so the generator seed IS the freeze — committing the data
+# adds nothing and risks truth.json travelling with the CSV.
+eval/planted/
+eval/results*/
+/results*.zip

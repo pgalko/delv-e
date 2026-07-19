@@ -5,137 +5,86 @@ _ROOT = os.path.dirname(_HERE)
 sys.path[:0] = [os.path.join(_HERE, "stubs"), _ROOT]  # bundled httpx stub + delv-e modules
 # --- end bootstrap ---
 
-# Briefing charts, v2 contract (reworked after the first live glm run): the
-# Synthesizer emits CHART/SECTION/CAPTION/SPEC entries and writes NO image
-# links; the harness renders each spec through the Executor against the live
-# kernel namespace and INSERTS each produced chart at the end of the section
-# its SECTION field names. Placement moved to the harness because the live run
-# dumped every image link after the last header despite instructions, and the
-# annotation ban moved to spec level (plus a directive override) because the
-# live specs asked for fifteen point labels. Pins: legend v2 in both modes,
-# the directive's override precedence and sizing, dict parsing with optional
-# fields, deterministic placement (fuzzy header match, same-section ordering,
-# missing-section fallback), stripping of model-authored image lines (the live
-# failure verbatim), failed charts simply absent, render-loop isolation and
-# manifest, and byte-identical zero-charts behavior.
+# The chart contract: what the technical pass may ask for, and how the harness
+# renders it. Each rule here was written after a live chart failed:
+#   v1 dumped every image link at the end of the document, so the harness owns
+#     placement and the model only says WHERE (a [[CHART:Fn]] marker);
+#   v1 charts were unreadable with annotations, callouts and floating stats, so
+#     identifiers belong in the data (tick labels, legend, colour), never as text;
+#   a v2 chart drew a y=x line between two quantities the method notes said shared
+#     no scale, and bars comparing magnitudes across separate fits, so a chart may
+#     not encode a comparison the analysis itself disclaims;
+#   and the chart that would have shown the headline was never drawn, so the
+#     headline claim is what a chart should make visible at a glance.
+# Charts now key on a FINDING rather than a section header, because the editor
+# chooses its own headings and a header is no longer a stable anchor.
 
 import inspect
-import json
-import tempfile
+import re
 
 import prompts as P
-import synthesis as S
-import investigation as I
-from synthesis import (_parse_synth, _parse_charts, sanitize_chart_name,
-                       apply_chart_results, MAX_CHARTS)
+from synthesis import (MAX_CHARTS, _parse_charts, charts_for_editor,
+                       render_chart_markers, sanitize_chart_name)
 
-# ── 1) Legend v2 in both modes; directive v2 carries sizing + override ──
 src = inspect.getsource(P)
+
+# ── 1) The legend exists in both modes and keys on findings ──
 assert src.count("###CHARTS###") >= 2
-assert src.count("Do NOT put image links in the BRIEFING") == 2
+assert src.count("FINDING: <the id of the finding") == 2
+assert "SECTION:" not in src, "a section header is not a stable anchor for the editor"
 assert src.count("Never ask for text annotations") == 2
 assert src.count("values from separate model fits share no scale") == 2, \
     "the encoding-faithfulness rule must exist in both modes"
 assert src.count("chart a quantity that carries it") == 2
 assert src.count("HEADLINE claim visible at a glance") == 2
-d = P.CHART_STYLE_DIRECTIVE.format(name="x.png")
-for phrase in ('fig.savefig("x.png", dpi=115)', "figsize=(8, 4.5)",
-               "EVEN IF THE SPEC ASKS FOR THEM", "frameon=False",
-               "horizontal bars sorted by value", "small grey points",
-               "do not recompute the analysis", "SAVED x.png"):
-    assert phrase in d, f"directive lost: {phrase!r}"
-print("legend v2 + directive v2: OK")
+print("legend: both modes, finding-keyed, faithfulness + headline rules: OK")
 
-# ── 2) Parse: four fields, optional middles, sanitize, dedupe, cap ──
-block = ("CHART: Joint Scatter.PNG\n"
-         "SECTION: ## What the data can answer\n"
-         "CAPTION: Verstappen is the joint outlier (r=0.87)\n"
-         "SPEC: scatter of joint_abilities_n30, x ability_finish, y ability_grid.\n"
-         "Second spec line.\n"
-         "CHART: era_leaders.png\n"
-         "SPEC: horizontal bars of era_ability_summary top entity per era")
-cs = _parse_charts(block)
-assert [c["name"] for c in cs] == ["joint_scatter.png", "era_leaders.png"]
-assert cs[0]["section"] == "## What the data can answer"
-assert cs[0]["caption"].startswith("Verstappen")
-assert cs[0]["spec"].endswith("Second spec line.")
-assert cs[1]["section"] == "" and cs[1]["caption"] == ""
-many = "\n".join(f"CHART: c{i}.png\nSPEC: s{i}" for i in range(5))
+# ── 2) Parsing a chart block ──
+block = ("CHART: Era Leaders!.png\n"
+         "FINDING: f2\n"
+         "CAPTION: the leader in each era\n"
+         "SPEC: horizontal bars from era_summary, sorted by value\n"
+         "\n"
+         "CHART: second.png\n"
+         "FINDING: F3\n"
+         "CAPTION: the second one\n"
+         "SPEC: a line over time\n")
+charts = _parse_charts(block)
+assert len(charts) == 2
+assert charts[0]["name"] == sanitize_chart_name("Era Leaders!.png")
+assert charts[0]["finding"] == "F2", "finding ids normalise to upper case"
+assert charts[1]["finding"] == "F3"
+assert "sorted by value" in charts[0]["spec"]
+print("parsing: names sanitised, findings normalised: OK")
+
+# ── 3) The cap holds ──
+many = "".join(f"CHART: c{i}.png\nFINDING: F{i}\nCAPTION: c\nSPEC: s\n\n" for i in range(6))
 assert len(_parse_charts(many)) == MAX_CHARTS == 3
-assert sanitize_chart_name("../Evil Name.PNG") == "evil_name.png"
-t = ("###VERDICT###\nFINAL\n###BRIEFING###\nBody\n###CHARTS###\n"
-     "CHART: a.png\nSECTION: Summary\nCAPTION: c\nSPEC: s")
-r = _parse_synth(t)
-assert r["briefing"] == "Body" and r["charts"][0]["name"] == "a.png"
-assert _parse_synth("###VERDICT###\nFINAL\n###BRIEFING###\nB")["charts"] == []
-print("parse v2: OK")
+print(f"cap: at most {MAX_CHARTS} charts: OK")
 
-# ── 3) Placement: the live failure as a regression ──
-briefing = ("## Summary\nS text.\n\n## What the data can answer\nW text.\n"
-            "More W.\n\n## Method notes\nM text.\n\n"
-            "![model-dumped one](charts/joint_scatter.png)\n"
-            "![model-dumped two](charts/era_leaders.png)")
-charts = [
-    {"name": "joint_scatter.png", "section": "What the data can answer",
-     "caption": "Joint outlier", "spec": "s1"},
-    {"name": "era_leaders.png", "section": "## summary",
-     "caption": "No single era leader", "spec": "s2"},
-    {"name": "gone.png", "section": "Summary", "caption": "x", "spec": "s3"},
-]
-out = apply_chart_results(briefing, charts, {"joint_scatter.png", "era_leaders.png"})
-lines = out.split("\n")
-assert "model-dumped" not in out, "model-authored image lines are stripped"
-i_sum, i_what, i_meth = (lines.index("## Summary"),
-                         lines.index("## What the data can answer"),
-                         lines.index("## Method notes"))
-i_era = lines.index("![No single era leader](charts/era_leaders.png)")
-i_joint = lines.index("![Joint outlier](charts/joint_scatter.png)")
-assert i_sum < i_era < i_what, "era chart lands inside Summary (fuzzy '## summary' match)"
-assert i_what < i_joint < i_meth, "joint chart lands inside its named section"
-assert "gone.png" not in out, "a failed chart simply does not appear"
-# same-section ordering + missing-section fallback
-two = [{"name": "a.png", "section": "Summary", "caption": "A", "spec": "s"},
-       {"name": "b.png", "section": "Summary", "caption": "B", "spec": "s"},
-       {"name": "c.png", "section": "No Such Header", "caption": "C", "spec": "s"}]
-out2 = apply_chart_results("## Summary\ntext\n\n## End\nz", two, {"a.png", "b.png", "c.png"})
-l2 = out2.split("\n")
-assert l2.index("![A](charts/a.png)") < l2.index("![B](charts/b.png)") < l2.index("## End")
-assert out2.rstrip().endswith("![C](charts/c.png)"), "missing section falls back to the end"
-assert apply_chart_results("plain text", [], set()) == "plain text"
-print("placement: live regression + ordering + fallback: OK")
+# ── 4) Rendering: the model says where, the harness says what ──
+produced = {"c0.png", "c1.png"}
+cs = _parse_charts("".join(f"CHART: c{i}.png\nFINDING: F{i}\nCAPTION: cap{i}\nSPEC: s\n\n"
+                          for i in range(2)))
+out = render_chart_markers("A [[CHART:F0]]\n\nB\n\n[[CHART:F1]]", cs, produced)
+assert out.count("![") == 2 and "[[CHART" not in out
+assert "![cap0](charts/c0.png)" in out and "![cap1](charts/c1.png)" in out
+# an image link is never emitted for a chart that failed to render
+assert "![" not in render_chart_markers("[[CHART:F0]][[CHART:F1]]", cs, set())
+# and a rendered chart the editor forgot is appended rather than lost
+tail = render_chart_markers("No markers at all.", cs, produced)
+assert tail.count("![") == 2
+print("rendering: no broken links, no lost charts: OK")
 
-# ── 4) Render loop: dict charts, isolation, manifest with section/caption ──
-class FakeKernel:
-    def describe_namespace(self, **kw):
-        return "- joint_abilities_n30: DataFrame"
+# ── 5) What the editor is told about the charts ──
+listing = charts_for_editor(cs, produced)
+assert "[[CHART:F0]] -> c0.png: cap0" in listing
+assert charts_for_editor(cs, set()) == "(no charts were produced)"
+print("manifest for the editor: OK")
 
-
-class FakeExecutor:
-    def __init__(self):
-        self.calls = []
-
-    def run(self, spec, kernel, registry_text, analysis_dir=None):
-        self.calls.append(spec)
-        name = spec.split('fig.savefig("')[1].split('"')[0]
-        if name == "ok.png":
-            os.makedirs(analysis_dir, exist_ok=True)
-            open(os.path.join(analysis_dir, name), "wb").write(b"png")
-            return {"code": "c", "stdout": f"SAVED {name}", "error": None, "attempts": 1}
-        return {"code": "c", "stdout": "", "error": "boom", "attempts": 3}
-
-
-with tempfile.TemporaryDirectory() as out_dir:
-    ex = FakeExecutor()
-    produced = I._render_charts(
-        ex, FakeKernel(),
-        [{"name": "ok.png", "section": "Summary", "caption": "cap", "spec": "plot it"},
-         {"name": "no.png", "section": "", "caption": "", "spec": "plot other"}],
-        out_dir)
-    assert produced == {"ok.png"}
-    assert ex.calls[0].startswith("plot it\n\nCHART STYLE") and 'dpi=115' in ex.calls[0]
-    man = json.load(open(os.path.join(out_dir, "charts", "manifest.json")))
-    assert man[0]["section"] == "Summary" and man[0]["caption"] == "cap"
-    assert man[1]["produced"] is False and man[1]["error"] == "boom"
-print("render loop v2: OK")
+# ── 6) The editor is told to place markers, never links ──
+assert "[[CHART:F3]]" in P.EDITOR_SYSTEM
+assert "Never write an image link yourself" in P.EDITOR_SYSTEM
+print("editor: markers only: OK")
 
 print("test_charts: OK")

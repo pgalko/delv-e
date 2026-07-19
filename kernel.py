@@ -72,7 +72,7 @@ _INTERNAL_NAMES = {
 # from stdin, execs the step's code into G (so state persists), writes a result
 # JSON, then prints the done token.
 _WORKER_SCRIPT = r'''
-import inspect, io, json, os, sys, traceback, warnings
+import ast, inspect, io, json, os, re, sys, traceback, warnings
 import pickle as _pickle, types as _types, importlib as _importlib
 warnings.filterwarnings("ignore")
 
@@ -185,13 +185,43 @@ _INTERNAL = {
 }
 
 
+_df_fp_cache = None      # fingerprint of df at the last checkpointed state
+_df_blob_cache = None    # pickled df bytes matching _df_fp_cache
+
+
+def _df_fingerprint():
+    """A cheap content fingerprint of df, used to avoid re-pickling it on every
+    checkpoint when nothing changed (the common case: executors mostly create
+    derived objects). Any failure returns a unique object — 'always changed' —
+    which is safe: the blob is simply rebuilt."""
+    _df = G.get("df")
+    if _df is None:
+        return None
+    try:
+        _h = int(pd.util.hash_pandas_object(_df, index=True).sum())
+        return (_h, _df.shape, tuple(map(str, _df.columns)),
+                tuple(str(_t) for _t in _df.dtypes))
+    except Exception:
+        return object()
+
+
 def _checkpoint_save(path):
     """Pickle the derived DATA objects in G to `path` atomically. Modules are
     recorded by import name (re-imported on load) and do not count against
     completeness. Returns (ok, skipped): ok is True only when every non-module
     derived object serialized. If anything is skipped (a function, lambda, or
     otherwise unpicklable object), the previous complete checkpoint is left
-    untouched and the caller replays the tail from it instead."""
+    untouched and the caller replays the tail from it instead.
+
+    df IS included, despite being 'internal': executors mutate it in place
+    (new columns, dropped rows), and those mutations belong to committed
+    steps. A checkpoint restore skips replaying the steps it covers, so if df
+    were left to the startup parquet reload — the ORIGINAL data — every
+    committed in-place edit inside the covered range would silently vanish
+    from any restore (crash recovery, timeout recovery, and the transactional
+    rollback of failed attempts). Its blob is rebuilt only when the content
+    fingerprint changes; on unpicklable df the checkpoint reports incomplete
+    and the caller falls back to full replay, which reapplies the mutations."""
     blobs, modules, skipped = {}, {}, []
     for _name, _val in list(G.items()):
         if _name in _INTERNAL or _name.startswith("_"):
@@ -203,6 +233,20 @@ def _checkpoint_save(path):
             blobs[_name] = _pickle.dumps(_val, protocol=_pickle.HIGHEST_PROTOCOL)
         except Exception:
             skipped.append(_name)
+    global _df_fp_cache, _df_blob_cache
+    if G.get("df") is not None:
+        _fp = _df_fingerprint()
+        if _df_blob_cache is None or _fp != _df_fp_cache:
+            try:
+                _df_blob_cache = _pickle.dumps(G["df"],
+                                               protocol=_pickle.HIGHEST_PROTOCOL)
+                _df_fp_cache = _fp
+            except Exception:
+                _df_blob_cache = None
+                _df_fp_cache = None
+                skipped.append("df")
+        if _df_blob_cache is not None:
+            blobs["df"] = _df_blob_cache
     if skipped:
         return False, skipped
     _tmp = path + ".tmp"
@@ -243,12 +287,90 @@ def _checkpoint_load(path):
             pass
 
 
+_ALIAS_RE = re.compile(r"^([A-Za-z_]\w*)__s(\d+)$")
+
+
+def _shape_of(val, depth=0):
+    """What a value IS: element shape and length, not just its type name.
+
+    The Executor is blind to prior code by design, so the registry is the ONLY
+    thing that tells it what a persisted object contains. "list len=60" does not,
+    and a wrong guess about a return contract is a silent, type-correct error."""
+    t = type(val).__name__
+    try:
+        if t == "DataFrame":
+            return "DataFrame %dx%d" % (val.shape[0], val.shape[1])
+        if t == "Series":
+            return "Series len=%d dtype=%s" % (len(val), val.dtype)
+        if t == "ndarray":
+            return "ndarray shape=%s dtype=%s" % (val.shape, val.dtype)
+        if t in ("int", "float", "bool", "str", "NoneType", "int64", "float64"):
+            return t
+        if depth >= 3:
+            return t
+        if t == "tuple":
+            if not val:
+                return "tuple()"
+            return "tuple(%s)" % ",".join(_shape_of(x, depth + 1) for x in val[:8])
+        if t in ("list", "set"):
+            if not val:
+                return "%s len=0" % t
+            first = next(iter(val))
+            return "%s[%s] len=%d" % (t, _shape_of(first, depth + 1), len(val))
+        if t == "dict":
+            if not val:
+                return "dict len=0"
+            key = next(iter(val))
+            return "dict[%s -> %s] len=%d" % (
+                _shape_of(key, depth + 1), _shape_of(val[key], depth + 1), len(val))
+    except Exception:
+        pass
+    return t
+
+
+def _post_exec(_user_code, _before, _step_no):
+    """After a clean exec: pin an immutable alias on everything this step bound,
+    and record what each function it called actually returned.
+
+    Both exist because the Executor is architecturally blind to prior code while
+    every Executor writes into one shared dict. Aliases make a rebound name
+    recoverable by a name the Executor can actually type; return contracts mean the next blind Executor never has to guess."""
+    if _step_no:
+        for _k in [_k for _k in list(G)
+                   if not _k.startswith("_") and not _ALIAS_RE.match(_k)]:
+            if _before.get(_k) != id(G[_k]):
+                G["%s__s%s" % (_k, _step_no)] = G[_k]
+    # Return contracts, observed from real calls in this step's code.
+    try:
+        _rets = G.setdefault("_returns", {})
+        for _node in ast.walk(ast.parse(_user_code)):
+            if not isinstance(_node, ast.Assign) or not isinstance(_node.value, ast.Call):
+                continue
+            _f = _node.value.func
+            _fname = _f.id if isinstance(_f, ast.Name) else None
+            if not _fname or not callable(G.get(_fname)):
+                continue
+            for _t in _node.targets:
+                if isinstance(_t, ast.Name) and _t.id in G:
+                    _rets[_fname] = _shape_of(G[_t.id])
+    except Exception:
+        pass
+
+
 def _namespace_summary():
     """Compact description of user-defined names currently in G."""
     internal = _INTERNAL
+    # Which steps bound each name? Derived from the aliases themselves, so no
+    # extra state has to survive a checkpoint restore.
+    bound_by = {}
+    for name in G:
+        m = _ALIAS_RE.match(name)
+        if m:
+            bound_by.setdefault(m.group(1), []).append(int(m.group(2)))
+
     out = []
     for name, val in list(G.items()):
-        if name in internal or name.startswith("__"):
+        if name in internal or name.startswith("__") or _ALIAS_RE.match(name):
             continue
         t = type(val).__name__
         try:
@@ -263,7 +385,7 @@ def _namespace_summary():
                 r = repr(val)
                 desc = r if len(r) <= 80 else r[:77] + "..."
             elif t in ("list", "tuple", "set", "dict"):
-                desc = "%s len=%d" % (t, len(val))
+                desc = _shape_of(val)
             elif t in ("ndarray",):
                 desc = "ndarray shape=%s dtype=%s" % (getattr(val, "shape", "?"), getattr(val, "dtype", "?"))
             elif t == "function":
@@ -272,13 +394,21 @@ def _namespace_summary():
                 except Exception:
                     sig = name + "(...)"
                 doc = (inspect.getdoc(val) or "").strip().splitlines()
-                desc = "function " + sig + ((": " + doc[0][:80]) if doc else "")
+                ret = G.get("_returns", {}).get(name)
+                desc = ("function " + sig + (" -> " + ret if ret else "")
+                        + ((": " + doc[0][:80]) if doc else ""))
             elif t in ("type", "module"):
                 continue  # imported modules and class definitions are not reusable derived state
             else:
                 desc = t
         except Exception:
             desc = t
+        steps = sorted(bound_by.get(name, []))
+        if len(steps) > 1:
+            # The collision is now impossible to miss, and pinnable.
+            desc += ("  [AMBIGUOUS: rebound by steps %s. Use %s to pin one.]"
+                     % (", ".join(str(s) for s in steps),
+                        " or ".join("%s__s%d" % (name, s) for s in steps)))
         out.append({"name": name, "type": t, "desc": desc})
     return out
 
@@ -320,6 +450,9 @@ for _line in sys.stdin:
 
     _stdout = None
     _error = None
+    _step_no = _req.get("step")
+    _before = {_k: id(_v) for _k, _v in G.items()
+               if not _k.startswith("_") and not _ALIAS_RE.match(_k)}
     try:
         with open(_code_path, "r", encoding="utf-8") as _f:
             _user_code = _f.read()
@@ -328,13 +461,14 @@ for _line in sys.stdin:
         with redirect_stdout(_buf):
             exec(_user_code, G)   # exec into G so derived state persists
         _stdout = _buf.getvalue()
+        _post_exec(_user_code, _before, _step_no)
     except Exception:
         _error = traceback.format_exc()
     finally:
         plt.close("all")
 
     _ckpt_ok, _ckpt_skipped = False, []
-    if _error is None and _ckpt_path:
+    if _error is None and _ckpt_path and not _req.get("no_ckpt"):
         try:
             _ckpt_ok, _ckpt_skipped = _checkpoint_save(_ckpt_path)
         except Exception:
@@ -373,6 +507,15 @@ class KernelDead(Exception):
     """Raised internally when the worker process is gone and must be restarted."""
 
 
+# In the Investigator's default registry view, only this many of the NEWEST
+# derived objects carry their full description; every older object is listed
+# by NAME only. Names are the reuse contract (reference-by-registry-name) and
+# stay complete; descriptions are recognition aids whose value decays with
+# age. Measured on a live 40-object run the descriptions were ~75% of the
+# volatile tail — the dominant per-turn cost after the audit-4.2 cuts.
+REGISTRY_DESC_RECENT = 25
+
+
 class PersistentKernel:
     """A long-lived worker process holding one persistent analysis namespace."""
 
@@ -393,6 +536,13 @@ class PersistentKernel:
         self._snapshot_through = 0
         # Latest namespace registry from the worker.
         self.registry = {"namespace": [], "columns": []}
+        # Registry as of the last COMMITTED step. Every failed attempt is rolled
+        # back to this state (see execute), so the registry shown onward never
+        # advertises objects a failed attempt created and then lost.
+        self._good_registry = {"namespace": [], "columns": []}
+        # True while the live worker holds state from a commit=False execution
+        # (chart rendering). Cleared by any rollback/replay.
+        self._uncommitted = False
         self._proc = None
         self._reader = None
         self._q = None
@@ -464,18 +614,33 @@ class PersistentKernel:
             pass
         self._proc = None
 
-    def _restart_and_replay(self):
-        """Rebuild the namespace after a kill. Restore the last complete checkpoint
-        (loaded by the fresh worker on startup), then replay only the steps after
-        it. If that tail fails (a step errors or the worker dies), fall back to a
-        full replay from a clean worker, which is the original O(n) behavior."""
+    def _restart_and_replay(self, reason=None):
+        """Rebuild the namespace to the last COMMITTED state. Restore the last
+        complete checkpoint (loaded by the fresh worker on startup), then replay
+        only the committed steps after it. If that tail fails (a step errors or
+        the worker dies), fall back to a full replay from a clean worker, which
+        is the original O(n) behavior.
+
+        Used both for crash/timeout recovery (no `reason`, logged as a WARNING)
+        and as the TRANSACTIONAL ROLLBACK after a failed or uncommitted
+        execution (`reason` given, logged as INFO — routine, not alarming).
+        Either way the worker ends at the last committed step: the checkpoint
+        file is only ever written after a successful committed step, so it can
+        never contain a failed attempt's partial mutations or uncommitted chart
+        state. On exit the visible registry is restored to the committed one
+        and any uncommitted-state flag is cleared."""
         n = self._snapshot_through
         tail = self._history[n:]
-        logger.warning(
-            "Persistent kernel restarting; restoring checkpoint through step %d, "
-            "replaying %d tail step(s).", n, len(tail))
+        if reason:
+            logger.info("Persistent kernel: %s — restoring checkpoint through "
+                        "step %d, replaying %d tail step(s).", reason, n, len(tail))
+        else:
+            logger.warning(
+                "Persistent kernel restarting; restoring checkpoint through step %d, "
+                "replaying %d tail step(s).", n, len(tail))
         self._kill_worker()
         self._start_worker(load_ckpt=(n > 0))
+        replayed = False
         for i, code in enumerate(tail):
             res = self._run_once(code, analysis_dir=None)
             if res is None or res.get("_timeout") or res.get("error"):
@@ -483,17 +648,22 @@ class PersistentKernel:
                                "falling back to full replay.", i)
                 break
         else:
-            return  # tail replayed cleanly: namespace is whole
+            replayed = True  # tail replayed cleanly: namespace is whole
 
-        # Fallback: clean worker, ignore the checkpoint, replay the whole history.
-        self._kill_worker()
-        self._start_worker(load_ckpt=False)
-        for j, code in enumerate(self._history):
-            res = self._run_once(code, analysis_dir=None)
-            if res is None or (res and res.get("_timeout")):
-                logger.error("Kernel could not complete full replay at step %d; "
-                             "namespace partial.", j)
-                break
+        if not replayed:
+            # Fallback: clean worker, ignore the checkpoint, replay the whole history.
+            self._kill_worker()
+            self._start_worker(load_ckpt=False)
+            for j, code in enumerate(self._history):
+                res = self._run_once(code, analysis_dir=None)
+                if res is None or (res and res.get("_timeout")):
+                    logger.error("Kernel could not complete full replay at step %d; "
+                                 "namespace partial.", j)
+                    break
+
+        self.registry = {"namespace": list(self._good_registry.get("namespace", [])),
+                         "columns": list(self._good_registry.get("columns", []))}
+        self._uncommitted = False
 
     # ----- execution -------------------------------------------------------
 
@@ -510,9 +680,11 @@ class PersistentKernel:
                 )
         return None
 
-    def _run_once(self, code, analysis_dir):
+    def _run_once(self, code, analysis_dir, step=None, no_ckpt=False):
         """One round-trip to the worker. Returns the result dict, or None if the
-        worker died (caller decides whether to restart). Does NOT itself restart."""
+        worker died (caller decides whether to restart). Does NOT itself restart.
+        With no_ckpt=True the worker skips its post-step checkpoint save, so an
+        uncommitted (chart) execution can never enter the checkpoint file."""
         # NOTE: analysis_dir is NOT created here. The folder is made lazily, only
         # when a plot is actually written (see the worker plot patch), so steps
         # that produce no plots — which is all of them, since the executor is told
@@ -525,6 +697,8 @@ class PersistentKernel:
                 "code_path": code_path,
                 "result_path": result_path,
                 "analysis_dir": analysis_dir or "",
+                "step": step,
+                "no_ckpt": bool(no_ckpt),
             })
             try:
                 self._proc.stdin.write(req + "\n")
@@ -550,50 +724,102 @@ class PersistentKernel:
         finally:
             _cleanup_files(code_path, result_path)
 
-    def execute(self, code, analysis_dir=None):
-        """Execute one step in the persistent namespace.
+    def execute(self, code, analysis_dir=None, step=None, commit=True):
+        """Execute one step in the persistent namespace, TRANSACTIONALLY.
 
         Returns (stdout, error, plots), matching executor.CodeExecutor.execute
         (minus the df argument — df lives in the kernel).
-        """
+
+        Commit semantics: a step is COMMITTED only when it runs without error
+        and commit=True; only committed code enters the replayable history.
+        Ordinary Python exceptions can mutate objects before raising (an
+        in-place df edit on line 1, a raise on line 3), so a failed attempt
+        leaves the worker dirty even though nothing was committed — and a
+        retry, or a later --resume/--extend replay of the committed history,
+        would otherwise see a state the committed record never produced. Every
+        failed attempt is therefore ROLLED BACK: the worker is rebuilt from the
+        last committed checkpoint + tail (see _restart_and_replay) before
+        control returns, and the error string says so, matching what the
+        executor's retry template now promises.
+
+        commit=False runs the code against the live namespace WITHOUT
+        committing it: no history append, no checkpoint (the worker is told to
+        skip its save), no registry update. Used for chart rendering, whose
+        code must see the analytical objects but must never become analytical
+        state; call discard_uncommitted() afterwards to restore the worker."""
         refusal = self._security_refuse(code)
         if refusal:
             return None, refusal, []
 
-        result = self._run_once(code, analysis_dir)
+        result = self._run_once(code, analysis_dir, step=step, no_ckpt=not commit)
 
-        # Timeout → restart + replay, then report.
+        # Timeout → roll back to the last committed state, then report.
         if result is not None and result.get("_timeout"):
             self._restart_and_replay()
             return None, (
                 f"Execution killed: exceeded {self.step_timeout}s time limit. "
                 "Simplify the step (fewer iterations, aggregate before fitting, "
-                "cap pairwise operations). Namespace was preserved."
+                "cap pairwise operations). The attempt was rolled back; the "
+                "namespace is exactly as it was before this step."
             ), []
 
-        # Worker died (OOM/segfault) → restart + replay, then report.
+        # Worker died (OOM/segfault) → roll back to the last committed state.
         if result is None:
             self._restart_and_replay()
             return None, (
                 "Execution killed by the OS (likely out of memory) or the worker "
                 "crashed. Reduce memory use (sample/aggregate first, avoid large "
-                "intermediate frames). Namespace was restored to the last good state."
+                "intermediate frames). The attempt was rolled back; the namespace "
+                "is exactly as it was before this step."
             ), []
 
         stdout = result.get("stdout")
         error = _truncate_traceback(result.get("error"))
         plots = result.get("plots", []) or []
+
+        if error is not None:
+            # TRANSACTIONAL ROLLBACK. The exception may have fired after part of
+            # the code already mutated the namespace; rebuild the worker from
+            # the committed record so the retry (and any later replay) sees
+            # exactly the pre-step state. The checkpoint file is safe to load:
+            # the worker only saves it after error-free steps.
+            self._restart_and_replay(
+                reason=f"rolling back failed attempt{f' (step {step})' if step else ''}")
+            return stdout, (error + "\n[delv-e: the failed attempt was rolled "
+                            "back — the namespace is exactly as it was before "
+                            "this attempt]"), plots
+
+        if not commit:
+            # Success, but deliberately uncommitted (chart rendering): the live
+            # worker now holds state the committed record does not. Leave the
+            # registry/history untouched and flag the worker dirty so
+            # discard_uncommitted() knows a restore is needed.
+            self._uncommitted = True
+            return stdout, None, plots
+
         self.registry = {
             "namespace": result.get("namespace", []),
             "columns": result.get("columns", []),
         }
-        if error is None:
-            self._history.append(code)  # only successful steps are replayable
-            if result.get("checkpoint_ok"):
-                # The checkpoint now captures state through this step, so a future
-                # restart restores from here and skips replaying everything before.
-                self._snapshot_through = len(self._history)
-        return stdout, error, plots
+        self._good_registry = {"namespace": list(self.registry["namespace"]),
+                               "columns": list(self.registry["columns"])}
+        self._history.append(code)  # only successful committed steps are replayable
+        if result.get("checkpoint_ok"):
+            # The checkpoint now captures state through this step, so a future
+            # restart restores from here and skips replaying everything before.
+            self._snapshot_through = len(self._history)
+        return stdout, None, plots
+
+    def discard_uncommitted(self, reason="discarding uncommitted state"):
+        """Restore the worker to the last committed step if any commit=False
+        execution has run since; no-op (returns False) otherwise. Chart
+        rendering calls this after its loop so chart-only variables never leak
+        into the analytical namespace, the persisted history, or a later
+        --resume/--extend replay."""
+        if not self._uncommitted:
+            return False
+        self._restart_and_replay(reason=reason)
+        return True
 
     # ----- introspection / lifecycle --------------------------------------
 
@@ -604,9 +830,14 @@ class PersistentKernel:
 
         When `names` is given, only those derived objects are listed (plus a count
         of the rest); callers use this to show the Executor just the objects its
-        spec references, and the Investigator just the live ones. When `names` is
-        None, the MOST RECENT `max_items` objects are shown (newest kept, oldest
-        dropped) — never the reverse, so freshly created objects are never hidden."""
+        spec references — those always carry their FULL descriptions.
+
+        When `names` is None (the Investigator's per-turn view), the NEWEST
+        REGISTRY_DESC_RECENT objects carry descriptions and every older object
+        is listed by NAME only, one compact line. Every name is always present
+        — reuse-by-name never depends on recency — but stale descriptions no
+        longer ride the uncached tail every turn (they were ~75% of it on a
+        measured 40-object run). `max_items` caps the described portion."""
         cols = self.registry.get("columns", [])
         ns = self.registry.get("namespace", [])
         lines = []
@@ -626,13 +857,20 @@ class PersistentKernel:
                 lines.append(f"  ... (+{hidden} other derived objects exist; "
                              f"reference one by its exact name to use it)")
         else:
-            shown = ns[-max_items:]            # keep the NEWEST, not the oldest
-            lines.append("Derived objects in namespace (most recent):")
+            desc_n = min(REGISTRY_DESC_RECENT, max_items)
+            shown = ns[-desc_n:]            # keep the NEWEST, never the reverse
+            older = ns[:-desc_n] if desc_n < len(ns) else []
+            lines.append("Derived objects in namespace (most recent, with descriptions):")
             for item in shown:
                 lines.append(f"  - {item['name']}: {item['desc']}")
-            hidden = len(ns) - len(shown)
-            if hidden > 0:
-                lines.append(f"  ... (+{hidden} older derived objects hidden)")
+            if older:
+                cap = 300
+                names_line = ", ".join(it["name"] for it in older[-cap:])
+                extra = len(older) - cap
+                lines.append("Earlier derived objects, by NAME only (all remain "
+                             "live; reference one by its exact name to use it): "
+                             + names_line
+                             + (f" (+{extra} more)" if extra > 0 else ""))
         return "\n".join(lines)
 
     def reset(self):
@@ -640,6 +878,8 @@ class PersistentKernel:
         self._kill_worker()
         self._history = []
         self.registry = {"namespace": [], "columns": []}
+        self._good_registry = {"namespace": [], "columns": []}
+        self._uncommitted = False
         self._snapshot_through = 0
         try:
             open(self._ckpt_path, "wb").close()  # truncate so no stale state loads
@@ -668,6 +908,8 @@ class PersistentKernel:
                     self._snapshot_through = len(self._history)
                 self.registry = {"namespace": res.get("namespace", []),
                                  "columns": res.get("columns", [])}
+                self._good_registry = {"namespace": list(self.registry["namespace"]),
+                                       "columns": list(self.registry["columns"])}
             else:
                 logger.warning("restore_history: a step failed to replay; namespace may be partial.")
 

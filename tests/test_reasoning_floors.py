@@ -122,4 +122,15 @@ assert rec.kw["reasoning_effort"] == "low", \
     "the rescue rung's 'none' must arrive at the provider as 'low' on grok"
 print("live-crash regression: OK")
 
+
+# ── Kimi K3: max-only reasoning dial → the field is omitted for EVERY canonical
+# effort (max is the model's default; unsupported enums risk 400s until
+# Moonshot ships lower levels). K2-era kimi models keep passthrough behavior.
+from llm import _provider_effort
+for eff in ("none", "low", "high", "max"):
+    assert _provider_effort("openrouter", eff, "moonshotai/kimi-k3") is None, eff
+assert _provider_effort("openrouter", "high", "moonshotai/kimi-k2.6") == "high"
+assert _provider_effort("openrouter", "max", "moonshotai/kimi-k2.6") == "xhigh"
+print("kimi-k3 max-only mapping: OK")
+
 print("test_reasoning_floors: OK")

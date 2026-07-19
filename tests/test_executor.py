@@ -17,7 +17,7 @@ import sys
 from investigation import Executor
 
 class FakeKernel:
-    def execute(self, code, analysis_dir=None): return ("ok output", None, [])
+    def execute(self, code, analysis_dir=None, step=None, commit=True): return ("ok output", None, [])
 
 # 1) The exact failure from the run: model returns NO code block on every attempt (reasoning ran away)
 class NoCodeClient:
@@ -59,7 +59,7 @@ class ErrThenFix:
         return "```python\nbad\n```" if s.n==1 else "```python\ngood\n```"
 class KernelErrThenOk:
     def __init__(s): s.n=0
-    def execute(s, code, analysis_dir=None):
+    def execute(s, code, analysis_dir=None, step=None, commit=True):
         s.n+=1
         return (None, "Traceback: NameError", []) if s.n==1 else ("fixed output", None, [])
 r3=Executor(ErrThenFix(),"ollama:kimi",max_retries=2).run("spec",KernelErrThenOk(),"reg")

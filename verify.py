@@ -56,6 +56,20 @@ def write_last_run_pointer(output_dir, pointer_path=LAST_RUN_POINTER):
         logger.warning("Could not write the last-run pointer %s.", pointer_path)
 
 
+def claims_from_findings(technical_text):
+    """The findings ARE the numbered claims, so a technical briefing needs no
+    extraction call: the claim, its direction and its numbers are already
+    structured. Returns [] for a pre-split briefing, which still needs the LLM."""
+    from synthesis import parse_findings
+    out = []
+    for f in parse_findings(technical_text or ""):
+        line = f["claim"]
+        if f["numbers"]:
+            line += f" ({f['numbers']})"
+        out.append(line)
+    return out
+
+
 def extract_claims(client, model, briefing_text, compute=False):
     """One cheap call that distills the briefing into numbered decisive claims.
 
@@ -139,9 +153,10 @@ def reconcile(client, model, original_seed, original_briefing, audit_briefing,
         logger.warning("Reconciliation hit its token cap; briefing.md may be "
                        "incomplete (briefing_audit.md is complete alongside).")
     text = out.strip()
-    # Marker-remnant tolerance: strip a stray leading briefing marker if the
-    # model echoes one (same failure family as the synthesis incidents).
-    text = re.sub(r"^#{2,}\s*BRIEFING[^\n]*\n", "", text).strip()
+    # Marker-remnant tolerance: strip a stray leading block marker if the model
+    # echoes one (same failure family as the synthesis incidents). The reconciler
+    # emits findings now, so either name can turn up.
+    text = re.sub(r"^#{2,}\s*(?:FINDINGS|BRIEFING)[^\n]*\n", "", text).strip()
     return text
 
 
@@ -151,31 +166,39 @@ def check_dirs(prior_dir, output_dir):
         raise SystemExit("--verify: choose an --output different from the "
                          "prior run directory (the audit must not overwrite "
                          "the run it audits).")
-    briefing_path = os.path.join(prior_dir, "briefing.md")
-    if not os.path.exists(briefing_path):
-        raise SystemExit(f"--verify: no briefing.md found in {prior_dir}.")
-    return briefing_path
+    # The TECHNICAL briefing is what an audit adjudicates: it is the claim record,
+    # numbered and exact, where briefing.md is its rendering for a reader. Runs
+    # made before the synthesis split have only the latter, so fall back to it.
+    for name in ("technical_briefing.md", "briefing.md"):
+        path = os.path.join(prior_dir, name)
+        if os.path.exists(path):
+            return path
+    raise SystemExit(f"--verify: no technical_briefing.md found in {prior_dir}.")
 
 
 def finalize_verify_outputs(output_dir, original_briefing, audit_briefing,
                             reconciled, claims):
-    """Write the verification artifact set. briefing.md is the reconciled
-    document; the inputs are preserved alongside for the audit trail. If
-    reconciliation produced nothing usable, the audit briefing stands in (never
-    end empty-handed) and the fallback is reported."""
+    """Write the verification artifact set. technical_briefing.md is the RECONCILED
+    ledger, which the editorial pass then renders into briefing.md; the two inputs
+    are preserved beside it for the trail. If reconciliation produced nothing usable,
+    the audit's own record stands in (never end empty-handed) and it is reported."""
     fallback = not reconciled or len(reconciled.strip()) < _MIN_RECONCILED_CHARS
     final_text = audit_briefing if fallback else reconciled
     if fallback:
         logger.warning("Reconciliation produced no usable briefing; the audit "
                        "briefing stands in as briefing.md.")
+    # The reconciled ledger IS the corrected technical record: it is what the
+    # deliverable cites by finding id, and what a later --verify or --extend must
+    # audit. It overwrites the audit's own record under the canonical name; both
+    # inputs are kept beside it for the trail.
     paths = {
-        "briefing.md": final_text,
-        "briefing_original.md": original_briefing,
-        "briefing_audit.md": audit_briefing,
+        "technical_briefing.md": final_text,
+        "technical_briefing_original.md": original_briefing,
+        "technical_briefing_audit.md": audit_briefing,
         "claims.md": "\n".join(f"{i}. {c}" for i, c in enumerate(claims, 1))
                      or "(claim extraction fell back to a briefing excerpt)",
     }
     for name, text in paths.items():
         with open(os.path.join(output_dir, name), "w", encoding="utf-8") as f:
             f.write(text)
-    return os.path.join(output_dir, "briefing.md"), fallback
+    return os.path.join(output_dir, "technical_briefing.md"), fallback

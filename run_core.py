@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--verify", dest="verify_run", default=None,
                         nargs="?", const="@last", metavar="PRIOR_RUN_DIR",
                         help="Audit a prior run: distill the decisive claims from its "
-                             "briefing.md, run a FRESH independent investigation that "
+                             "technical_briefing.md, run a FRESH independent investigation that "
                              "adjudicates them against the data, then write one "
                              "reconciled briefing (originals preserved alongside) into "
                              "output_verify/ by default. Bare --verify audits the last "
@@ -124,6 +124,10 @@ def main():
     # cannot serve search, it falls through to OpenRouter, then Anthropic.
     from llm import resolve_search_seat, parse_model_string
     search_model = None if args.no_search else resolve_search_seat(investigator_model)
+    # The editorial pass searches the published literature AFTER the findings are
+    # fixed, so it cannot contaminate them. It rides the synth model's provider,
+    # which on ollama is free (rate-limited, not billed).
+    lit_search_model = None if args.no_search else resolve_search_seat(synth_model)
     if not args.no_search:
         if search_model is None:
             print("Web search disabled: no provider can serve it (an ollama-seated "
@@ -344,6 +348,7 @@ def main():
             g1_pushback_budget=args.g1_pushback, ui=ui,
             prior_seeds=prior_seeds,
             search_model=search_model, search_budget=args.search_budget,
+            lit_search_model=lit_search_model,
             stats=run_stats, compute=args.compute,
             reasoning_effort=args.reasoning_effort,
         )
@@ -359,14 +364,41 @@ def main():
     if verify_ctx is not None and briefing:
         ui.note("Verify: reconciling the audit with the original briefing…",
                 "magenta")
+        # Both sides of a reconciliation are TECHNICAL records: numbered findings
+        # with their numbers and caveats, which is what can actually be adjudicated.
+        # The audit's was just written by the publish pass.
+        technical = ""
+        _tp = os.path.join(args.output, "technical_briefing.md")
+        if os.path.exists(_tp):
+            with open(_tp, encoding="utf-8") as f:
+                technical = f.read()
+        technical = technical or briefing
         reconciled = verify.reconcile(
             client, synth_model, verify_ctx["original_seed"],
-            verify_ctx["original_briefing"], briefing, compute=args.compute)
+            verify_ctx["original_briefing"], technical, compute=args.compute)
         _, used_fallback = verify.finalize_verify_outputs(
-            args.output, verify_ctx["original_briefing"], briefing,
+            args.output, verify_ctx["original_briefing"], technical,
             reconciled, verify_ctx.get("claims", []))
         if not used_fallback:
-            briefing = reconciled
+            # The corrected record is a findings ledger, so the reader's document is
+            # re-rendered from it by the same editorial pass that produced the run's
+            # own briefing, reusing the charts the audit already rendered.
+            from synthesis import (Editor, charts_for_editor, load_chart_manifest,
+                                   render_chart_markers)
+            from prompts import mode_prompts
+            charts, produced = load_chart_manifest(args.output)
+            lit = ""
+            lit_path = os.path.join(args.output, "literature.md")
+            if os.path.exists(lit_path):
+                with open(lit_path, encoding="utf-8") as f:
+                    lit = f.read()
+            ed = Editor(client, synth_model, prompts=mode_prompts(args.compute),
+                        reasoning_effort=args.reasoning_effort)
+            ui.agent("Editor", synth_model)
+            rendered = ed.write(seed, reconciled, charts_for_editor(charts, produced), lit)
+            briefing = render_chart_markers(rendered, charts, produced) or reconciled
+            with open(os.path.join(args.output, "briefing.md"), "w", encoding="utf-8") as f:
+                f.write(briefing)
 
     # Run telemetry (supersedes the old cost.txt). Written once, at run end, into
     # the timestamped log folder. The console still prints the cost line for live
@@ -378,7 +410,8 @@ def main():
         run_logger, cost_tracker, run_stats, log,
         seed=seed, dataset_shape=(0, 0) if df is None else df.shape,
         models={"investigator": investigator_model, "executor": executor_model,
-                "synthesizer": synth_model, "search": search_model},
+                "synthesizer": synth_model, "search": search_model,
+                "literature_search": lit_search_model},
         max_iters=args.iterations, wall_clock_s=run_wall,
         target_estimand=getattr(nav, "target_estimand", ""),
         final_verdict=final_verdict)

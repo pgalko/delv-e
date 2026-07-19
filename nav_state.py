@@ -61,6 +61,15 @@ REGIME_STATUS = {"not_examined", "partial", "examined"}
 RISK_STATUS = {"open", "resolved"}
 BREAKDOWN_STATUS = {"holds", "thin", "blocked", "unrecoverable"}
 
+# Statuses that mean a thread is still LIVE. An entry in one of these that
+# disappears from a re-emitted ledger — rather than passing through a closing
+# status (tested/foreclosed/examined/resolved) — is the silent-drift signal the
+# per-section merge warns about. BREAKDOWN entries are terminal descriptors, so
+# their removal is logged but never warned.
+_LIVE_STATUS = {"frontier": {"untested", "in_progress"},
+                "regime": {"not_examined", "partial"},
+                "risk": {"open"}}
+
 # Loose synonym mapping so minor model drift in status words still parses.
 _STATUS_SYNONYMS = {
     "in progress": "in_progress", "inprogress": "in_progress",
@@ -155,9 +164,11 @@ class Entry:
 
 
 class NavState:
-    """Structured pointer/status ledger. Replaced wholesale each turn from the
-    Investigator's ###LEDGER### block, but constrained by format to handles +
-    statuses + step pointers, so 're-emission' can't smuggle in a prose answer."""
+    """Structured pointer/status ledger. Re-emitted in full by the Investigator
+    each turn and merged PER SECTION from its ###LEDGER### block (a section is
+    replaced only when it parsed; see apply_ledger_block), constrained by format
+    to handles + statuses + step pointers, so 're-emission' can't smuggle in a
+    prose answer and a partially garbled turn can't wipe the map."""
 
     def __init__(self):
         self.frontier = []
@@ -172,26 +183,48 @@ class NavState:
     # ---- ingest the Investigator's ledger block -------------------------
 
     def apply_ledger_block(self, text):
-        """Parse a ###LEDGER### block and REPLACE the ledgers.
+        """Parse a ###LEDGER### block and MERGE it into the ledgers, per section.
 
         Accepts the CANONICAL shape the Investigator is shown and asked to emit:
         a section header (FRONTIER / REGIME / RISK / BREAKDOWN, bare or decorated
         like 'REGIME LEDGER:' or 'OPEN RISKS:') followed by indented entry lines
         `label [status] steps:ids`, with BREAKDOWN optionally adding ` — why: ...`.
         Also still accepts the legacy pipe shape `KIND | label | status | steps`
-        so older behaviour never breaks. Individual malformed lines are skipped;
-        a totally empty/garbled block leaves the prior state intact (so one bad
-        turn cannot wipe the map). Render and parser share this shape, so a model
-        that simply echoes the map it is shown round-trips cleanly.
+        so older behaviour never breaks. Individual malformed lines are skipped.
+
+        REPLACEMENT IS PER SECTION, never wholesale. A bucket is replaced only
+        when its section yielded at least one parsed entry this turn; a section
+        that is absent, explicitly "(none)", or whose every line was malformed
+        keeps its prior contents. Under the old wholesale rule, one parseable
+        line anywhere replaced ALL FOUR buckets, so a turn with garbled
+        FRONTIER/REGIME lines and one good RISK line silently wiped the frontier
+        and regimes — and an emptied REGIME bucket disarms the G1 gate
+        (open_regimes() drives both the loop's pre-synthesis pushback and the
+        Synthesizer's backstop). Entries are closed by STATUS
+        (tested/foreclosed/resolved), never by omission, so keeping a prior
+        section on a bad parse matches the ledger's own rules. A totally
+        empty/garbled block still leaves the whole prior state intact.
+
+        Every applied block is DIFFED against the prior state: additions and
+        removals are logged, and a removed entry whose prior status was still
+        LIVE (frontier untested/in_progress, regime not_examined/partial, risk
+        open) is logged as a WARNING — the silent-drift signal section 7 of the
+        handover says to keep watching for, now mechanical. Returns the diff
+        dict ({kind: {"added": [...], "removed": [...], "dropped_live": [...]}})
+        for replaced sections, or None when nothing was applied.
+
+        Render and parser share this shape, so a model that simply echoes the
+        map it is shown round-trips cleanly.
         """
         if not text or not text.strip():
-            return
+            return None
         buckets = {"frontier": [], "regime": [], "risk": [], "breakdown": []}
         defaults = {"frontier": ("untested", FRONTIER_STATUS),
                     "regime": ("not_examined", REGIME_STATUS),
                     "risk": ("open", RISK_STATUS),
                     "breakdown": ("thin", BREAKDOWN_STATUS)}
-        parsed_any = False
+        seen_sections = set()      # section headers encountered this block
+        explicit_empty = set()     # sections whose body was a literal "(none)"
         current = None  # section in force while reading header+entry lines
 
         def _section_of(line):
@@ -229,6 +262,15 @@ class NavState:
             sec = _section_of(line)
             if sec is not None:
                 current = sec or None
+                if current:
+                    seen_sections.add(current)
+                continue
+
+            # A literal "(none)" body is the render's empty-section marker; a
+            # model echoing it is stating "no entries", not garbling a line.
+            if current and re.fullmatch(r"\(?\s*(?:none|n/?a|-)\s*\)?", line,
+                                        re.IGNORECASE):
+                explicit_empty.add(current)
                 continue
 
             kind = label = status_raw = None
@@ -269,13 +311,57 @@ class NavState:
             if not label:
                 continue
             buckets[kind].append(Entry(kind, label, status, steps, why))
-            parsed_any = True
 
-        if parsed_any:
+        # ---- per-section merge + mechanical drift diff ----
+        prior = {"frontier": self.frontier, "regime": self.regimes,
+                 "risk": self.risks, "breakdown": self.breakdown}
+        replaced = {k for k, v in buckets.items() if v}
+        if not replaced:
+            return None  # nothing parsed anywhere: whole prior map intact, as before
+
+        # A section whose header (or explicit "(none)") appeared but whose lines
+        # all failed to parse is the wipe-hazard tell: say so, keep the prior.
+        for kind in ("frontier", "regime", "risk", "breakdown"):
+            if kind in replaced or not prior[kind]:
+                continue
+            if kind in explicit_empty:
+                logger.warning("Ledger: %s emitted as '(none)' while %d prior "
+                               "entr%s exist; entries close by status, never by "
+                               "omission — prior kept.", kind, len(prior[kind]),
+                               "y" if len(prior[kind]) == 1 else "ies")
+            elif kind in seen_sections:
+                logger.warning("Ledger: %s section present but no line parsed; "
+                               "prior entries kept.", kind)
+
+        diff = {}
+        for kind in replaced:
+            old = {e.label: e for e in prior[kind]}
+            new = {e.label for e in buckets[kind]}
+            added = [l for l in new if l not in old]
+            removed = [l for l in old if l not in new]
+            live = _LIVE_STATUS.get(kind, set())
+            dropped_live = [l for l in removed if old[l].status in live]
+            diff[kind] = {"added": added, "removed": removed,
+                          "dropped_live": dropped_live}
+            if added or removed:
+                logger.info("Ledger diff (%s): +%s -%s", kind,
+                            added or "[]", removed or "[]")
+            if dropped_live:
+                logger.warning("Ledger: %s entr%s %s disappeared while still "
+                               "LIVE (never passed through a closing status) — "
+                               "renamed or dropped by the model.", kind,
+                               "y" if len(dropped_live) == 1 else "ies",
+                               dropped_live)
+
+        if "frontier" in replaced:
             self.frontier = buckets["frontier"]
+        if "regime" in replaced:
             self.regimes = buckets["regime"]
+        if "risk" in replaced:
             self.risks = buckets["risk"]
+        if "breakdown" in replaced:
             self.breakdown = buckets["breakdown"]
+        return diff
 
     # ---- guardrail support ---------------------------------------------
 
@@ -349,7 +435,18 @@ class NavState:
         return "\n".join(lines) if lines else "  (no steps yet)"
 
     def render_for_investigator(self, log=None):
-        """The structured view passed back to the Investigator each turn."""
+        """The structured view passed back to the Investigator each turn.
+
+        Bare section headers by design (audit 4.2): the sections' meanings,
+        status vocabularies, and G1's rule are taught ONCE in the cached system
+        prompt, so re-teaching them here re-billed ~600 uncached chars every
+        turn and made the legend a third leg of the render/legend/parser
+        contract. The header KEYWORDS (frontier/regime/risk/breakdown) are
+        load-bearing — apply_ledger_block's section detection keys on them and
+        the model echoes this shape back — so change them only with the parser.
+        Pass `log` to append the EVIDENCE INDEX (Synthesizer payload); the
+        Investigator's call site omits it, since each step's spec already sits
+        in its history region."""
         def fmt(entries, with_why=False):
             if not entries:
                 return "  (none)"
@@ -365,21 +462,18 @@ class NavState:
         sections = []
         if self.target_estimand:
             sections += [
-                "TARGET ESTIMAND (the question the seed asks; aim the primary answer at THIS; "
-                "keep the question fixed and refine only how you estimate it):",
+                "TARGET ESTIMAND (pinned — aim the primary answer at this):",
                 f"  {self.target_estimand}",
                 "",
             ]
         sections += [
-            "FRONTIER (framings/estimands — pursue untested ones to widen the map):",
+            "FRONTIER:",
             fmt(self.frontier),
-            "REGIME LEDGER — stratification/effect-modifier axes. 'examined' means the",
-            "effect was estimated WITHIN each level (not merely controlled as a confounder).",
-            "G1: at least one axis must be examined before any null/uniform claim.",
+            "REGIME LEDGER:",
             fmt(self.regimes),
             "OPEN RISKS:",
             fmt(self.risks),
-            "BREAKDOWN MAP (where the answer holds / thin / blocked / unrecoverable):",
+            "BREAKDOWN MAP:",
             fmt(self.breakdown, with_why=True),
         ]
         if log is not None:

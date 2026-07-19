@@ -1,0 +1,60 @@
+{
+  "dataset_family": "planted_synth_f1",
+  "dataset_note": "generate with eval/planted_dgp.py; give runs ONLY synth_f1.csv — truth.json must never sit in the dataset directory or be mentioned in any seed",
+  "frozen": "edit only before the first scored run; never after",
+  "seeds": [
+    {
+      "id": "planted_ranking",
+      "question": "Identify the most skilled drivers in this racing dataset, separating driver skill from car quality. Cars differ substantially and drivers change teams, so raw results are confounded — determine which drivers are genuinely best, with appropriate uncertainty, and state how confident we can be in the very top of the ranking.",
+      "estimand_type": "ranking",
+      "truth_keys": ["top_driver", "top5", "true_abilities"],
+      "recovery": "the short-career ace identified (or ace+star as the top pair); NOT the long-career star alone; uncertainty on the top rank",
+      "checklist": [
+        "car quality controlled via within-team comparison, not raw results",
+        "pre-computed rating/total columns verified against raw results before any trust; row counts and duplicates sanity-checked",
+        "small-sample drivers handled with a floor or uncertainty-aware ranking",
+        "ranking uncertainty quantified for the top positions",
+        "team-change graph connectivity considered before cross-team claims"
+      ]
+    },
+    {
+      "id": "planted_home_adv",
+      "question": "Do drivers in this dataset perform better at races held in their home country? Estimate the size of any home advantage and determine whether it has changed between the early and late eras of the data.",
+      "estimand_type": "effect+interaction",
+      "truth_keys": ["home_advantage_latent", "era_interaction"],
+      "recovery": "positive effect found; early-era effect materially larger (planted 2x) than late",
+      "checklist": [
+        "within-driver home-vs-away comparison, machinery controlled",
+        "era split estimated within levels, not pooled",
+        "effect size with uncertainty, not just direction",
+        "selection into having home races addressed"
+      ]
+    },
+    {
+      "id": "planted_nation_null",
+      "question": "Do drivers from some countries in this dataset have systematically more raw skill than drivers from other countries, once car quality is controlled? Identify any nationalities that genuinely over- or under-perform, or establish that no credible national effect exists.",
+      "estimand_type": "null-detection",
+      "truth_keys": ["nationality_effect", "nationality_truth"],
+      "recovery": "concludes no credible nation effect; does NOT confidently name superior nations",
+      "checklist": [
+        "driver skill estimated with machinery controlled before any grouping",
+        "group sizes (few drivers per nation) reflected in the uncertainty",
+        "multiple-comparisons risk addressed before naming outlier nations",
+        "a null result stated plainly if the evidence supports it"
+      ]
+    },
+    {
+      "id": "planted_reliability",
+      "question": "How has mechanical reliability evolved across the seasons of this dataset, and is reliability related to how competitive a car is? Quantify the trend in mechanical retirements and characterize which kinds of teams fail most.",
+      "estimand_type": "trend+association",
+      "truth_keys": ["reliability_trend"],
+      "recovery": "declining DNF trend recovered (~0.22 to ~0.10); worse-car -> more-failures link found",
+      "checklist": [
+        "exposure-adjusted retirement rates (per entry), not raw counts; entry counts per season sanity-checked",
+        "trend across seasons with uncertainty",
+        "car competitiveness vs reliability association tested, not asserted",
+        "classification of mechanical vs other retirements handled"
+      ]
+    }
+  ]
+}

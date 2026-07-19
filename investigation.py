@@ -34,7 +34,11 @@ import os
 import re
 
 from executor import extract_code
-from synthesis import apply_chart_results
+from llm import literature_search
+from synthesis import (Editor, charts_for_editor, check_attributions,
+                       check_coverage, check_numbers, format_sources,
+                       parse_findings, render_chart_markers, render_citations,
+                       strip_unverified_citations, technical_document)
 from prompts import CHART_STYLE_DIRECTIVE
 from kernel import PersistentKernel
 from nav_state import NavState
@@ -45,11 +49,15 @@ logger = get_logger(__name__)
 # Prompts now live in prompts.py (single source of truth; see the prompt audit).
 from prompts import (
     INVESTIGATOR_TAIL_TEMPLATE,
+    INVESTIGATOR_TASK_FIRST,
+    INVESTIGATOR_TASK_LATER,
+    WORKING_SET_HEADER,
     EXECUTOR_USER_TEMPLATE, EXECUTOR_RETRY_TEMPLATE,
     EXECUTOR_TRUNCATION_RETRY, DIRECTIVE_G1_GATE, DIRECTIVE_SYNTH_GATE,
     DIRECTIVE_MIDPOINT, DIRECTIVE_EXTEND_LEDGER, BUDGET_WRAPUP_TEMPLATE,
     SEARCH_INVESTIGATOR_INSTRUCTION, SEARCH_MIDSTREAM_TEMPLATE,
     DIRECTIVE_SEARCH_SPENT, DIRECTIVE_SEARCH_FAILED, DIRECTIVE_TRUNCATED_RETRY,
+    DIRECTIVE_FORMAT_RETRY,
     DATA_MODE, mode_prompts,
 )
 from llm import (
@@ -106,10 +114,22 @@ def _decision_from_status(raw):
     return "CONTINUE"
 
 
+# Block extraction terminates ONLY at the next NAMED marker, never at an arbitrary
+# "###": a model writing markdown "### Subsection" headers inside its THINKING or
+# SPEC must not silently truncate the block (the Executor would receive half a
+# spec, and the truncated spec is what the log — and so the Synthesizer — records
+# for the step). This is the same live failure _parse_synth in synthesis.py was
+# hardened against; that fix is ported here, together with its trailing-hash
+# tolerance ("###SPEC##", "###SPEC" both open a block).
+_INV_MARKERS = r"(?:ESTIMAND|THINKING|STATUS|SPEC|LEDGER|REHYDRATE|QUERY)"
+_INV_BLOCK_END = rf"(?=###\s*{_INV_MARKERS}\b|\Z)"
+
+
 def _parse_investigator(text):
-    """Parse the Investigator's three-block output. Tolerant of minor drift."""
+    """Parse the Investigator's block output. Tolerant of minor drift."""
     def block(name):
-        m = re.search(rf"###\s*{name}\s*###\s*(.*?)(?=###|\Z)", text, re.DOTALL | re.IGNORECASE)
+        m = re.search(rf"###\s*{name}[ \t]*#*\s*(.*?){_INV_BLOCK_END}",
+                      text, re.DOTALL | re.IGNORECASE)
         return m.group(1).strip() if m else ""
     thinking = block("THINKING")
     status = _decision_from_status(block("STATUS"))
@@ -123,13 +143,20 @@ def _parse_investigator(text):
         spec = ""
     if estimand.lower().strip() in ("none", "n/a", ""):
         estimand = ""
-    # Fallback: if no markers at all, treat whole text as thinking and stop.
+    # Fallback: no THINKING and no SPEC. Keep the whole text as thinking so
+    # nothing is lost, and keep SYNTHESIZE as the terminal fallback status. When
+    # additionally NO known marker appears anywhere ("unparsed"), the turn is
+    # flagged so the loop can retry the format once (see the retry loop in
+    # run_investigation) instead of finalizing the run on a formatting lapse;
+    # callers that ignore the flag degrade to the old behavior.
+    unparsed = False
     if not thinking and not spec:
+        unparsed = not re.search(rf"###\s*{_INV_MARKERS}\b", text or "", re.IGNORECASE)
         thinking = text.strip()
         status = "SYNTHESIZE"
     return {"thinking": thinking, "status": status, "spec": spec,
             "ledger": ledger, "rehydrate": rehydrate, "search": search,
-            "estimand": estimand}
+            "estimand": estimand, "unparsed": unparsed}
 
 
 def _write_step_artifact(analysis_dir, entry, iteration, max_steps):
@@ -137,9 +164,32 @@ def _write_step_artifact(analysis_dir, entry, iteration, max_steps):
     the code, and the raw output) to <exploration>/<NN>/analysis.md. This is a
     WRITE-ONLY audit artifact — it never enters any model's context, so it has no
     token cost; it just makes each step easy to review on disk. Plots (if any) land
-    in the same folder."""
+    in the same folder.
+
+    When the step needed more than one attempt (or ended in an error), an
+    "Execution attempts" section records every attempt in order — the failed
+    code, its traceback, and whether the kernel rolled it back — because the
+    committed code alone no longer tells the whole story: failed attempts are
+    transactionally rolled back and leave no trace in the namespace."""
     out = entry.get("stdout")
     body = out if out else f"[error after {entry.get('attempts','?')} attempt(s)]\n{entry.get('error','')}"
+    attempt_log = entry.get("attempt_log") or []
+    attempts_md = ""
+    if len(attempt_log) > 1 or (attempt_log and attempt_log[-1].get("error")):
+        sections = []
+        for a in attempt_log:
+            if not a.get("code"):
+                status = "no code returned"
+            elif a.get("error"):
+                status = "FAILED — rolled back"
+            else:
+                status = "committed"
+            body_a = a.get("error") or a.get("stdout") or "(no output)"
+            sections.append(
+                f"### Attempt {a.get('attempt', '?')} — {status}\n\n"
+                f"```python\n{a.get('code', '')}\n```\n\n"
+                f"```\n{body_a}\n```")
+        attempts_md = "\n\n## Execution attempts\n\n" + "\n\n".join(sections) + "\n"
     md = (
         f"# Step {entry['step']}\n\n"
         f"| Field | Value |\n|-------|-------|\n"
@@ -151,6 +201,7 @@ def _write_step_artifact(analysis_dir, entry, iteration, max_steps):
         f"## Rationale (the Investigator's reasoning)\n\n{entry.get('thinking','')}\n\n"
         f"## Code\n\n```python\n{entry.get('code','')}\n```\n\n"
         f"## Output\n\n```\n{body}\n```\n"
+        f"{attempts_md}"
     )
     try:
         os.makedirs(analysis_dir, exist_ok=True)
@@ -171,10 +222,22 @@ class Executor:
         self.max_tokens = max_tokens or DEFAULT_MAX_TOKENS
         self.p = prompts or DATA_MODE
 
-    def run(self, spec, kernel, registry_text, analysis_dir=None):
-        """Returns dict: {code, stdout, error, attempts}. Never raises on a bad
-        executor response — if the model fails to produce runnable code, that is
-        returned as an error dict so the Investigator can see it and adapt."""
+    def run(self, spec, kernel, registry_text, analysis_dir=None, step=None,
+            commit=True):
+        """Returns dict: {code, stdout, error, attempts, attempt_log}. Never
+        raises on a bad executor response — if the model fails to produce
+        runnable code, that is returned as an error dict so the Investigator can
+        see it and adapt.
+
+        attempt_log records EVERY attempt in order ({attempt, code, stdout,
+        error}), including no-code responses and attempts the kernel rolled
+        back, so the step artifact can show the full execution audit trail —
+        the committed code alone no longer tells the whole story now that
+        failed attempts are transactionally rolled back.
+
+        commit=False (chart rendering) runs code against the live namespace
+        without committing it to the kernel's replayable history; see
+        PersistentKernel.execute."""
         messages = [
             {"role": "system", "content": self.p.exec_system},
             {"role": "user", "content": EXECUTOR_USER_TEMPLATE.format(
@@ -183,6 +246,7 @@ class Executor:
         code = ""
         stdout = None
         error = None
+        attempt_log = []
         for attempt in range(self.max_retries + 1):
             resp, _meta = call_with_ladder(self.client, messages, self.model,
                                            agent="Executor", max_tokens=self.max_tokens)
@@ -192,19 +256,28 @@ class Executor:
                 # on chain-of-thought and emitted no (or a truncated) code block.
                 error = ("executor returned no runnable ```python``` code block "
                          f"(likely truncated after {self.max_tokens} output tokens of reasoning)")
+                attempt_log.append({"attempt": attempt + 1, "code": "",
+                                    "stdout": None, "error": error})
                 messages.append({"role": "assistant", "content": (resp or "")[-2000:]})
                 messages.append({"role": "user", "content": EXECUTOR_TRUNCATION_RETRY})
                 continue
-            stdout, error, _plots = kernel.execute(code, analysis_dir=analysis_dir)
+            stdout, error, _plots = kernel.execute(code, analysis_dir=analysis_dir,
+                                                   step=step, commit=commit)
+            attempt_log.append({"attempt": attempt + 1, "code": code,
+                                "stdout": stdout, "error": error})
             if not error:
-                return {"code": code, "stdout": stdout, "error": None, "attempts": attempt + 1}
-            # Mechanical retry with the traceback.
+                return {"code": code, "stdout": stdout, "error": None,
+                        "attempts": attempt + 1, "attempt_log": attempt_log}
+            # Mechanical retry with the traceback. The kernel has already rolled
+            # the failed attempt back to the last committed state, so the retry
+            # runs against exactly the pre-step namespace (and the retry template
+            # tells the model so).
             messages.append({"role": "assistant", "content": resp})
             messages.append({"role": "user", "content":
                              EXECUTOR_RETRY_TEMPLATE.format(traceback=error)})
         return {"code": code, "stdout": stdout,
                 "error": error or "executor failed to produce runnable code",
-                "attempts": self.max_retries + 1}
+                "attempts": self.max_retries + 1, "attempt_log": attempt_log}
 
 
 def _render_charts(executor, kernel, charts, output_dir, ui=None, stats=None):
@@ -213,30 +286,41 @@ def _render_charts(executor, kernel, charts, output_dir, ui=None, stats=None):
     savefig routes bare filenames into the step's analysis_dir). Never raises:
     charts must not break the briefing. Returns the set of produced filenames
     and writes charts/manifest.json for provenance. Chart steps are
-    deliberately NOT appended to the investigation log: they run after
-    synthesis, carry no analytical state, and must not enter Investigator
-    history on a later --extend."""
+    deliberately NOT appended to the investigation log — and, since the
+    isolation fix, not to the KERNEL either: chart code runs commit=False (no
+    history append, no checkpoint) and the worker is restored to the last
+    committed step afterwards, so chart-only variables never reach the
+    Investigator's registry, kernel_history.json, or a later --resume/--extend
+    replay. Before this, successful chart code silently entered the replayable
+    history even though the log stayed clean."""
     charts_dir = os.path.join(output_dir, "charts")
     produced, manifest = set(), []
-    for c in charts:
-        name, spec = c["name"], c["spec"]
-        full_spec = f"{spec}\n\n{CHART_STYLE_DIRECTIVE.format(name=name)}"
-        try:
-            registry_text = kernel.describe_namespace()
-            res = executor.run(full_spec, kernel, registry_text,
-                               analysis_dir=charts_dir)
-            ok = os.path.exists(os.path.join(charts_dir, name))
-            err = res.get("error")
-        except Exception as exc:        # noqa: BLE001 - isolation is the contract
-            ok, err = False, str(exc)
-        if ok:
-            produced.add(name)
-        if stats:
-            stats.bump("charts_rendered" if ok else "charts_failed")
-        logger.info("Chart %s: %s", name, "saved" if ok else f"FAILED ({err})")
-        manifest.append({"chart": name, "section": c.get("section"),
-                         "caption": c.get("caption"), "spec": spec,
-                         "produced": ok, "error": None if ok else err})
+    try:
+        for c in charts:
+            name, spec = c["name"], c["spec"]
+            full_spec = f"{spec}\n\n{CHART_STYLE_DIRECTIVE.format(name=name)}"
+            try:
+                registry_text = kernel.describe_namespace()
+                res = executor.run(full_spec, kernel, registry_text,
+                                   analysis_dir=charts_dir, commit=False)
+                ok = os.path.exists(os.path.join(charts_dir, name))
+                err = res.get("error")
+            except Exception as exc:        # noqa: BLE001 - isolation is the contract
+                ok, err = False, str(exc)
+            if ok:
+                produced.add(name)
+            if stats:
+                stats.bump("charts_rendered" if ok else "charts_failed")
+            logger.info("Chart %s: %s", name, "saved" if ok else f"FAILED ({err})")
+            manifest.append({"chart": name, "finding": c.get("finding"),
+                             "caption": c.get("caption"), "spec": spec,
+                             "produced": ok, "error": None if ok else err})
+    finally:
+        # Restore the worker to the last committed analytical step (no-op when
+        # no chart code actually ran). Inside finally so even an unexpected
+        # exception cannot leave chart state live.
+        kernel.discard_uncommitted(reason="chart rendering finished; "
+                                          "discarding chart-only kernel state")
     if manifest:
         try:
             os.makedirs(charts_dir, exist_ok=True)
@@ -246,6 +330,11 @@ def _render_charts(executor, kernel, charts, output_dir, ui=None, stats=None):
         except OSError as exc:
             logger.warning("Could not write charts manifest: %s", exc)
     return produced
+
+
+# The editorial pass may run at most this many literature searches, one round
+# trip each. On ollama they are free but rate-limited, so the ceiling is calls.
+LITERATURE_BUDGET = 3
 
 
 # Investigator turns use the shared DEFAULT_MAX_TOKENS budget. The output-token cap
@@ -268,28 +357,55 @@ class Investigator:
         self.reasoning_effort = reasoning_effort
 
     def decide(self, seed, schema, registry_text, log, nav, directive=None, rehydrate=None,
-               budget_note=None, reasoning_effort=None):
-        nav_text = nav.render_for_investigator(log)
+               budget_note=None, search_note=None, reasoning_effort=None):
+        # No evidence index for the Investigator (audit 4.2): each step's spec
+        # already sits in the history region as a full block, headline, or
+        # archive line, so the index duplicated it — one line per step, growing
+        # linearly, in the uncached tail. The Synthesizer still gets it (its
+        # call site passes the log; its evidence assembly is a different payload).
+        nav_text = nav.render_for_investigator()
         head = self.p.inv_head.format(seed=seed, schema=schema)
-        # Tiered history: recent + live-thread (protected) + rehydrated stay full;
-        # older closed-thread steps collapse to a headline + pointer. Past the
-        # history budget, old headlines slim and fold into an archive and older
-        # protected residents trim (see _history_blocks).
-        blocks = _history_blocks(log, protected=nav.protected_steps(),
-                                 forced_full=set(rehydrate or []),
-                                 char_budget=HISTORY_CHAR_BUDGET)
+        # Append-only context (audit 5.2): the cached prefix carries one
+        # PERMANENT block per step that has exited the recent window — a pure
+        # function of the log, independent of protection and pins, so it never
+        # rewrites and reads back from cache in full every turn. The FULL raws
+        # of recent / live-thread / rehydrated steps ride in the volatile
+        # working set at the top of the tail instead (see _render_context).
+        prefix_blocks, working_blocks = _render_context(
+            log, protected=nav.protected_steps(), pinned=set(rehydrate or []),
+            prefix_budget=HISTORY_CHAR_BUDGET,
+            working_budget=WORKING_SET_CHAR_BUDGET)
         # Search instruction lives in the cached prefix (static for the run) so it
         # adds no per-turn cost; present only when search is enabled.
         if self.search_enabled:
             stable_blocks = [head,
-                             SEARCH_INVESTIGATOR_INSTRUCTION.format(budget=self.search_budget)] + blocks
+                             SEARCH_INVESTIGATOR_INSTRUCTION.format(budget=self.search_budget)] + prefix_blocks
         else:
-            stable_blocks = [head] + blocks
-        tail = INVESTIGATOR_TAIL_TEMPLATE.format(registry=registry_text, nav=nav_text)
+            stable_blocks = [head] + prefix_blocks
+        # The closing task is branched: until an estimand is pinned (normally
+        # just the first turn), the tail carries the orientation task plus the
+        # full ESTIMAND instructions relocated out of the permanent system
+        # prompt; afterwards, a terse integrate-and-decide line. The tail is
+        # volatile and uncached, so the branch is free (the HEAD stays
+        # byte-stable — it is cached block 0).
+        task = (INVESTIGATOR_TASK_FIRST.format(estimand_note=self.p.estimand_note)
+                if not nav.target_estimand else INVESTIGATOR_TASK_LATER)
+        tail = INVESTIGATOR_TAIL_TEMPLATE.format(registry=registry_text,
+                                                 nav=nav_text, task=task)
+        if working_blocks:
+            tail = (WORKING_SET_HEADER + "\n\n"
+                    + "\n\n".join(working_blocks) + "\n\n" + tail)
         # Late-window budget notice (volatile, uncached): present only in the run's
         # final stretch so the total budget never reads as a quota to fill.
         if budget_note:
             tail += ("\n\n" + budget_note)
+        # Standing search-budget notice (volatile, uncached): present on every turn
+        # once the budget is spent. The SEARCH advertisement lives in the CACHED
+        # stable prefix and cannot be withdrawn without resetting the cache, so
+        # this tail line overrides it — preempting the wasted premium turn where
+        # the model requests a search the loop can only refuse.
+        if search_note:
+            tail += ("\n\n" + search_note)
         if directive:
             tail += ("\n\nDIRECTIVE (act on this now): " + directive)
         from llm import build_cached_messages
@@ -316,20 +432,52 @@ class Investigator:
         return decision
 
 
-# ── History-budget compaction knobs ─────────────────────────────────────────
-# Tiered demotion engages only when the rendered per-step history exceeds this
-# many characters (sum of block lengths), so short/typical runs render
-# byte-identically to the unbudgeted behavior. Sized from measured heavy runs
-# (the F1 seed): late-run history hit 95-145K chars; this budget holds it near
-# 90K, roughly 30K prompt tokens once the head and volatile tail sit on top,
-# while typical sub-13-step runs never cross it.
+# ── Context layout knobs ─────────────────────────────────────────────────────
+# The cached PREFIX holds one PERMANENT block per step that has exited the
+# recent window — written once, byte-identical forever (append-only by
+# construction; audit 5.2). This budget bounds the prefix; past it, the oldest
+# permanent blocks fold into the single archive block — the one remaining
+# rewrite, a deliberate one-time cache reset. Permanent blocks run ~0.5-1.5k
+# chars, so ordinary runs never approach it.
 HISTORY_CHAR_BUDGET = 90_000
+# The WORKING SET (volatile tail, uncached) carries the FULL raws of recent,
+# protected (live-thread), and pinned (rehydrated) steps. Over this budget,
+# protected residents trim to PROTECTED_SLIM_CEILING — attention hygiene AND
+# the per-turn bill, since every working-set char is re-billed at full rate
+# every turn; trimming is free cache-wise because the tail is never cached.
+# Sized from the first live run on this layout: its working set ran 21-32k
+# chars (heavy prints riding live threads for 3-6 turns) and a 60k budget
+# never fired a single trim, while a print-disciplined run sits near 11k and
+# never triggers. 30k catches exactly the observed excess.
+WORKING_SET_CHAR_BUDGET = 30_000
 # Over budget, the raw of an older PROTECTED resident (full only because it
 # feeds a live thread, not because it is recent) is trimmed to this ceiling.
-PROTECTED_SLIM_CEILING = 4_000
-# Over budget, an old collapsed headline keeps only this much of its SPEC (its
-# first sentence, capped); the step's finding lives in the NAV MAP and the
-# full raw remains one REHYDRATE away.
+# Lowered 4,000 -> 2,000 after the third live run: protected raws measured
+# 2.2-4.6k chars, so a 4k ceiling made every trim a no-op and a 39k working
+# set sailed past the 30k budget untouched. 2,000 matches the print anchor —
+# a protected resident was fully read while recent; past the budget it keeps
+# its head plus the honest notice, and the full raw is one pinned REHYDRATE
+# away.
+PROTECTED_SLIM_CEILING = 2_000
+# A permanent block's verbatim RESULT EXCERPT keeps the WHOLE raw up to
+# KEEP_WHOLE chars (a print-budget-disciplined step fits, so archiving loses
+# nothing), else this much of each end around an honest omission marker.
+# HEAD/TAIL slimmed 400/200 -> 250/120 after the first live run on this
+# layout: the permanent-block slope was ~1.9k chars/turn of cached prefix,
+# and the band the slim drops contained zero later-cited numbers on that run
+# (measured); KEEP_WHOLE deliberately stays at the old head+tail+80 so no raw
+# kept whole before is truncated now.
+RESULT_EXCERPT_KEEP_WHOLE = 680
+RESULT_EXCERPT_HEAD = 250
+RESULT_EXCERPT_TAIL = 120
+# First sentence of the step's contemporaneous THINKING carried in its
+# permanent block (audit 5.3: conclusions stay in the LOG, never the ledger).
+NOTE_EXCERPT_CHARS = 160
+# A REHYDRATE listing pins the step's full raw into the working set for this
+# many turns (audit 5.3); re-listing refreshes. Before this, a rehydrated raw
+# arrived for ONE turn and vanished unless re-requested every turn.
+REHYDRATE_PIN_TURNS = 3
+# Past the prefix budget, an archived line keeps only this much of its SPEC.
 SLIM_SPEC_CHARS = 200
 
 
@@ -343,29 +491,72 @@ def _spec_excerpt(spec, limit=SLIM_SPEC_CHARS):
     return head if len(head) <= limit else head[:limit].rstrip() + "..."
 
 
-def _slim_headline(e):
-    """A collapsed step demoted under the history budget: one-sentence SPEC
-    plus the same recovery affordances as a normal headline."""
-    return (f"--- STEP {e['step']} (collapsed) ---\n"
-            f"SPEC: {_spec_excerpt(e.get('spec'))}\n"
-            f"[Compacted under the history budget. Finding is in the NAV MAP; list "
-            f"step {e['step']} in a ###REHYDRATE### block to restore the full raw.]")
-
-
 def _archive_line(e):
     return f"STEP {e['step']}: {_spec_excerpt(e.get('spec'))}"
 
 
-def _step_block(e, full=True, hard_ceiling=20000, budget_trim=False):
-    """Render ONE completed step as a deterministic, byte-stable block.
+def _result_excerpt(raw, head=RESULT_EXCERPT_HEAD, tail=RESULT_EXCERPT_TAIL,
+                    keep_whole=RESULT_EXCERPT_KEEP_WHOLE):
+    """Verbatim excerpt of a step's raw output for its permanent block. Short
+    raws (up to keep_whole) are kept WHOLE — with the print budget observed,
+    archiving a step loses no numbers at all. Long raws keep both ends around
+    an honest omission marker. Deterministic bytes from the frozen entry
+    alone: a permanent block must never change once written."""
+    r = (raw or "(no output)").strip()
+    if len(r) <= keep_whole:
+        return r
+    return (r[:head].rstrip()
+            + f"\n[... {len(r) - head - tail:,} chars omitted; full raw on disk ...]\n"
+            + r[-tail:].lstrip())
 
-    full=True  → SPEC + complete RAW output + the Investigator's prior note.
-    full=False → COLLAPSED: SPEC + a pointer. The raw is NOT destroyed (it stays
-                 in the on-disk log, is always given to the Synthesizer in full, and
-                 can be pulled back via REHYDRATE); it is merely non-resident this
-                 turn so stale tables don't crowd the model's attention. The step's
-                 finding lives in the nav map.
-    budget_trim=True marks a ceiling cut made by the history-budget policy (an
+
+def _note_excerpt(thinking, limit=NOTE_EXCERPT_CHARS):
+    """First sentence of the step's contemporaneous THINKING — the
+    Investigator's own integration, recorded at the time it read the raw."""
+    s = " ".join((thinking or "").split())
+    if not s:
+        return ""
+    head = s.split(". ")[0]
+    if len(head) < len(s):
+        head = head.rstrip(".") + "."
+    return head if len(head) <= limit else head[:limit].rstrip() + "..."
+
+
+def _permanent_block(e):
+    """The ONE form in which a step ever enters the cached prefix — written
+    when it exits the recent window, byte-identical forever after (a pure
+    function of the frozen log entry, independent of protection or pins).
+    Searches are grandfathered in full: external calibration is small and
+    load-bearing. Every other step keeps its full SPEC, a verbatim RESULT
+    EXCERPT, and its note at the time — so archiving no longer strands every
+    number behind a REHYDRATE round-trip the way the spec+pointer collapsed
+    form did."""
+    if e.get("kind") == "search":
+        return _step_block(e)          # the search branch already renders full
+    sid = e["step"]
+    if e.get("error"):
+        body = (f"[error after {e.get('attempts', '?')} attempt(s)]\n"
+                f"{_result_excerpt(e.get('error'))}")
+    else:
+        body = _result_excerpt(e.get("stdout"))
+    parts = [f"--- STEP {sid} (archived) ---",
+             f"SPEC: {e.get('spec', '')}",
+             f"RESULT EXCERPT (verbatim; full raw on disk — REHYDRATE {sid} to restore it):",
+             body]
+    note = _note_excerpt(e.get("thinking"))
+    if note:
+        parts.append(f"NOTE AT THE TIME: {note}")
+    return "\n".join(parts)
+
+
+def _step_block(e, hard_ceiling=20000, budget_trim=False):
+    """Render ONE completed step FULL, as a deterministic, byte-stable block:
+    SPEC + complete RAW output + the Investigator's prior note. Used for the
+    working set (and for a search step's permanent form). The old collapsed
+    mode is gone — a step that leaves the working set is rendered ONCE by
+    _permanent_block into the append-only prefix instead.
+
+    budget_trim=True marks a ceiling cut made by the working-set budget (an
     older protected resident trimmed to PROTECTED_SLIM_CEILING), which gets a
     calm recovery notice instead of the "unusual" one.
     """
@@ -373,19 +564,12 @@ def _step_block(e, full=True, hard_ceiling=20000, budget_trim=False):
         return (f"--- STEP {e['step']} (WEB SEARCH) ---\n"
                 f"QUERY: {e.get('query', '')}\n"
                 f"FINDINGS (external, for calibration):\n{e.get('result') or '(no result)'}")
-    if not full:
-        return (f"--- STEP {e['step']} (collapsed) ---\n"
-                f"SPEC: {e.get('spec', '')}\n"
-                f"[Raw output + integration note collapsed to keep context focused. "
-                f"This step's finding is recorded in the NAV MAP. If you need its exact "
-                f"numbers again, list step {e['step']} in a ###REHYDRATE### block and the "
-                f"full raw will return next turn.]")
     raw = (f"[error after {e.get('attempts', '?')} attempt(s)]\n{e['error']}"
            if e.get("error") else (e.get("stdout") or "(no output)"))
     if len(raw) > hard_ceiling:
         if budget_trim:
             raw = (raw[:hard_ceiling].rstrip()
-                   + "\n[...older live-thread step trimmed here under the history "
+                   + "\n[...older live-thread step trimmed here under the working-set "
                      "budget; the full raw is on disk and returns via ###REHYDRATE### "
                      "if you need its exact numbers...]")
         else:
@@ -400,100 +584,103 @@ def _step_block(e, full=True, hard_ceiling=20000, budget_trim=False):
     return "\n".join(parts)
 
 
-def _history_blocks(log, recent_full=3, protected=None, forced_full=None,
-                    char_budget=None):
-    """Per-step blocks, one per completed step, append-only and stable.
+def _render_context(log, recent_full=3, protected=None, pinned=None,
+                    prefix_budget=None, working_budget=None):
+    """Split the completed steps into (prefix_blocks, working_blocks).
 
-    A step is shown FULL when it is recent (last `recent_full`), protected (feeds a
-    live thread — see NavState.protected_steps), or explicitly rehydrated this turn
-    (`forced_full`). Otherwise it is COLLAPSED to a headline+pointer. This keeps the
-    working set small so long runs don't bury the signal (needle-in-haystack), while
-    nothing is lost: collapsed raw stays on disk, goes to the Synthesizer in full,
-    and is fetchable via REHYDRATE.
+    PREFIX — append-only by construction (audit 5.2). Every step that has
+    exited the recent window appears as its PERMANENT block (_permanent_block:
+    spec + verbatim result excerpt + note), written once and never rewritten.
+    The prefix is a pure function of the step list and `recent_full` — it does
+    NOT depend on `protected` or `pinned` — so the two churn sources that
+    invalidated the old cache (protection moving as threads advance, and this
+    turn's rehydrates) can no longer touch deep history. Each turn appends at
+    most the block(s) of the step(s) that just exited the window; the cached
+    prefix reads back in full every turn.
 
-    Budgeted tiering (char_budget set; the Investigator passes
-    HISTORY_CHAR_BUDGET): when the rendered blocks exceed the budget, steps are
-    demoted oldest-first, cheapest-fidelity-first, until under budget:
-      1. old collapsed headlines slim to a one-sentence SPEC;
-      2. the oldest slim headlines fold into a single ARCHIVED STEPS block,
-         one line each, so prompt size asymptotes instead of growing with
-         every completed step;
-      3. older PROTECTED residents get their raw trimmed to
-         PROTECTED_SLIM_CEILING.
-    The last `recent_full` steps, search blocks, and this turn's rehydrates are
-    never demoted, whatever the budget, so a run whose untouchable core exceeds
-    the budget simply exceeds it. Every demotion is recoverable (raw on disk,
-    Synthesizer sees everything full, REHYDRATE restores any step), and below
-    the budget the output is byte-identical to the unbudgeted rendering.
-    Demotions rewrite deep history and so reset the cached prefix at the first
-    changed block; measured runs already reset to the seed almost every turn
-    under one-collapse-per-turn churn, so the marginal cache cost is small
-    against the fresh-input savings.
+    WORKING SET — the volatile, uncached tail. Full raws of: the last
+    `recent_full` steps, protected steps (feeding live threads), and pinned
+    steps (REHYDRATE, resident for REHYDRATE_PIN_TURNS). Chronological,
+    labeled by step id. Over `working_budget`, protected residents trim to
+    PROTECTED_SLIM_CEILING oldest-first — recents, pins, and searches are
+    never trimmed; a working set whose untouchable core exceeds the budget
+    simply exceeds it. Trimming here is free cache-wise.
+
+    The one remaining prefix rewrite: past `prefix_budget`, the OLDEST
+    permanent blocks fold into a single ARCHIVED STEPS block (one line each) —
+    a deliberate, rare, one-time cache reset so the prefix asymptotes instead
+    of growing with every completed step.
+
+    Nothing is ever lost: full raws stay on disk, the Synthesizer sees every
+    step in full, and REHYDRATE restores any step to the working set.
     """
     protected = protected or set()
-    forced_full = forced_full or set()
+    pinned = pinned or set()
     steps = [e for e in log if not e.get("terminal")]
-    recent_ids = {e["step"] for e in steps[-recent_full:]}
+    older, recent = steps[:-recent_full] or [], steps[-recent_full:]
+    if not recent_full:
+        older, recent = steps, []
 
-    def _base_full(e):
+    # ---- prefix: one permanent block per older step, oldest first ----
+    perm = [_permanent_block(e) for e in older]
+    prefix = perm
+    if prefix_budget is not None and sum(map(len, perm)) > prefix_budget:
+        header = ("--- ARCHIVED STEPS (oldest; spec lines only; raw on disk; any step "
+                  "returns via ###REHYDRATE###) ---")
+        n_arch = 0
+        while n_arch < len(older):
+            n_arch += 1
+            arch = header + "\n" + "\n".join(_archive_line(e) for e in older[:n_arch])
+            if len(arch) + sum(map(len, perm[n_arch:])) <= prefix_budget:
+                break
+        prefix = [arch] + perm[n_arch:]
+
+    # ---- working set: full raws, chronological, labeled ----
+    entries = []                       # (entry, kind) with kind deciding the label
+    for e in older:
         sid = e["step"]
-        return (e.get("kind") == "search") or (sid in recent_ids) \
-            or (sid in protected) or (sid in forced_full)
+        if sid in pinned:
+            entries.append((e, "pinned"))
+        elif sid in protected and e.get("kind") != "search":
+            entries.append((e, "protected"))
+    for e in recent:
+        entries.append((e, "recent"))
 
-    modes = ["full" if _base_full(e) else "collapsed" for e in steps]
+    def _label(e, kind):
+        if kind == "pinned":
+            return (f"[REHYDRATED step {e['step']} — full raw restored to the "
+                    f"working set; its archived form remains above]\n")
+        if kind == "protected":
+            return (f"[LIVE-THREAD step {e['step']} — full raw resident while "
+                    f"its thread stays open]\n")
+        return ""
 
-    def _render():
-        blocks, archive = [], []
-        for e, m in zip(steps, modes):
-            if m == "archived":
-                archive.append(_archive_line(e))
-            elif m == "slim_collapsed":
-                blocks.append(_slim_headline(e))
-            elif m == "slim_full":
-                blocks.append(_step_block(e, full=True,
-                                          hard_ceiling=PROTECTED_SLIM_CEILING,
-                                          budget_trim=True))
+    def _render_working(trim_ids):
+        out = []
+        for e, kind in entries:
+            if e["step"] in trim_ids:
+                out.append(_label(e, kind) + _step_block(
+                    e, hard_ceiling=PROTECTED_SLIM_CEILING, budget_trim=True))
             else:
-                blocks.append(_step_block(e, full=(m == "full")))
-        if archive:
-            blocks.insert(0, "--- ARCHIVED STEPS (oldest; raw on disk; any step "
-                             "returns via ###REHYDRATE###) ---\n" + "\n".join(archive))
-        return blocks
-
-    out = _render()
-    if char_budget is None or sum(map(len, out)) <= char_budget:
+                out.append(_label(e, kind) + _step_block(e))
         return out
 
-    # Pass 1: slim old collapsed headlines, oldest first.
-    for i, m in enumerate(modes):
-        if m == "collapsed":
-            modes[i] = "slim_collapsed"
-            out = _render()
-            if sum(map(len, out)) <= char_budget:
-                return out
-    # Pass 2: fold the oldest slim headlines into the archive block.
-    for i, m in enumerate(modes):
-        if m == "slim_collapsed":
-            modes[i] = "archived"
-            out = _render()
-            if sum(map(len, out)) <= char_budget:
-                return out
-    # Pass 3: trim older protected residents (never recents, search blocks,
-    # or this turn's rehydrates).
-    for i, e in enumerate(steps):
-        sid = e["step"]
-        if modes[i] == "full" and e.get("kind") != "search" \
-                and sid not in recent_ids and sid not in forced_full:
-            modes[i] = "slim_full"
-            out = _render()
-            if sum(map(len, out)) <= char_budget:
-                return out
-    return out   # best effort: the untouchable core alone exceeds the budget
+    working = _render_working(set())
+    if working_budget is not None and sum(map(len, working)) > working_budget:
+        trim_ids = set()
+        for e, kind in entries:       # oldest first; only protected residents trim
+            if kind == "protected":
+                trim_ids.add(e["step"])
+                working = _render_working(trim_ids)
+                if sum(map(len, working)) <= working_budget:
+                    break
+    return prefix, working
 
 
 def _format_log(log):
-    """Flat join of the per-step blocks (used for non-cached / debug rendering)."""
-    return "\n\n".join(_history_blocks(log))
+    """Flat join of the full context (used for non-cached / debug rendering)."""
+    prefix, working = _render_context(log)
+    return "\n\n".join(prefix + working)
 
 
 # How many times to re-call the Investigator when a turn comes back empty or
@@ -513,7 +700,12 @@ def _referenced_names(text, kernel):
     Used to show the Executor only the objects its closed spec actually names."""
     ns = [it["name"] for it in kernel.registry.get("namespace", [])]
     text = text or ""
-    return {n for n in ns if re.search(rf"\b{re.escape(n)}\b", text)}
+    # A spec may pin a step-versioned alias (records__s6). The registry lists the
+    # bare name (carrying the ambiguity note that points at the aliases), so match
+    # through the suffix or a pinned spec resolves nothing and trips the
+    # self-containment tripwire for doing exactly the right thing.
+    return {n for n in ns
+            if re.search(rf"\b{re.escape(n)}(?:__s\d+)?\b", text)}
 
 
 
@@ -537,7 +729,7 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                       output_dir="output", kernel=None, nav=None, log=None,
                       periodic_every=0, g1_pushback_budget=2, on_step=None, ui=None,
                       prior_seeds=None, search_model=None, search_budget=3, stats=None,
-                      compute=False, reasoning_effort="medium"):
+                      compute=False, reasoning_effort="medium", lit_search_model=None):
     """The inverted-core loop with synthesis.
 
     Each iteration: one premium Investigator call (integrate last raw result,
@@ -554,6 +746,12 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
     compute prompt bundle, and the statistical G1 gate is bypassed (the compute
     synthesizer self-checks uncertainty/convergence/validity instead). Everything
     else (kernel, ledger, loop, nets) is identical.
+
+    `max_steps` is the analysis-step budget. Model-chosen turns (analysis steps
+    and SEARCH steps, including refused search requests) consume it; gate
+    pushbacks (G1 pre-gate, Synthesizer NEEDS_MORE_WORK) are system-initiated
+    and are refunded, so the run may make up to max_steps + g1_pushback_budget
+    Investigator turns in total and a gate can never eat the final planned turn.
 
     To RESUME a prior run (--resume/--extend): pass the restored `kernel` (with
     restore_history already applied), `nav`, and prior `log`; max_steps is then
@@ -582,6 +780,8 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
     executor = Executor(client, executor_model, prompts=p)
     synthesizer = Synthesizer(client, synth_model, prompts=p,
                               reasoning_effort=reasoning_effort)
+    editor = Editor(client, synth_model, prompts=p,
+                    reasoning_effort=reasoning_effort)
     searches_used = 0
     briefing = ""
     # On an --extend run, the first Investigator turn is told to carry the
@@ -601,79 +801,279 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
         except OSError as exc:
             logger.warning("Could not persist run state: %s", exc)
 
+    def _literature(technical):
+        """Up to LITERATURE_BUDGET searches, chosen by the editor from the findings.
+        Post-hoc by design: the findings are already fixed, so the literature can
+        calibrate the write-up but cannot contaminate the analysis.
+
+        Returns (sources, literature_text). Every source gets a stable [Sn] id here,
+        in the harness, because the editor cannot be trusted to attribute one: given
+        a page it will invent an author, and a wrong attribution on a real URL is
+        invisible to any check. Same contract as the charts, for the same reason.
+
+        Every outcome is recorded. The free ollama route makes no LLM call, so a
+        search that fails there leaves NO trace in the run log; a live run had all
+        three searches fail silently while the console still printed "searched"."""
+        if not lit_search_model or not LITERATURE_BUDGET:
+            return [], ""
+        try:
+            queries = editor.queries(seed, technical, LITERATURE_BUDGET)
+        except Exception as exc:                                # noqa: BLE001
+            logger.warning("Editor could not produce literature queries: %s", exc)
+            return [], ""
+        if not queries:
+            logger.info("Editor asked for no literature searches.")
+            return [], ""
+
+        sources, notes, failures, seen = [], [], [], set()
+        for q in queries[:LITERATURE_BUDGET]:
+            if ui:
+                ui.agent("Literature Search", lit_search_model)
+            found, note, err = literature_search(client, lit_search_model, q)
+            if err:
+                failures.append((q, err))
+                if stats:
+                    stats.bump("literature_search_failed")
+                logger.warning("Literature search failed (%s): %s", q, err)
+                if ui:
+                    ui.note(f"Literature search failed: {err}", "yellow")
+                continue
+            if stats:
+                stats.bump("literature_searches")
+            if ui:
+                ui.searched(q, None)
+            if note:
+                notes.append(f"### QUERY: {q}\n{note}")
+            for src in found:
+                if src["url"] in seen:
+                    continue
+                seen.add(src["url"])
+                src["id"] = f"S{len(sources) + 1}"
+                sources.append(src)
+
+        # Always leave the artifact: on a total failure it is the only place the
+        # reason survives, and a briefing that ships without citations needs one.
+        parts = list(notes)
+        if sources:
+            parts.append("## SOURCES\n\n" + "\n\n".join(
+                f"[{s['id']}] {s['title']}\n{s['url']}" for s in sources))
+        if failures:
+            parts.append("## SEARCHES THAT FAILED\n\n" + "\n".join(
+                f"- {q}\n  {err}" for q, err in failures))
+        if parts:
+            try:
+                with open(os.path.join(output_dir, "literature.md"), "w",
+                          encoding="utf-8") as f:
+                    f.write("\n\n".join(parts) + "\n")
+            except OSError:
+                pass
+        if not sources:
+            msg = ("No literature was retrieved: every search on the %s seat failed. "
+                   "The briefing ships without citations; see literature.md."
+                   % lit_search_model)
+            logger.warning(msg)
+            if ui:
+                ui.note(msg, "yellow")
+            return [], ""
+        return sources, "\n\n".join(notes + [format_sources(sources)])
+
+    def _publish(result):
+        """Technical record, then charts, then literature, then the deliverable.
+
+        The technical briefing is the complete record and the --verify target;
+        briefing.md is what a reader receives. Three gates run HERE and not in a
+        prompt, because the deliverable now sits downstream of an extra call and a
+        silently dropped finding, a fabricated number, or an invented citation
+        would otherwise be invisible: nobody reads both artifacts."""
+        findings = parse_findings(result["findings"])
+        charts = result.get("charts") or []
+        produced = set()
+        if charts:
+            if ui:
+                ui.agent("Executor", executor.model)
+            produced = _render_charts(executor, kernel, charts, output_dir,
+                                      ui=ui, stats=stats)
+
+        technical = technical_document(result)
+        sources, literature = _literature(result["findings"])
+
+        if ui:
+            ui.agent("Editor", synth_model)
+        briefing = editor.write(seed, result["findings"],
+                                charts_for_editor(charts, produced), literature)
+
+        # Gate 1, coverage: every decisive finding must reach the reader. One retry
+        # naming what was dropped, then carry the survivors verbatim rather than
+        # ever losing a finding the evidence earned.
+        missing = check_coverage(briefing, findings)
+        if missing and briefing:
+            if stats:
+                stats.bump("editor_coverage_retries")
+            logger.warning("Editor dropped decisive finding(s) %s; retrying once.",
+                           ", ".join(f["id"] for f in missing))
+            briefing = editor.write(
+                seed, result["findings"], charts_for_editor(charts, produced), literature,
+                directive=("Your previous draft omitted these decisive findings: "
+                           + ", ".join(f["id"] for f in missing)
+                           + ". Every decisive finding must reach the reader, cited by "
+                             "id. Carry them, or list them under a final "
+                             "'## Not carried forward' heading with your reason."))
+            missing = check_coverage(briefing, findings)
+        if missing:
+            if stats:
+                stats.bump("editor_coverage_failed")
+            logger.warning("Editor still dropped %s; appending them verbatim.",
+                           ", ".join(f["id"] for f in missing))
+            briefing = (briefing or "").rstrip() + "\n\n## Not carried forward\n\n" + "\n\n".join(
+                f"**{f['id']}** {f['claim']}\n\n{f['numbers']}" for f in missing)
+
+        # Gate 2, citations: the harness owns the label. [Sn] markers become the
+        # reference list; a marker naming nothing is dropped, and any raw link the
+        # editor wrote anyway is stripped unless the harness actually fetched it.
+        briefing = render_citations(briefing, sources)
+        before = briefing
+        briefing = strip_unverified_citations(briefing, {s["url"] for s in sources})
+        if stats and briefing != before:
+            stats.bump("citations_stripped")
+        invented = check_attributions(briefing)
+        if invented:
+            if stats:
+                stats.bump("editor_invented_attributions")
+            logger.warning("Editor attributed sources by name (%s); it was given "
+                           "titles, not author lists, so these are guesses.",
+                           ", ".join(invented[:5]))
+
+        # Gate 3, numbers: a statistic in neither the record nor the literature is
+        # either drift or invention. Warned, not silently rewritten: the technical
+        # briefing sits alongside for anyone who wants to check.
+        bad = check_numbers(briefing, result["findings"], literature)
+        if bad:
+            if stats:
+                stats.bump("editor_unsourced_numbers")
+            logger.warning("Editor briefing carries %d number(s) absent from the "
+                           "technical record: %s", len(bad), ", ".join(bad[:8]))
+
+        briefing = render_chart_markers(briefing, charts, produced)
+        if not briefing.strip():
+            logger.warning("Editor produced nothing; the technical record stands in "
+                           "as the deliverable.")
+            briefing = technical
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            for name, text in (("technical_briefing.md", technical),
+                               ("briefing.md", briefing)):
+                with open(os.path.join(output_dir, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+        except OSError as exc:
+            logger.warning("Could not write the briefing artifacts: %s", exc)
+        result["briefing"] = briefing
+        result["technical"] = technical
+        return result
+
     def _final_synthesis(final=False):
         result = synthesizer.synthesize(seed, schema_text, log, nav, final=final,
                                         prior_seeds=prior_seeds,
                                         registry_text=kernel.describe_namespace())
-        if result["verdict"] == "FINAL" and result["briefing"]:
-            charts = result.get("charts") or []
-            if charts:
-                # Post-synthesis chart pass: cheap Executor calls against the
-                # still-live namespace. The briefing ships regardless of chart
-                # fate; apply_chart_results guarantees no broken links.
-                if ui:
-                    ui.agent("Executor", executor.model)
-                produced = _render_charts(executor, kernel, charts, output_dir,
-                                          ui=ui, stats=stats)
-                result["briefing"] = apply_chart_results(result["briefing"],
-                                                         charts, produced)
-            try:
-                os.makedirs(output_dir, exist_ok=True)
-                with open(os.path.join(output_dir, "briefing.md"), "w", encoding="utf-8") as f:
-                    f.write(result["briefing"])
-            except OSError as exc:
-                logger.warning("Could not write briefing.md: %s", exc)
+        if stats and result.get("format_repaired"):
+            stats.bump("synth_format_retries")
+        if result["verdict"] == "FINAL" and result["findings"]:
+            _publish(result)
         return result
 
-    rehydrate = set()  # steps to show full next turn (requested via REHYDRATE)
+    # REHYDRATE pins (audit 5.3): step -> remaining turns of working-set
+    # residency. A listing pins the step for REHYDRATE_PIN_TURNS; re-listing
+    # refreshes. Before this, a rehydrated raw arrived for one turn and
+    # vanished unless re-requested, taxing every live decision with a request.
+    pins = {}
+    rehydrate = set()  # the currently-pinned steps, passed to decide()
     try:
-        for i in range(1, max_steps + 1):
+        # `budget` is the analysis-step budget for THIS invocation. Gate pushbacks
+        # (the G1 pre-gate and a Synthesizer NEEDS_MORE_WORK) are system-initiated
+        # turns the model did not plan for, so they no longer consume it: each
+        # pushback extends the ceiling by one, bounded by g1_pushback_budget, so a
+        # gate can never eat the model's final turn and force the ungated
+        # provisional path. Model-chosen SEARCH turns (and refused search
+        # requests) still consume budget, as documented.
+        budget = max_steps
+        i = 0
+        while i < budget:
+            i += 1
             step = step_offset + i
             registry_text = kernel.describe_namespace(names=_live_names(kernel, log))
             # Wrap-up notice only inside the final stretch of THIS invocation's
             # budget (resume/extend budgets are additional steps, so i is right).
-            steps_left = max_steps - i + 1
+            # `budget` reflects any pushback refunds, so the countdown stays honest.
+            steps_left = budget - i + 1
             budget_note = None
             if steps_left <= _budget_window(max_steps):
                 budget_note = BUDGET_WRAPUP_TEMPLATE.format(n=steps_left)
                 if stats:
                     stats.bump("budget_wrapup_notices")
+            # Once the search budget is spent, tell the model preemptively (every
+            # turn, in the uncached tail) rather than letting it burn a full
+            # premium turn on a SEARCH request the loop can only refuse.
+            search_note = (DIRECTIVE_SEARCH_SPENT
+                           if search_enabled and searches_used >= search_budget
+                           else None)
             if ui:
-                ui.iteration(step, max_steps, "ORIENTING" if i == 1 else "EXPLORING")
+                ui.iteration(step, budget, "ORIENTING" if i == 1 else "EXPLORING")
                 ui.agent("Investigator", investigator_model)
             decision = investigator.decide(seed, schema_text, registry_text, log,
                                            nav, directive=directive, rehydrate=rehydrate,
-                                           budget_note=budget_note)
-            # An empty or token-capped (truncated) turn carries no real decision.
-            # Retry it rather than letting the parser's markerless fallback finalize
-            # the run prematurely. Attempt 1 above ran at the chosen effort; a retry
-            # holds that effort but adds the think-less directive, and the FINAL retry
-            # forces reasoning off where the endpoint allows it (models that
-            # cannot disable reasoning floor to their lowest accepted rung or a
-            # plain retry; see _provider_effort),
-            # dropping the directive since 'none' is the fix rather than the nudge.
-            # Only after the retries are exhausted do we emit a provisional briefing
-            # (never end empty-handed).
+                                           budget_note=budget_note,
+                                           search_note=search_note)
+            # An empty or token-capped (truncated) turn carries no real decision, and
+            # a non-empty turn with NO ### blocks at all ("unparsed") carries one the
+            # parser cannot see. Retry either rather than letting the markerless
+            # fallback finalize the run prematurely.
+            # Truncated: attempt 1 above ran at the chosen effort; a retry holds that
+            # effort but adds the think-less directive, and the FINAL retry forces
+            # reasoning off where the endpoint allows it (models that cannot disable
+            # reasoning floor to their lowest accepted rung or a plain retry; see
+            # _provider_effort), dropping the directive since 'none' is the fix
+            # rather than the nudge.
+            # Unparsed: the model finished its turn but skipped the format, so the
+            # FORMAT directive is the fix — carried on every retry, at the chosen
+            # effort (thinking less would not help a formatting lapse).
+            # Only after the retries are exhausted do we fall through: a
+            # still-truncated turn emits a provisional briefing (never end
+            # empty-handed); a still-unparsed turn proceeds as the markerless
+            # fallback (SYNTHESIZE) through the normal gate machinery.
             inv_retry = 0
-            while decision.get("incomplete") and inv_retry < INV_TRUNCATION_RETRIES:
+            while ((decision.get("incomplete") or decision.get("unparsed"))
+                   and inv_retry < INV_TRUNCATION_RETRIES):
                 inv_retry += 1
                 last = inv_retry == INV_TRUNCATION_RETRIES
-                retry_effort = "none" if last else None  # None keeps the chosen effort
-                if last:
-                    retry_directive = directive
+                if decision.get("incomplete"):
+                    kind = "empty/truncated"
+                    retry_effort = "none" if last else None  # None keeps the chosen effort
+                    if last:
+                        retry_directive = directive
+                    else:
+                        retry_directive = (DIRECTIVE_TRUNCATED_RETRY if not directive
+                                           else directive + "\n\n" + DIRECTIVE_TRUNCATED_RETRY)
                 else:
-                    retry_directive = (DIRECTIVE_TRUNCATED_RETRY if not directive
-                                       else directive + "\n\n" + DIRECTIVE_TRUNCATED_RETRY)
-                logger.info("Step %d: Investigator turn was empty/truncated "
-                            "(retry %d/%d); reasoning_effort=%s.", step, inv_retry,
+                    kind = "unparsed (no ### blocks)"
+                    retry_effort = None
+                    retry_directive = (DIRECTIVE_FORMAT_RETRY if not directive
+                                       else directive + "\n\n" + DIRECTIVE_FORMAT_RETRY)
+                logger.info("Step %d: Investigator turn was %s "
+                            "(retry %d/%d); reasoning_effort=%s.", step, kind, inv_retry,
                             INV_TRUNCATION_RETRIES, retry_effort or investigator.reasoning_effort)
                 if ui:
-                    ui.note("Investigator turn was cut off; retrying.", "yellow")
+                    ui.note("Investigator turn was cut off; retrying."
+                            if kind == "empty/truncated"
+                            else "Investigator reply had no parseable blocks; retrying.",
+                            "yellow")
                 if stats:
-                    stats.bump("investigator_truncation_retries")
+                    stats.bump("investigator_truncation_retries"
+                               if kind == "empty/truncated"
+                               else "investigator_format_retries")
                 decision = investigator.decide(seed, schema_text, registry_text, log,
                                                nav, directive=retry_directive, rehydrate=rehydrate,
                                                budget_note=budget_note,
+                                               search_note=search_note,
                                                reasoning_effort=retry_effort)
             directive = None  # consumed (after any retries)
             if decision.get("incomplete"):
@@ -693,11 +1093,18 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                 if on_step:
                     on_step(log[-1])
                 break
-            # Steps requested this turn are shown full on the NEXT turn.
-            rehydrate = set(decision.get("rehydrate") or [])
-            if rehydrate:
-                logger.info("Step %d: Investigator requested rehydrate of steps %s.",
-                            step, sorted(rehydrate))
+            # Pin bookkeeping: decrement existing pins by one consumed decision,
+            # then (re)pin this turn's requests for REHYDRATE_PIN_TURNS. The raws
+            # arrive on the NEXT turn and stay resident until their pin expires.
+            pins = {s: n - 1 for s, n in pins.items() if n > 1}
+            requested = [int(s) for s in (decision.get("rehydrate") or [])]
+            for s in requested:
+                pins[s] = REHYDRATE_PIN_TURNS
+            if requested:
+                logger.info("Step %d: Investigator requested rehydrate of steps %s "
+                            "(pinned for %d turns).", step, sorted(set(requested)),
+                            REHYDRATE_PIN_TURNS)
+            rehydrate = set(pins)
 
             # Apply the ledger (pointer-based; a garbled block leaves the map intact).
             nav.apply_ledger_block(decision.get("ledger", ""))
@@ -717,6 +1124,7 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                 if (not compute and not nav.g1_satisfied(log) and nav.open_regimes()
                         and pushbacks < g1_pushback_budget):
                     pushbacks += 1
+                    budget += 1   # system-initiated turn: refund it (bounded by the pushback budget)
                     if stats:
                         stats.bump("g1_gate_overrides")
                     directive = DIRECTIVE_G1_GATE.format(axes=", ".join(nav.open_regimes()))
@@ -735,6 +1143,7 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                     ui.synthesis(result["verdict"], nav.g1_satisfied(log), result.get("reason"))
                 if result["verdict"] == "NEEDS_MORE_WORK" and pushbacks < g1_pushback_budget:
                     pushbacks += 1
+                    budget += 1   # system-initiated turn: refund it (bounded by the pushback budget)
                     if stats:
                         stats.bump("synth_pushbacks")
                     directive = DIRECTIVE_SYNTH_GATE.format(reason=result["reason"])
@@ -755,7 +1164,7 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                 # other nets do not cover (seen live: a malformed briefing marker
                 # parsed to an empty briefing under a FINAL verdict). Re-run once
                 # in finalization mode, which forces a briefing and salvages.
-                if result["verdict"] == "FINAL" and not result.get("briefing"):
+                if result["verdict"] == "FINAL" and not result.get("findings"):
                     logger.warning("Step %d: synthesizer returned FINAL with no "
                                    "parseable briefing; re-running in finalization "
                                    "mode to recover the deliverable.", step)
@@ -852,7 +1261,8 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                                "method from the spec text alone.", step)
                 if stats:
                     stats.bump("blind_step_references")
-            result = executor.run(spec, kernel, exec_registry, analysis_dir=analysis_dir)
+            result = executor.run(spec, kernel, exec_registry, analysis_dir=analysis_dir,
+                                  step=step)
 
             entry = {
                 "step": step, "spec": spec, "code": result["code"],
@@ -860,9 +1270,16 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
                 "attempts": result["attempts"], "thinking": decision["thinking"],
                 "leakage": leaks,
             }
+            # Attach the per-attempt audit only when it says more than the
+            # committed code/output already do (a retry happened, or the step
+            # ended in an error) — the common clean single-attempt entry stays
+            # byte-identical to before.
+            attempt_log = result.get("attempt_log") or []
+            if len(attempt_log) > 1 or result["error"]:
+                entry["attempt_log"] = attempt_log
             log.append(entry)
             _persist()
-            _write_step_artifact(analysis_dir, entry, i, max_steps)
+            _write_step_artifact(analysis_dir, entry, i, budget)
             if ui:
                 ui.executed(entry, os.path.join(analysis_dir, "analysis.md"))
             if on_step:
@@ -873,10 +1290,12 @@ def run_investigation(seed, df, client, investigator_model, executor_model,
             if periodic_every and i % periodic_every == 0:
                 snap = synthesizer.synthesize(seed, schema_text, log, nav,
                                               prior_seeds=prior_seeds)
+                if stats and snap.get("format_repaired"):
+                    stats.bump("synth_format_retries")
                 try:
                     with open(os.path.join(output_dir, f"landscape_step{step:02d}.md"),
                               "w", encoding="utf-8") as f:
-                        f.write(snap.get("briefing") or f"(NEEDS_MORE_WORK: {snap.get('reason')})")
+                        f.write(snap.get("findings") or f"(NEEDS_MORE_WORK: {snap.get('reason')})")
                 except OSError:
                     pass
                 if snap["verdict"] == "NEEDS_MORE_WORK" and snap.get("reason"):

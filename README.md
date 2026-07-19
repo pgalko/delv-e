@@ -103,9 +103,14 @@ the equivalent explicit `prompt_cache_breakpoint` markers, xAI models get a
 per-run affinity header, and every OpenRouter request carries a per-run session
 id so sticky routing keeps hitting the same cache. Cache reads and cache writes
 are both accounted (GPT-5.6 bills writes at 1.25x input; the report shows savings
-net of that premium). As evidence accumulates, older steps that no longer bear on
-an open question collapse to a pointer, the Investigator can rehydrate any of
-them, and the Synthesizer always reads the full raw evidence. Two disciplines
+net of that premium). As evidence accumulates, each step past the recent
+window becomes a permanent block (its spec, a result excerpt, and a note) that
+never changes bytes once written, so provider prefix caches keep hitting; the
+full recent material rides in a bounded working set at the tail, the
+Investigator can rehydrate any older step on demand, and the Synthesizer always
+reads the full raw evidence. Cache-read discounts vary by provider (from ~4x to
+10x off; Kimi K3's 0.30/M reads are currently the deepest), and the cost report
+shows the savings per provider. Two disciplines
 keep long runs from growing without bound: specs are written under a print
 budget (decision-sufficient prints rather than full table dumps, floats shown at
 four significant digits), and a history character budget
@@ -201,6 +206,10 @@ python run_core.py data.csv "..." \
   --investigator-model anthropic:claude-opus-4-8 \
   --executor-model ollama:kimi-k2.6:cloud
 ```
+
+Recent additions: `openrouter:moonshotai/kimi-k3` (1M context; its reasoning
+dial currently has only the max level, so delv-e omits the effort field and the
+model runs at its default).
 
 ### Reasoning effort
 
@@ -330,6 +339,20 @@ remains in `run_log.json`. To keep logs and warnings on the console, set
 | `dataio.py` | Dataset loading and schema building. |
 | `ui.py` | Terminal styling and progress output. |
 | `logger_config.py` | Logging setup. |
+
+Two directories sit beside the modules: `tests/` (the regression suite, 43
+files, run with plain `python3 tests/test_X.py`) and `eval/` (the quality
+evaluation harness — see below).
+
+## Evaluating changes
+
+The `eval/` directory measures briefing quality across named configurations
+(model setups and/or code versions): frozen question banks, repeated runs, a
+free mechanical scorer, a blinded judge, and a synthetic dataset whose correct
+answers are known exactly (so confidently wrong reports are caught, which no
+rubric can do). One command runs a matrix and prints a scorecard or an A/B
+comparison at the end. The manual, with recipes per goal, is
+[`eval/DESIGN.md`](eval/DESIGN.md).
 
 ## License
 

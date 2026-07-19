@@ -16,6 +16,34 @@ ENABLED = (sys.stdout.isatty()
            and os.environ.get("NO_COLOR") is None
            and os.environ.get("TERM") != "dumb")
 
+# Windows consoles and pipes often default to a legacy codepage (cp1252) that
+# cannot encode the banner's box glyphs or the status marks — a run launched
+# through eval/run_matrix.py on Windows crashed in banner() exactly this way.
+# Prefer reconfiguring the stream to UTF-8; where that is impossible, _SAFE
+# marks the stream as unable to carry non-ASCII and printing falls back.
+def _utf8_stream():
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    if "utf" in enc:
+        return True
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        return True
+    except (AttributeError, ValueError, OSError):
+        return False
+
+_SAFE = _utf8_stream()
+
+
+def _print(s):
+    """Print that never dies on a legacy codepage: non-encodable characters
+    degrade to '?' instead of raising UnicodeEncodeError mid-run."""
+    try:
+        print(s)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(s.encode(enc, errors="replace").decode(enc))
+
 VERSION = "0.2.0"
 TAGLINE = "Deep Exploratory Learning & Visualization Engine"
 
@@ -58,10 +86,13 @@ _LOGO = (
 
 def banner():
     print()
-    art = "\n".join("  " + ln for ln in _LOGO.split("\n"))
-    print(c(art, "white", "bold"))
+    if _SAFE:
+        art = "\n".join("  " + ln for ln in _LOGO.split("\n"))
+        _print(c(art, "white", "bold"))
+    else:
+        _print(c("  D E L V - E", "white", "bold"))
     print()
-    print("  " + c(f"{VERSION} — {TAGLINE}", "dim"))
+    _print("  " + c(f"{VERSION} - {TAGLINE}", "dim"))
     print()
 
 
@@ -114,7 +145,7 @@ def question(text):
     wrapped = textwrap.fill(body, _width() - len(indent),
                             initial_indent=indent, subsequent_indent=indent)
     # Light weight: a subtle marker, body in the terminal's default text weight.
-    print(c("  ▸ ", "cyan") + wrapped[len(indent):])
+    _print(c("  ▸ ", "cyan") + wrapped[len(indent):])
 
 
 def _truncate(s, n):
@@ -127,39 +158,39 @@ def executed(entry, artifact_path=None):
     arbitrary executor output does not reduce to a reliable one-liner."""
     err = entry.get("error")
     if err:
-        print(c(f"  ✗ failed after {entry.get('attempts','?')} attempt(s)", "red")
+        _print(c(f"  ✗ failed after {entry.get('attempts','?')} attempt(s)", "red")
               + c("  " + _truncate(str(err), 100), "dim"))
     else:
         n_lines = len((entry.get("code") or "").splitlines())
         extra = c(f" ({entry['attempts']} attempts)", "dim") if (entry.get("attempts") or 1) > 1 else ""
-        print(c(f"  ✓ {n_lines} lines, executed OK", "green") + extra)
+        _print(c(f"  ✓ {n_lines} lines, executed OK", "green") + extra)
     if artifact_path:
-        print(c(f"    📄 {artifact_path}", "dim"))
+        _print(c(f"    📄 {artifact_path}", "dim"))
 
 
 def searched(query, artifact_path=None):
     """Post-search status: the query and a pointer to the saved findings."""
-    print(c("  \U0001F50D searched: ", "cyan") + c(_truncate(query, _width() - 16), "dim"))
+    _print(c("  \U0001F50D searched: ", "cyan") + c(_truncate(query, _width() - 16), "dim"))
     if artifact_path:
-        print(c(f"    \U0001F4C4 {artifact_path}", "dim"))
+        _print(c(f"    \U0001F4C4 {artifact_path}", "dim"))
 
 
 def synthesis(verdict, g1=None, reason=None):
     if verdict == "FINAL":
-        print(c("  ◆ synthesis → FINAL", "green", "bold")
+        _print(c("  ◆ synthesis → FINAL", "green", "bold")
               + (c(f"  (G1={g1})", "dim") if g1 is not None else ""))
     else:
-        print(c("  ◆ synthesis → needs more work", "yellow", "bold")
+        _print(c("  ◆ synthesis → needs more work", "yellow", "bold")
               + (c(f"  {_truncate(reason,90)}", "dim") if reason else ""))
 
 
 def note(msg, color="blue"):
-    print(c("  • " + msg, color))
+    _print(c("  • " + msg, color))
 
 
 def done(path):
     print()
-    print(c("  ✓ briefing ready  ", "green", "bold") + c(path, "dim"))
+    _print(c("  ✓ briefing ready  ", "green", "bold") + c(path, "dim"))
 
 
 # Back-compat: run_core may still pass on_step; keep a simple summary available.

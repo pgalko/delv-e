@@ -106,18 +106,18 @@ except SystemExit as e:
     assert "different" in str(e)
 try:
     verify.check_dirs(tmp_prior, tmp_out)
-    raise AssertionError("missing briefing.md must be rejected")
+    raise AssertionError("missing technical_briefing.md must be rejected")
 except SystemExit as e:
-    assert "briefing.md" in str(e)
-with open(os.path.join(tmp_prior, "briefing.md"), "w") as f:
+    assert "technical_briefing.md" in str(e)
+with open(os.path.join(tmp_prior, "technical_briefing.md"), "w") as f:
     f.write("## Summary\nprior text\n")
 p = verify.check_dirs(tmp_prior, tmp_out)
-assert p.endswith("briefing.md")
+assert p.endswith("technical_briefing.md")
 print("check_dirs: same-dir and missing-briefing guards: OK")
 
 # ---------- reconcile: marker-remnant tolerance ----------
 
-rec = verify.reconcile(ExtractMock("###BRIEFING##\n## Summary\nmerged.\n"),
+rec = verify.reconcile(ExtractMock("###FINDINGS##\n## Summary\nmerged.\n"),
                        "m:x", "Q?", "orig", "audit")
 assert rec.startswith("## Summary"), rec[:40]
 print("reconcile: stray leading briefing marker stripped: OK")
@@ -128,17 +128,24 @@ reconciled_text = "## Summary\nmerged briefing with statuses.\n" + "y" * 300
 path, fallback = verify.finalize_verify_outputs(
     tmp_out, "ORIGINAL DOC", "AUDIT DOC", reconciled_text, ["A is 1."])
 assert not fallback
-assert open(os.path.join(tmp_out, "briefing.md")).read() == reconciled_text
-assert open(os.path.join(tmp_out, "briefing_original.md")).read() == "ORIGINAL DOC"
-assert open(os.path.join(tmp_out, "briefing_audit.md")).read() == "AUDIT DOC"
+# The reconciled ledger lands as the CORRECTED TECHNICAL RECORD, not as the
+# deliverable. A live audit merged two 9-finding ledgers into F1-F14, wrote it to
+# briefing.md, and the editorial re-render then overwrote it: five citations in the
+# deliverable resolved to nothing, and the corrected record a later --verify would
+# have to audit was never saved at all.
+assert open(os.path.join(tmp_out, "technical_briefing.md")).read() == reconciled_text
+assert open(os.path.join(tmp_out, "technical_briefing_original.md")).read() == "ORIGINAL DOC"
+assert open(os.path.join(tmp_out, "technical_briefing_audit.md")).read() == "AUDIT DOC"
+assert not os.path.exists(os.path.join(tmp_out, "briefing.md")), \
+    "briefing.md is the editorial render, written by the editor, not by reconciliation"
 assert "1. A is 1." in open(os.path.join(tmp_out, "claims.md")).read()
-print("finalize: four artifacts, reconciled briefing is the deliverable: OK")
+print("finalize: reconciled ledger IS the corrected technical record: OK")
 
 path, fallback = verify.finalize_verify_outputs(
     tmp_out, "ORIGINAL DOC", "AUDIT DOC", "  ", [])
 assert fallback
-assert open(os.path.join(tmp_out, "briefing.md")).read() == "AUDIT DOC"
-print("finalize: empty reconciliation falls back to the audit briefing: OK")
+assert open(os.path.join(tmp_out, "technical_briefing.md")).read() == "AUDIT DOC"
+print("finalize: empty reconciliation falls back to the audit record: OK")
 
 # ---------- last-run pointer resolution ----------
 
@@ -196,7 +203,11 @@ class VerifyFlowMock:
                     "print(df.groupby('g')['v'].median().to_string())\n"
                     "print('###RESULTS_END###')\n```")
         if agent == "Synthesizer":
-            return f"###VERDICT###\nFINAL\n###BRIEFING###\n{AUDIT_BRIEFING}"
+            return ("###VERDICT###\nFINAL\n###FINDINGS###\n"
+                    "F1 | decisive\nCLAIM: Claim (1) is refuted: the proper metric shows no trend.\n"
+                    "NUMBERS: slope 0.0021 (95% CI -0.0104 to 0.0146) [step 1]\nCAVEATS: none\n")
+        if agent == "Editor":
+            return AUDIT_BRIEFING
         if agent == "Reconciler":
             return ("## Summary\nReconciled: claim 1 refuted, claim 2 attenuated.\n"
                     "## Verification record\n1. refuted\n2. attenuated\n" + "z" * 220)
@@ -214,15 +225,20 @@ log, _, nav, audit_briefing = run_investigation(
     executor_model="m:c", schema_text="(s)", max_steps=5, output_dir=outdir,
     kernel=kk, nav=NavState(), stats=RunStats())
 kk.cleanup()
-assert audit_briefing.startswith("## Summary\nClaim (1) refuted")
+assert audit_briefing.startswith("## Summary\nClaim (1) refuted"), audit_briefing[:60]
+assert os.path.exists(os.path.join(outdir, "technical_briefing.md")), \
+    "the audit must leave a technical record for reconciliation to adjudicate"
+with open(os.path.join(outdir, "technical_briefing.md"), encoding="utf-8") as f:
+    _tech = f.read()
+assert "F1 | decisive" in _tech and "slope 0.0021" in _tech
 reconciled = verify.reconcile(mk, "m:x", "Original Q?", "## Summary\nprior\n",
                               audit_briefing)
 _, fb = verify.finalize_verify_outputs(outdir, "## Summary\nprior\n",
                                        audit_briefing, reconciled, claims)
 assert not fb
-final = open(os.path.join(outdir, "briefing.md")).read()
+final = open(os.path.join(outdir, "technical_briefing.md")).read()
 assert "Verification record" in final and "refuted" in final
-assert open(os.path.join(outdir, "briefing_audit.md")).read() == audit_briefing
+assert open(os.path.join(outdir, "technical_briefing_audit.md")).read() == audit_briefing
 assert set(["ClaimExtractor", "Investigator", "Executor", "Synthesizer",
             "Reconciler"]) <= set(mk.agents)
 print("end-to-end: extract -> audit run -> reconcile -> single briefing: OK")
@@ -240,7 +256,7 @@ def smoke(args, cwd):
     return (r.stdout + r.stderr).strip().splitlines()[-1]
 
 smoke_dir = tempfile.mkdtemp(prefix="delve_smoke_")
-assert "no briefing.md found" in smoke(["--verify", "/nonexistent_dir"], smoke_dir)
+assert "no technical_briefing.md found" in smoke(["--verify", "/nonexistent_dir"], smoke_dir)
 assert "no prior run recorded" in smoke(["--verify"], smoke_dir)
 os.makedirs(os.path.join(smoke_dir, "priorrun"))
 with open(os.path.join(smoke_dir, "priorrun", "briefing.md"), "w") as f:

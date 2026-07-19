@@ -57,6 +57,11 @@ of the suite still runs in a fresh clone. To run them, provide the dataset:
 - `test_gpt56_cache` — GPT-5.6 explicit caching: breakpoint emission, flatten pass-through, write-cost math pinned to a live probe
 - `test_compaction_budget` — history-budget tiered demotion: inert default, pass order, red lines
 - `test_print_discipline` — the PRINT BUDGET clause (both modes, leakage-clean) and the kernel float format
-- `test_charts` — briefing charts: CHART/SECTION/CAPTION/SPEC parsing, harness-owned placement, render-loop isolation
+- `test_namespace` — the shared mutable namespace: registry return contracts and element shapes (so a blind Executor never guesses what a persisted object contains), step-versioned aliases (`records__s6`) that survive a later rebind, ambiguity flagging on the bare name, and pinned-alias resolution in specs
+- `test_charts` — charts: CHART/FINDING/CAPTION/SPEC parsing, harness-owned placement by finding id, no broken links and no lost charts
 - `test_reasoning_floors` — per-model effort floors (glm, x-ai) and the reasoning-rejection circuit breaker
 - `test_spec_selfcontainment` — the executor-visibility spec rule (both modes), the compute persist-as-function rule, and the blind-step-reference tripwire
+- `test_search_providers` — provider-native web search: dispatch, the per-call plugin opt-in (searchless Executor/Synthesizer pin), the ollama REST path, and auto seating with the fallback chain
+- `test_provider_cost` — OpenRouter's `usage.cost` as the authoritative ledger figure: capture, absent-vs-zero, tool-fee reconciliation, unchanged fallback
+- `test_synth_audience` — the synthesis prompt contract after the split: the standard of proof governs the technical pass (and carries no audience rule), the audience standard governs the editor, reconciliation adjudicates findings, plus the permanent domain-neutrality guard and the f-string brace guard
+- `test_two_pass` — the two-pass machinery: findings parsing, the three harness gates (coverage with its retry-then-append path driven through the real loop, unsourced numbers, unverified citations), chart markers keyed on findings, and the editor's isolation from raw evidence

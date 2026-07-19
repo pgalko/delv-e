@@ -14,6 +14,7 @@ options (e.g. Ollama's reasoning_effort, chosen per agent role).
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -172,9 +173,9 @@ def _ollama_web_search(query, max_results=5):
     api_key = os.environ.get("OLLAMA_API_KEY")
     if not api_key:
         raise EnvironmentError(
-            "OLLAMA_API_KEY not found. Web search on the ollama provider uses "
-            "https://ollama.com/api/web_search; create a key at "
-            "ollama.com/settings/keys or run with --search-model none.")
+            "OLLAMA_API_KEY not set. Ollama's hosted web search "
+            "(https://ollama.com/api/web_search) needs a key from "
+            "ollama.com/settings/keys; pass --no-search to run without it.")
     resp = httpx.post("https://ollama.com/api/web_search",
                       headers={"Authorization": f"Bearer {api_key}"},
                       json={"query": query, "max_results": max_results},
@@ -209,6 +210,49 @@ def default_search_model(model):
     if provider_name == "ollama":
         return model
     return None
+
+
+def literature_search(client, seat, query, max_results=5):
+    """One literature search for the editorial pass. Returns (sources, note, error).
+
+    `sources` is a list of {title, url, content}: the harness needs them structured,
+    not as prose, because it owns the citation labels. A model asked to attribute a
+    source will invent an attribution -- a live briefing credited a preprint to
+    "Addis et al.", lifted from the author's university -- and a wrong attribution
+    on a real URL is invisible to a URL check.
+
+    On ollama the hosted endpoint returns exactly that shape, free and unbilled.
+    Other providers expose no raw-results API, so the seat answers in prose (`note`)
+    and its markdown links become the sources.
+
+    Never raises, and never swallows: a failure comes back as `error`. The ollama
+    route makes no LLM call and so leaves no row in the run log; a failure that only
+    warned would be invisible in every artifact a run produces."""
+    provider_name, _ = parse_model_string(seat or "")
+    try:
+        if provider_name == "ollama":
+            results = _ollama_web_search(query, max_results=max_results)
+            if not results:
+                return [], "", "the endpoint returned no results"
+            sources = [{"title": (r.get("title") or "").strip() or "(untitled)",
+                        "url": (r.get("url") or "").strip(),
+                        "content": (r.get("content") or "").strip()[:2000]}
+                       for r in results[:max_results] if r.get("url")]
+            return sources, "", None
+        from prompts import LITERATURE_SEARCH_TEMPLATE
+        note = client.search_call(
+            [{"role": "user", "content": LITERATURE_SEARCH_TEMPLATE.format(query=query)}],
+            seat, max_tokens=2000, agent="Literature Search", query=query) or ""
+        if not note.strip():
+            return [], "", "the search seat returned an empty answer"
+        seen, sources = set(), []
+        for title, url in re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", note):
+            if url not in seen:
+                seen.add(url)
+                sources.append({"title": title.strip(), "url": url, "content": ""})
+        return sources, note.strip(), None
+    except Exception as exc:                                   # noqa: BLE001
+        return [], "", f"{type(exc).__name__}: {exc}"
 
 
 def resolve_search_seat(investigator_model):
@@ -276,8 +320,9 @@ def _provider_effort(provider_name, effort, model=""):
     mandatory for this endpoint and cannot be disabled"); their documented dial
     is low/medium/high with HIGH as the unspecified default, so 'none' floors
     to 'low', the lowest accepted rung (omitting the field would mean MORE
-    reasoning, the opposite of the rescue's intent). Models that tolerate
-    'none' (kimi and other non-thinking executors) are unaffected."""
+    reasoning, the opposite of the rescue's intent). Kimi K2-era models tolerate
+    'none' (non-thinking executors) and are unaffected; Kimi K3 is a reasoning
+    model with a max-only dial and gets NO effort field (see below)."""
     if provider_name not in ("ollama", "openrouter"):
         return None
     if provider_name == "ollama" and "glm" in (model or ""):
@@ -292,6 +337,13 @@ def _provider_effort(provider_name, effort, model=""):
         effort = "high"   # OpenRouter route: documented enum is high/max only
     if effort == "none" and "x-ai/" in (model or ""):
         effort = "low"    # grok cannot disable reasoning; low is its bottom rung
+    if "kimi-k3" in (model or ""):
+        # Kimi K3 (2026-07) ships with ONLY the max reasoning level, which is
+        # also its default; other enum values risk rejection until Moonshot
+        # ships the promised lower levels. Omit the field so the model runs at
+        # its sole supported level. Consequence (same as glm on Ollama): the
+        # truncation ladder's "none" rescue degrades to a plain retry for K3.
+        return None
     if provider_name == "openrouter":
         return "xhigh" if effort == "max" else effort
     return effort
@@ -317,6 +369,7 @@ PRICING = {
     # OpenRouter — varies by model, add entries as needed
     # Pricing: https://openrouter.ai/models
     "moonshotai/kimi-k2.6":       {"input": 0.45, "output": 2.20},
+    "moonshotai/kimi-k3":         {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "z-ai/glm-5.2":               {"input": 1.40, "output": 4.40},
     "z-ai/glm-5.1":               {"input": 1.39, "output": 4.40},
     "deepseek/deepseek-v3.2":     {"input": 0.26, "output": 0.38},

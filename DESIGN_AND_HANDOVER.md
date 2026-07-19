@@ -22,7 +22,8 @@ runs an autonomous loop in which a strong model reasons over raw evidence and de
 to investigate, a cheap model writes and runs the pandas code, and a strong model finally
 re-derives the answer over the raw evidence and writes a briefing.
 
-**Canonical code.** The system is 13 Python modules plus a `tests/` directory. The shipped,
+**Canonical code.** The system is 13 Python modules plus a `tests/` directory and an
+`eval/` directory (the quality-evaluation harness; see 6.23 and `eval/DESIGN.md`). The shipped,
 authoritative archive is `delv-e.zip` (the complete project: the 13 modules, `tests/`, the
 docs, and the repo scaffolding). The live working copy is `/home/claude/delve/delv-e/`. The
 rebuilt system is exactly these 13 files: `kernel.py`, `investigation.py`, `nav_state.py`,
@@ -63,8 +64,11 @@ network. Validation is done two ways, both already in place:
 `test_synth_gates`, `test_budget`, `test_toolkit`, `test_verify`, `test_compute`,
 `test_compute_cli`, `test_executor_reasoning_effort`, `test_truncation_retry`,
 `test_reasoning_ladder`, `test_function_reuse`, `test_checkpoint`, `test_compute_continue`,
-`test_verify_compute`, `test_gpt56_cache`, `test_compaction_budget`,
-`test_print_discipline`. All 31 pass as of this handover.
+`test_verify_compute`, `test_gpt56_cache`, `test_compaction_budget`, `test_print_discipline`,
+`test_hardening_fixes`, `test_rollback_failclosed_charts`, `test_charts`,
+`test_prompt_dedup`, `test_spec_selfcontainment`, `test_append_only_context`,
+`test_two_pass`, `test_synth_audience`, `test_namespace`, `test_provider_cost`,
+`test_search_providers`, `test_reasoning_floors`. All 43 pass as of this handover.
 The dataset-backed tests (`test_continue`, `test_extend`, `test_search`) read their dataset from `datasets/` (or a path given via an environment variable) and skip cleanly if it is absent, so a fresh
 clone runs the rest green. See `tests/README.md`.
 
@@ -240,6 +244,12 @@ by provider; any agent can run on any provider.
 | **Executor** | cheap (Ollama) | one per CONTINUE (plus mechanical retries) | Turns the closed spec into pandas and runs it in the kernel. No reasoning about the question; just faithful translation. |
 | **Synthesizer** | premium (Anthropic) | once at finish (plus pushbacks / periodic snapshots) | Re-derives the answer over the full raw evidence, emits FINAL + briefing or NEEDS_MORE_WORK, and enforces the non-final G1 backstop. It never stores a prior conclusion as a premise, which is what lets an extension overturn an earlier finding. |
 
+**Standing configuration (as of the 2026-07 A/Bs).** glm-5.2 end-to-end is the working
+default for the tabular task family: two consecutive planted A/Bs put it at or above
+grok-4.5 as Investigator (89% vs 67% answer recovery under identical prompts), with the gap
+concentrated in false-discovery resistance. Kimi K3 (6.25) is integrated and queued as the
+next Investigator candidate, both for capability and for its 0.1x cache-read pricing.
+
 **Model wiring.** `--investigator-model`, `--executor-model`, and `--synth-model` set each
 independently; defaults fall back to a premium model for Investigator and Synthesizer and a
 cheap model for Executor. Model strings are parsed by `parse_model_string` into
@@ -408,7 +418,140 @@ one-move compliance (7 of 13 multi-part), while run 2 held both disciplines clea
 
 ---
 
+### 5.5 The planted evaluation harness (successor for change validation)
+
+The F1 GOAT seed above remains the deep-investigation benchmark, but change validation now
+runs on the `eval/` harness: frozen question banks (real seeds with judge checklists;
+synthetic seeds with exact planted answers), 1-3 named configurations per matrix, and
+composite scoring that separates answer correctness from data-hygiene trap catches. The
+full manual, including recipes and the rules that keep results valid (freeze discipline,
+judge-outside-the-pipeline, the Goodhart rule for prompt fixes), is `eval/DESIGN.md`; the
+harness's own history is 6.23-6.24.
+
 ## 6. Recent fixes and enhancements
+
+### 6.25 Kimi K3 integration (shipped, suite green; first live run pending)
+
+**Why.** Moonshot's K3 (released 2026-07-16, OpenRouter slug `moonshotai/kimi-k3` — note
+`moonshot/…` 404s) is the first Investigator-tier candidate whose cache pricing matches the
+append-only layout's design assumptions: $3/M in, $15/M out, cache reads $0.30/M (a 0.1x
+discount, against grok's 0.25x). 1M context; a reasoning model that currently exposes ONLY
+the max effort level, which is also its default.
+
+**Fix (files: `llm.py`; test: `test_reasoning_floors.py`).** `_provider_effort` returns None
+for any `kimi-k3` model on OpenRouter: the effort field is omitted entirely, because max is
+the sole supported level and other enum values risk 400s the `_reasoning_rejected` net does
+not recognize. Documented consequence (same as glm on Ollama): the truncation ladder's
+"none" rescue degrades to a plain retry. PRICING gained the K3 entry including
+`cached_input: 0.30` — without it the never-under-report fallback would bill cached reads at
+the full rate and hide exactly the economics K3 is meant to demonstrate. K2-era kimi models
+keep their passthrough behavior (pinned in the test).
+
+**Status.** Suite green with new per-effort assertions. Watch items for the first live run:
+cached-token telemetry (the append-only layout finally on its intended pricing), and
+Moonshot's own launch note about "excessive proactiveness on agent tasks" — in delv-e terms,
+iteration counts and ONE-MOVE discipline.
+
+### 6.24 Stratum-conflict and multiplicity clauses: the first eval-validated prompt fix (shipped, validated by A/B)
+
+**Why.** The planted harness (6.23) measured two systematic weaknesses across BOTH tested
+Investigators: 6/6 runs failed to conclude a genuinely-best short-career entity because they
+resolved a stratum-vs-pooled leadership conflict by total volume, and 4/6 runs asserted
+subgroup effects that were planted to be exactly zero. These are aggregation and selection
+errors, not model quirks.
+
+**Fix (files: `prompts.py`; tests: `test_prompt_dedup.py` pins).** Three surgical additions:
+two METHOD ADEQUACY bullets in the data-mode Investigator (a pooled "best" claim when the
+leader differs by stratum calls for reporting the conflict itself, never resolving it by
+totals; an extreme picked from many scanned groups calls for a selection-aware test —
+permutation over group labels, shrinkage, or a multiplicity adjustment), one G1b sentence
+(entity comparisons and rankings are effects too; stratum-dependent leadership IS the
+finding), and a findings-grade cap (a scanned-groups extreme is decisive only with a
+selection-aware check). All phrasing is dataset-agnostic by rule: the eval may only reveal
+which generic principle is missing; the prompt words must contain no information about how
+the eval detects its absence (a leaked domain token was caught and scrubbed in review, along
+with two pre-existing domain-flavored words). Ceiling raised 13,200 -> 13,900 with the
+justification in the test; the clauses are pinned in the ablation guard.
+
+**Status / evidence.** Code-A/B validated: same model, same frozen data, old vs new prompts
+moved answer recovery 67% -> 89%, with the movement exactly on the targeted metrics
+(ace_concluded 0.33 -> 0.67, null_ok 0.33 -> 1.00) and untargeted seeds flat. One post-fix
+headline is the taught behavior verbatim: "STAR highest on full-pool probability but ACE
+highest on within-era point estimates." The same A/B settled the Investigator-model question
+twice in the same direction (glm-5.2 89% vs grok-4.5 67% under identical prompts), with a
+concrete mechanism: the Synthesizer was the same glm model in both arms, so the difference
+is trajectory composition — glm ran the prescribed permutation test and an outlier
+decomposition of its own extreme (and its briefing's null cites that decomposition); grok
+substituted four correlated measurement channels of the same selection and read their
+agreement as confirmation, in one rep running a joint F-test, getting the null, and leading
+with per-group significance anyway. Standing configuration for this task family: glm-5.2
+end-to-end (~$0/run on the Ollama tier).
+
+### 6.23 The evaluation harness: planted ground truth, blinded extraction, and configuration A/Bs (shipped; see eval/DESIGN.md for the manual)
+
+**Why.** Every prompt or code change so far was validated by reading a handful of live runs —
+expensive, slow, and blind to confidently-wrong briefings. The harness makes quality
+measurable: seeds x replicates x named configurations, with three scoring tiers.
+
+**What (directory: `eval/`; data and results gitignored, the generator seed IS the freeze).**
+`run_matrix.py` runs 1-3 named configurations (name + repo + models — so the same machinery
+does code A/Bs, model A/Bs, or both), accumulates resumable cells under
+`<out>/<name>/<seed>/rep<k>/`, enforces name-as-contract provenance (models, dataset SHA
+fingerprint, seeds file, dgp version; repo paths warn-only because Dropbox mounts differ
+across machines), and auto-runs scoring, judging, recovery, and the report. Scoring tiers:
+mechanical (free: grounding of quoted numbers against computation outputs, redundancy,
+integrity events), a blinded judge (extract-only on planted seeds — one structured
+"what did this briefing conclude" line, cheap, feeds recovery and replication agreement;
+full rubric only on real seeds where no answer key exists), and planted-truth recovery
+(`planted_dgp.py` generates a deterministic synthetic dataset with exact answers: a planted
+short-career ace vs a long-career star in better cars, a re-powered era interaction, an
+exactly-zero group effect with a tempting naive spread, a reliability trend, plus data traps
+— a decoy rating column tracking car quality, a leaky career-totals column, and a fully
+duplicated season). Difficulty is planted and calibrated from both sides: every trap must
+catch naive methodology (verified: raw metrics crown the wrong entity) and release correct
+methodology (verified: the true best clears standard filters at z > 4).
+
+**Hard-won grading lessons, all now in code.** String presence is not conclusion: runs that
+crowned the wrong entity still mentioned the right one, so recovery grades ranking and
+group-null seeds from the judge's extracted headline (with bare-name matching, era-scoped
+negation handling, negative-direction claims counted, and chance-attributed namings
+exempted). The rubric judge cannot catch fluent wrongness — a confidently-wrong briefing
+scored 5/5/5 blind — which is the measured justification for the extract/rubric split and
+for treating recovery, not judged axes, as the decision metric on planted seeds. Run-to-run
+variance is real: two identical-configuration runs differed by ~11 points, so gaps under
+~15 points at reps=3 are noise. And the standing rule: skim any surprising grade against the
+briefing before quoting it — four scorer corrections came from exactly that habit.
+
+### 6.22 Post-audit hardening and the append-only context layout (shipped, validated live)
+
+**Why.** A deep audit of the live system found three robustness gaps (kernel state after a
+failed step, synthesis JSON failures silently downgraded, chart failures contaminating the
+run) and two efficiency ones (duplicated prompt furniture; the collapse-rewrite context
+model defeating prefix caching by design).
+
+**Fixes.** (1) Kernel: failed steps roll back transactionally to the pre-step checkpoint
+(including a df-in-checkpoint bug found while testing), and the retry template says
+"ROLLED BACK" truthfully instead of describing state that no longer exists. (2) Synthesis:
+fail-closed on unparseable output with a format-repair pass, never a silent downgrade.
+(3) Charts: rendered with commit=False and a fail-closed manifest, so a chart error cannot
+dirty kernel state or the evidence record. (4) Prompt de-dup: bare nav headers, estimand
+instructions ride turn 0 only, SPEC CONTRACT merged, honest collapse wording. (5) The
+append-only layout: past the recent window each step becomes one permanent block (full SPEC,
+verbatim result excerpt, note) that never changes bytes once written; volatile material
+(full raws of recents, protected, pinned) rides in a working set at the tail under its own
+budget; REHYDRATE pins for three turns; the registry slims to newest-25 descriptions.
+The prefix is a pure function of the log, so provider prefix caches hit monotonically —
+byte-level lcp analysis on live runs proved the prefix stable while the old layout's
+collapse rewrites reset it almost every turn. Economics measured honestly: on xAI's shallow
+0.25x discount the new layout does not beat the old one's accidental 44% implicit-cache
+floor at heavy raw regimes (the working set dominates); the design is correct and the
+provider pricing is the artifact — which is what makes 6.25 the natural test. Knobs in
+`investigation.py`: HISTORY_CHAR_BUDGET 90K (fold backstop), WORKING_SET_CHAR_BUDGET 30K,
+PROTECTED_SLIM_CEILING 2,000 (was 4,000), RESULT_EXCERPT keep-whole 680 / head 250 / tail
+120. Tests: `test_hardening_fixes`, `test_rollback_failclosed_charts`, `test_prompt_dedup`,
+`test_append_only_context`, `test_compaction_budget` (rewritten for the fold and working-set
+trim).
+
 
 This section is the most useful for picking up where we left off. Items are newest first.
 
@@ -420,7 +563,7 @@ This section is the most useful for picking up where we left off. Items are newe
 
 **Status.** Suite 31 files green. Validated on three live runs of the F1 seed. Median step stdout fell 17,991 to 2,766 chars (max 37,663 to 7,189); over-precise floats 2,098 to 25; the late-run prompt 136K to 58K chars, with input flat at 20-21K tokens from turn 12 of a 19-turn run; the Synthesizer's full-history feed (11 steps) fit in 21K tokens; zero REHYDRATE requests (the under-printing signal never fired) and zero empty completions; complete-run cost $0.43-0.67 against $1.22 for the pre-change heavy run. The history budget (6.20) never engaged at this step weight, which is the intended end state: a backstop. Watch item: top-and-bottom-k sorted views may lean ranking-flavored briefings toward outlier headlines; across three F1 runs the conclusions stayed coherent (the pooled-modern and era-local lenses of one answer), but if the lean recurs, the clause gains a line asking for the CI-overlap summary alongside rankings.
 
-### 6.20 History-budget compaction: tiered demotion with an inert default (shipped, verified live)
+### 6.20 History-budget compaction: tiered demotion with an inert default (shipped, verified live; steady-state layout since reworked by 6.22 — the 90K budget survives as the fold backstop)
 
 **Why.** Same-seed runs vary in length, and every marginal turn is the priciest of the run: per-turn cost rose about 3x from turn 3 to turn 16 on measured heavy runs because the prompt floor grows with depth (full residents near the 20K ceiling, a ~1.9K-char headline per collapsed step forever, an 11-18K-char volatile tail). Compaction itself was verified healthy against those runs (collapse counts climbing, residents capped, the modules hash-identical to baseline); the issue was that the floor it compacts to rises with every completed step.
 
@@ -765,6 +908,18 @@ Pre-GitHub work, shipped together.
   F1 runs stayed coherent (the pooled-modern and era-local lenses of one answer), but if the lean
   recurs on other ranking seeds, add a clause line asking for the CI-overlap summary alongside
   any ranking print.
+- **Synced folders resurrect deleted results.** Dropbox restored byte-identical stale result
+  cells into a results tree after a partial delete, and two uploads of "new" results were the
+  same bytes twice. The runner's provenance guard (dataset SHA, dgp version) now refuses
+  forward mixing, but the human-side rule stands: after deleting cells in a synced tree, let
+  the sync settle and verify with hashes, never with folder names or timestamps; and never
+  run both machines into the same results tree concurrently.
+- **Eval-driven prompt fixes must pass the Goodhart rule.** When the harness reveals a
+  weakness, the fix's wording may contain no information about how the eval detects that
+  weakness (no dataset vocabulary, no trap names — one leaked token was caught in review).
+  The test of a good clause: a statistics reviewer with no knowledge of the eval would
+  endorse it for any dataset. Fixes that fail this test measure prompt-recognition, not
+  reasoning, and burn the eval for future use.
 
 ## Appendix A: Path map
 

@@ -25,83 +25,83 @@ assert "n/a" in SYNTHESIZER_SYSTEM, "legend must allow n/a for generality"
 print("legend: GATES block present with n/a option: OK")
 
 # ---------- shape 1: canonical three-block output ----------
-out = f"###GATES###\n{GATES}\n###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nClear effect.\n"
+out = f"###GATES###\n{GATES}\n###VERDICT###\nFINAL\n###FINDINGS###\n## Summary\nClear effect.\n"
 r = _parse_synth(out)
-assert r["verdict"] == "FINAL" and r["briefing"].startswith("## Summary")
+assert r["verdict"] == "FINAL" and r["findings"].startswith("## Summary")
 assert r["gates_review"] == GATES, "gates text must be extracted verbatim"
-assert "G1:" not in r["briefing"], "gates must not leak into the briefing"
+assert "G1:" not in r["findings"], "gates must not leak into the briefing"
 print("shape 1 (gates before verdict): OK")
 
 # ---------- shape 2: legacy two-block output (weak model forgets the gates) ----------
-r = _parse_synth("###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nok.\n")
+r = _parse_synth("###VERDICT###\nFINAL\n###FINDINGS###\n## Summary\nok.\n")
 assert r["verdict"] == "FINAL" and r["gates_review"] == ""
 print("shape 2 (gates absent, tolerated): OK")
 
 # ---------- shape 3: gates AFTER the briefing (misplaced) ----------
-out3 = f"###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nok.\n###GATES###\n{GATES}\n"
+out3 = f"###VERDICT###\nFINAL\n###FINDINGS###\n## Summary\nok.\n###GATES###\n{GATES}\n"
 r = _parse_synth(out3)
-assert r["briefing"].strip() == "## Summary\nok.", "briefing must stop at the GATES marker"
+assert r["findings"].strip() == "## Summary\nok.", "findings block must stop at the GATES marker"
 assert r["gates_review"] == GATES
 print("shape 3 (gates misplaced after briefing): OK")
 
 # ---------- shape 4: gated pushback with gates ----------
 out4 = (f"###GATES###\nG1: fail - no regime examined within levels\n"
         "###VERDICT###\nNEEDS_MORE_WORK: estimate the effect within era levels\n"
-        "###BRIEFING###\nnone\n")
+        "###FINDINGS###\nnone\n")
 r = _parse_synth(out4)
 assert r["verdict"] == "NEEDS_MORE_WORK" and "era" in r["reason"]
-assert r["briefing"] == "" and "fail" in r["gates_review"]
+assert r["findings"] == "" and "fail" in r["gates_review"]
 print("shape 4 (failed gate + pushback): OK")
 
 # ---------- shape 5: the LIVE failure: briefing marker one hash short ----------
-# A real glm run emitted "###BRIEFING##" (two trailing hashes); the exact-match
+# A real glm run emitted "###FINDINGS##" (two trailing hashes); the exact-match
 # parser silently dropped a complete ~6,900-char briefing under a FINAL verdict.
 out5 = (f"###GATES###\n{GATES}\n###VERDICT###\nFINAL\n"
-        "###BRIEFING##\n## Summary\nVerstappen leads, bounded below by the "
+        "###FINDINGS##\n## Summary\nVerstappen leads, bounded below by the "
         "non-dominant-car margin.\n\n## Method notes\n- Pace covers ~59% of entries.\n")
 r = _parse_synth(out5)
 assert r["verdict"] == "FINAL", r["verdict"]
-assert r["briefing"].startswith("## Summary"), r["briefing"][:60]
-assert "Method notes" in r["briefing"], "full briefing must survive the malformed marker"
+assert r["findings"].startswith("## Summary"), r["findings"][:60]
+assert "Method notes" in r["findings"], "full findings block must survive the malformed marker"
 assert r["gates_review"] == GATES
 print("shape 5 (live trailing-hash malformation, briefing recovered): OK")
 
 # ---------- shape 6: zero trailing hashes ----------
-out6 = "###VERDICT###\nFINAL\n###BRIEFING\n## Summary\nok.\n"
+out6 = "###VERDICT###\nFINAL\n###FINDINGS\n## Summary\nok.\n"
 r = _parse_synth(out6)
-assert r["verdict"] == "FINAL" and r["briefing"].startswith("## Summary")
+assert r["verdict"] == "FINAL" and r["findings"].startswith("## Summary")
 print("shape 6 (zero trailing hashes): OK")
 
 # ---------- shape 7: leading-malformed marker, salvage path ----------
-out7 = "###VERDICT###\nFINAL\n##BRIEFING###\n## Summary\nstill recovered.\n"
+out7 = "###VERDICT###\nFINAL\n##FINDINGS###\n## Summary\nstill recovered.\n"
 r = _parse_synth(out7)
-assert r["briefing"].startswith("## Summary"), r["briefing"][:60]
+assert r["findings"].startswith("## Summary"), r["findings"][:60]
 print("shape 7 (leading-malformed marker, salvaged): OK")
 
 # ---------- shape 8: malformed marker + 'none' must NOT resurrect a briefing ----------
-out8 = "###VERDICT###\nNEEDS_MORE_WORK: stratify by era\n###BRIEFING##\nnone\n"
+out8 = "###VERDICT###\nNEEDS_MORE_WORK: stratify by era\n###FINDINGS##\nnone\n"
 r = _parse_synth(out8)
-assert r["verdict"] == "NEEDS_MORE_WORK" and r["briefing"] == ""
+assert r["verdict"] == "NEEDS_MORE_WORK" and r["findings"] == ""
 print("shape 8 (malformed marker + none stays empty): OK")
 
 # ---------- shape 9: the LIVE mtbuller failure: ### subsections inside the briefing ----------
-out9 = (f"###GATES###\n{GATES}\n###VERDICT###\nFINAL\n###BRIEFING###\n"
+out9 = (f"###GATES###\n{GATES}\n###VERDICT###\nFINAL\n###FINDINGS###\n"
         "## Summary\nThe gate is sharp.\n\n## What the data can answer\n"
         "### Conversion threshold (Steps 2, 3)\nLogistic fit details here.\n"
         "### Regime change (Steps 5, 6)\nTail loss details here.\n"
         "## Method notes\n- clustered.\n")
 r = _parse_synth(out9)
 assert r["verdict"] == "FINAL"
-assert "Conversion threshold" in r["briefing"], "### subsections must not truncate the briefing"
-assert "Tail loss details" in r["briefing"] and "Method notes" in r["briefing"]
+assert "Conversion threshold" in r["findings"], "### subsections must not truncate the briefing"
+assert "Tail loss details" in r["findings"] and "Method notes" in r["findings"]
 print("shape 9 (### subsections inside briefing survive): OK")
 
 # ---------- shape 10: named markers still terminate (misplaced gates after briefing) ----------
-out10 = ("###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nbody\n"
+out10 = ("###VERDICT###\nFINAL\n###FINDINGS###\n## Summary\nbody\n"
          "### Detail subsection\nmore body\n###GATES###\nG1: pass - x\n")
 r = _parse_synth(out10)
-assert "Detail subsection" in r["briefing"] and "more body" in r["briefing"]
-assert "G1: pass" not in r["briefing"], "named GATES marker must still terminate the briefing"
+assert "Detail subsection" in r["findings"] and "more body" in r["findings"]
+assert "G1: pass" not in r["findings"], "named GATES marker must still terminate the briefing"
 assert "G1: pass - x" in r["gates_review"]
 print("shape 10 (named markers terminate, subsections do not): OK")
 
@@ -112,8 +112,8 @@ from llm import RunStats
 import tempfile
 
 EMPTY_FINAL = ("###GATES###\nG1: pass - regime examined\n"
-               "###VERDICT###\nFINAL\n###BRIEFING###\nnone\n")
-GOOD_FINAL = ("###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\n"
+               "###VERDICT###\nFINAL\n###FINDINGS###\nnone\n")
+GOOD_FINAL = ("###VERDICT###\nFINAL\n###FINDINGS###\n## Summary\n"
               "Recovered on the finalization retry.\n")
 
 class LoopMock:
@@ -153,7 +153,7 @@ log2, _, nav2, briefing2 = run_investigation(
     stats=statsk)
 kk.cleanup()
 assert mk.synth_calls == 2, f"expected a finalization retry, got {mk.synth_calls} synth calls"
-assert briefing2 and "Recovered" in briefing2, "the retry's briefing must be the deliverable"
+assert briefing2 and "Recovered" in briefing2, "the retry's findings block must be the deliverable"
 assert statsk.get("synth_briefing_retries") == 1, statsk.as_dict()
 term = [e for e in log2 if e.get("terminal")]
 assert term and term[-1]["synth_verdict"] == "FINAL"

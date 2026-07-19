@@ -26,7 +26,7 @@ def inv(t,s,sp,l): return f"###THINKING###\n{t}\n###STATUS###\n{s}\n###SPEC###\n
 def code(b): return "```python\n"+b+"\n```"
 LED = "FRONTIER | f1 | in_progress | steps: 1\nREGIME | g | not_examined | steps: -"
 EXEC = {1: code("print('###RESULTS_START###')\nprint(df.groupby('g')['v'].median().to_string())\nprint('###RESULTS_END###')")}
-SYNTH = "Reasoning.\n###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nEffect is positive.\n"
+SYNTH = "Reasoning.\n###VERDICT###\nFINAL\n###FINDINGS###\n## Summary\nEffect is positive.\n"
 
 class Mock:
     def __init__(s, inv_seq): s.inv_seq=inv_seq; s.inv_calls=0; s.e=0

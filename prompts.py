@@ -38,39 +38,39 @@ When the data has a recognized structure, name the standard estimator for it bef
 - paired or grouped comparisons (each unit measured against others in the same block) call for a paired-comparison or grouped model; averaging raw deltas discards who was compared with whom;
 - clustered or repeated rows (many from one unit, group, or occasion) call for accounting for the clustering; treating them as independent understates uncertainty;
 - a "best", "top", or "outlier" claim calls for uncertainty computed before the claim: an interval, a rank range, or a probability of being first;
+- a "best" claim pooled ACROSS strata, when the leader DIFFERS by stratum, calls for reporting the conflict itself, never resolving it by totals: exposure differences make pooled comparisons composition effects, and a short strong record can beat a long good one;
+- an extreme picked from MANY scanned groups (the best or worst site, category, or cohort) calls for a selection-aware test (permutation over group labels, shrinkage, or a multiplicity adjustment): the most extreme of K noisy group means is expected by chance, especially when groups are small;
 - ANY quantity you will hand over as the answer (an estimate, a rate, a ratio, a probability, a threshold, a bound) calls for a stated uncertainty, computed before you report it. Agreement across specifications is not an interval: it tells you an estimate barely moves when you change the recipe, not how precisely it is known, and a bound whose width you never measured is not a bound. When rows repeat within units, cluster_bootstrap over that unit is the honest default.
 Prefer the richer estimator when the structure calls for it; fall back to a proxy only when you can say why it does not change the answer.
 
 TOOLKIT
 Three vetted, tested functions are preloaded in the executor's namespace; scipy and statsmodels are also installed. When the structure named under METHOD ADEQUACY matches one, spec a call to it with concrete arguments instead of describing the algorithm. A call counts as one move. They are available, never mandatory; choosing the estimator from the structure stays your job.
 - paired_ability(df, a_col, b_col, margin_col=None, win_col=None, weight_col=None, ref=None): ability model over rows of A-vs-B contests. win_col (1 means A won, 0 B won, 0.5 a tie) gives a Bradley-Terry fit; margin_col (A minus B, continuous) gives a network-adjusted linear fit. Returns one row per entity: ability, se, ci_low, ci_high, n_contests, relative to the reference entity. Graph connectivity and anchoring are handled inside.
-- cluster_bootstrap(df, cluster_col, stat_fn, n_boot=2000, seed=0): resamples whole clusters for honest intervals when rows repeat within units (subjects, sites, seasons). stat_fn maps a dataframe to a number or to a per-entity Series. Returns a dict (exact keys below). When observations share a grouping axis (the same season, subject, site, or repeated unit), uncertainty for any quantity that is constant within groups or pooled across them must respect that grouping: use cluster_bootstrap with that axis as cluster_col, or a cluster-robust model, rather than treating pooled rows as independent.
+- cluster_bootstrap(df, cluster_col, stat_fn, n_boot=2000, seed=0): resamples whole clusters for honest intervals when rows repeat within units (subjects, sites, years). stat_fn maps a dataframe to a number or to a per-entity Series. Returns a dict (exact keys below). When observations share a grouping axis (the same year, subject, site, or repeated unit), uncertainty for any quantity that is constant within groups or pooled across them must respect that grouping: use cluster_bootstrap with that axis as cluster_col, or a cluster-robust model, rather than treating pooled rows as independent.
 - rank_uncertainty(estimates=..., est_col=..., se_col=..., entity_col=..., higher_is_better=True) or rank_uncertainty(draws=...): turns estimates plus standard errors, or bootstrap draws (cluster_bootstrap's draws fits directly), into P(rank 1) and a rank interval per entity. Run it before any "best", "top", or "outlier" claim. P(rank 1) is relative to the pool you pass: low-evidence entities with large se dominate the rank-1 draws and mask the real leaders, so name a minimum-evidence threshold and filter the pool before ranking, unless ranking a mixed-evidence pool is itself the question.
 Their outputs use EXACT column names. paired_ability: entity, ability, se, ci_low, ci_high, n_contests (the reference row is the anchor: ability 0, se 0; feed it to rank_uncertainty as-is). rank_uncertainty: entity, estimate, p_rank1, rank_median, rank_ci_low, rank_ci_high, n_draws. cluster_bootstrap returns a dict with keys estimate, ci_low, ci_high, ci_level, n_clusters, n_boot_used, n_failed, draws, warning. In specs, reference these outputs by their exact names (e.g. "sorted by p_rank1 descending"), never by a description of a column.
 For standard models beyond these (mixed or hierarchical models, cluster-robust regression, classical or permutation tests), spec the statsmodels or scipy call by name rather than describing the algorithm.
 When combining several measures into one composite score, first check whether every entity is observed on every component; under asymmetric coverage, restrict the comparison to common coverage or normalize each entity over its observed components, and print which was done.
 
-SPECIFYING A STEP (the closure rule)
-The executor is a junior coder with NO analytical latitude. Every analytical decision must already be made by YOU and written into the spec. Write the spec in words, never as runnable code. Describe what to compute (the columns, filters, grouping, statistics, and what to print) and let the executor write the Python. If you include a code block you have done the executor's job and broken the tier separation. A valid spec:
+SPEC CONTRACT (the closure rule — what a spec must contain, and what the executor can see)
+The executor is a junior coder with NO analytical latitude, and it reads NOTHING but your spec plus the registry objects your spec names — never prior steps, prior specs, or prior code. Every analytical decision is made by YOU and written into the spec, in words, never as runnable code; a code block does the executor's job and breaks the tier separation. A valid spec:
 - names every column it touches, by exact name;
 - gives every filter as a literal boolean condition on named columns;
 - gives the exact operation (groupby keys + aggregation, or the named statistical test with its inputs);
-- references prior derived objects/columns by their registry name;
+- references prior derived objects/columns by their registry NAME — "the model of step 1" is unresolvable to the executor even though that step sits in YOUR context, so never reference a prior step's model, method, or code by step number: either call a named registry function with the parameters you want, or restate the full mechanism inside the spec;
 - pins the output shape (what to print).
+Any mechanism you will re-run or vary should FIRST be specced as a named function and persisted; later steps then vary its parameters as one-line calls by registry name, keeping every variant mechanically identical instead of re-stated and accidentally changed.
 Never hand down a choice. Banned in a spec: appropriate, best, robust, handle, clean, reasonable, meaningful, optimal, sensible, "if it looks like". If a step would need a judgment partway through (e.g. how to treat outliers, which aggregation), do NOT delegate it — split it: ask for the diagnostic first, read the raw result, decide yourself, then specify the next step.
 
-SELF-CONTAINMENT (what the executor can see). The executor reads NOTHING but your spec and the registry objects your spec names; it never sees prior steps, prior specs, or prior code. A reference like "the model of step 1" is unresolvable to it, even though that step sits in full in YOUR context. Never reference a prior step's model, method, or code by step number. Either call a NAMED registry function with the parameters you want, or restate the full mechanism inside the spec. If the computation you want to vary is not in the registry as a callable, first spec a step that defines it as a named function and persists it; later steps then vary its parameters by name.
-
-PRINT BUDGET (the context cost of a print). Every character a step prints returns to you in your own context next turn, and full table dumps bury the signal you need under rows you will never read. Specify decision-sufficient prints, not listings: for ranked or per-group results, the top and bottom rows (10 or fewer each side), the row counts, and the summary statistics; for relationships, the correlations, test statistics, and shapes rather than every row. Derived objects persist in the namespace, so a later one-line step can print any exact slice by name if a decision turns on it. Ask for a complete listing only when the decision depends on seeing every row.
+PRINT BUDGET (the context cost of a print). Every character a step prints rides your context for MULTIPLE turns — a raw stays fully resident while it is recent or feeds a live thread, so a full-table dump is paid again on every turn it survives and buries the signal under rows you will never read. Specify decision-sufficient prints, not listings: for ranked or per-group results, the top and bottom rows (10 or fewer each side), row counts, and summary statistics; for relationships, the correlations, test statistics, and shapes rather than every row. Keep a step's printed output under ~2,000 characters unless the decision genuinely depends on seeing every row — derived objects persist in the namespace, so a later one-line step can print any exact slice by name the moment a decision turns on it.
 
 ONE MOVE PER SPEC. A spec computes exactly one analytical move (one transformation, aggregation, model fit, or inspection) plus the prints that show its result, even when every part is fully specified and needs no judgment. Chaining several computations in one spec is the most common way a strong plan still fails here, because the executor must build a whole pipeline at once and you never see an intermediate result before the next move depends on it. For example:
 - Wrong, one spec: "standardize the metric within each group; regress it on covariates A and B and take residuals; rank units by residual and print the top 20." That is three moves.
 - Right, three specs: (1) standardize within group, print the distribution; (2) regress on A and B, print the fit and save the residuals; (3) rank by residual, print the top 20. You read each result before specifying the next.
-A single move may be long and detailed, with its own sanity checks and several prints of that one result. What to split out is a second independent analysis; derived objects persist by registry name, so later steps reuse earlier ones.
+A single move may be long and detailed, with its own sanity checks and several prints of that one result. What to split out is a second independent analysis.
 
 OUTPUT FORMAT. Emit these blocks (THINKING, STATUS, SPEC, LEDGER every turn; ESTIMAND on the first step; REHYDRATE only when needed):
-###ESTIMAND### (first step only; it is then pinned and shown back to you every turn)
-Name the TARGET ESTIMAND: the question the seed asks you to answer, stated faithfully and at the level that will not change as you learn more, namely what is being related to what, for whom, and under what conditions (if any). Stay close to what the seed actually asks and do not narrow, restructure, or pre-commit it beyond what it states. When the seed asks you to discover or identify which factors, dimensions, or causes matter, that discovery is itself the target: do not enumerate candidate factors the seed did not name; candidates belong on the FRONTIER, not in the estimand. A few sentences, no analysis yet. What is pinned is this question; you stay free to refine HOW you estimate it (the operationalization, the proxy, the comparison you run) as evidence comes in, but keep the primary answer aimed at this same question and do not let a related or intermediate quantity quietly stand in for it. If a confound threatens the estimand, prefer matching or stratifying on it over discarding the data the estimand depends on; dropping the only data that covers part of the question forecloses the answer.
+###ESTIMAND### (first step only — the full instructions arrive with the first turn's task; once emitted, the estimand is pinned and shown back to you every turn)
 ###THINKING###
 Your holistic reasoning. On every turn after the first, first integrate the latest RAW result (what it means, how it updates your understanding, what it rules in/out, what new question it raises). Track where the answer holds and where it breaks. Be explicit about the shape of the answer.
 ###STATUS###
@@ -88,7 +88,7 @@ The navigational map, restated in full each turn as terse pointer lines (handles
   BREAKDOWN:
     <where/condition> [holds|thin|blocked|unrecoverable] steps:<ids or -> — why: <terse reason, no numbers>
 ###REHYDRATE### (optional)
-On long runs, OLDER steps that feed only closed threads are shown COLLAPSED — their SPEC plus a pointer, with the raw numbers removed to keep your context focused. Their findings remain in this ledger. If you need a collapsed step's EXACT numbers back to make a decision, list its step number(s) here (e.g. "6, 9") and the full raw will return next turn. Omit this block if you don't need anything rehydrated. Recent steps and steps feeding live (untested/in_progress) frontier items or open risks are never collapsed, so you always have full raw for what you are actively working on.
+OLDER steps leave the working set and are ARCHIVED: their SPEC, a verbatim excerpt of the result, and your note at the time stay resident, but the COMPLETE raw is NOT resident — it stays on disk, and the map holds only status pointers, never findings. If a decision needs an archived step's complete raw (the excerpt shows when output was omitted), list its step number(s) here (e.g. "6, 9"); the full raw returns next turn and stays in the working set for 3 turns (re-list to keep it longer). Do not proceed on a recollection of numbers you can no longer see. Omit this block otherwise. Recent steps and steps feeding live (untested/in_progress) frontier items or open risks keep their full raw in the working set automatically.
 Ledger rules:
 - FRONTIER must always include the framings you have NOT yet tried (status untested) — that is the adjacent possible and the reason this system exists. Do not drop them once added.
 - REGIME = a stratification axis along which you ESTIMATE THE EFFECT WITHIN EACH LEVEL to test whether its shape varies. Controlling a variable as a confounder (e.g. restricting to a single one of its values) is NOT examining a regime. Per G1, at least one REGIME must be examined or partial before STATUS can be SYNTHESIZE or before you call the effect null/uniform.
@@ -101,7 +101,7 @@ INVESTIGATOR_HEAD_TEMPLATE = """SEED QUESTION:
 DATASET SCHEMA (df is preloaded):
 {schema}
 
-INVESTIGATION SO FAR (each completed step is a separate block below; the latest is last):"""
+INVESTIGATION SO FAR (chronological; older steps appear below in ARCHIVED form — their spec, a verbatim excerpt of the result, and your note at the time; the FULL raws of recent and live-thread steps follow in the CURRENT WORKING SET near the end of this message):"""
 
 INVESTIGATOR_TAIL_TEMPLATE = """CURRENT NAMESPACE REGISTRY (objects already built — reference by name, do not rebuild):
 {registry}
@@ -109,7 +109,35 @@ INVESTIGATOR_TAIL_TEMPLATE = """CURRENT NAMESPACE REGISTRY (objects already buil
 NAVIGATIONAL MAP (your maintained landscape — pursue untested frontier items; mind G1 on the regime ledger):
 {nav}
 
-Decide the next move. If this is step 1, orient yourself, name the TARGET ESTIMAND (the question the seed asks), seed the FRONTIER with the plausible framings (including the ones you have not yet tried), and specify the first analysis. Otherwise integrate the latest RAW result in the history above, update the ledger, then decide."""
+{task}"""
+
+# The tail's closing task, branched by turn. The tail is volatile and uncached,
+# so this branching is free cache-wise; the ~1,000-char ESTIMAND instructions
+# ride ONLY the turn that emits the estimand instead of every turn's context
+# (audit 4.2 — do NOT move per-turn variation into the HEAD, which is cached
+# block 0 and must stay byte-stable). The branch keys on the estimand being
+# unpinned rather than on the step number, so a first turn whose ESTIMAND
+# block failed to parse sees the instructions again until one pins.
+INVESTIGATOR_TASK_FIRST = """Decide the first move: orient yourself, seed the FRONTIER with the plausible framings (including the ones you have not yet tried), name the TARGET ESTIMAND in your ###ESTIMAND### block, and specify the first analysis.
+
+ESTIMAND INSTRUCTIONS (this turn only — the estimand is then pinned and shown back to you every turn):
+{estimand_note}"""
+
+INVESTIGATOR_TASK_LATER = ("Integrate the latest RAW result in the CURRENT WORKING "
+                           "SET above, update the ledger, then decide the next move.")
+
+# Heads the volatile working-set section (audit 5.2): the FULL raws of recent,
+# live-thread, and rehydrated steps ride here, in the uncached tail, so the
+# cached prefix above never rewrites. Rendered only when the set is non-empty.
+WORKING_SET_HEADER = ("CURRENT WORKING SET (the FULL raws you are actively working "
+                      "with: recent steps, steps feeding live threads, and rehydrated "
+                      "steps; older steps are archived above in permanent form):")
+
+# Moved out of the permanent system prompt (audit 4.2): single-use rules that
+# were a permanent resident of every turn's context. Wording preserved verbatim.
+ESTIMAND_NOTE_DATA = """Name the TARGET ESTIMAND: the question the seed asks you to answer, stated faithfully and at the level that will not change as you learn more, namely what is being related to what, for whom, and under what conditions (if any). Stay close to what the seed actually asks and do not narrow, restructure, or pre-commit it beyond what it states. When the seed asks you to discover or identify which factors, dimensions, or causes matter, that discovery is itself the target: do not enumerate candidate factors the seed did not name; candidates belong on the FRONTIER, not in the estimand. A few sentences, no analysis yet. What is pinned is this question; you stay free to refine HOW you estimate it (the operationalization, the proxy, the comparison you run) as evidence comes in, but keep the primary answer aimed at this same question and do not let a related or intermediate quantity quietly stand in for it. If a confound threatens the estimand, prefer matching or stratifying on it over discarding the data the estimand depends on; dropping the only data that covers part of the question forecloses the answer."""
+
+ESTIMAND_NOTE_COMPUTE = """Name the TARGET ESTIMAND: the quantity the seed asks you to compute, stated faithfully and at the level that will not change as you learn more, namely what is being computed, under what model, and for what parameters (if fixed). Stay close to what the seed actually asks and do not narrow or restructure it. When the seed asks you to discover which conditions or parameters matter, that discovery is itself the target: do not enumerate candidates the seed did not name; candidates belong on the FRONTIER. A few sentences, no computation yet. What is pinned is this quantity; you stay free to refine HOW you estimate it (the method, the variance reduction, the tolerance) as evidence comes in, but keep the primary answer aimed at this same quantity."""
 
 
 # ====================================================================
@@ -147,7 +175,7 @@ EXECUTOR_RETRY_TEMPLATE = """The code raised an error:
 
 {traceback}
 
-Fix it and return the corrected complete code. The namespace was preserved — objects that were successfully created before the error still exist. Return ONLY a ```python``` code block."""
+The failed attempt was ROLLED BACK: the namespace is exactly as it was before this step, so any objects your failed code created no longer exist and any in-place mutations (dropped columns, overwritten values) were undone. Fix the error and return the corrected COMPLETE code for the whole spec — it must recreate anything the failed attempt made. Objects from PRIOR successful steps still exist (see the registry). Return ONLY a ```python``` code block."""
 
 
 # Sent when the executor returns no code block (usually reasoning-token truncation).
@@ -163,8 +191,10 @@ EXECUTOR_TRUNCATION_RETRY = (
 # Synthesizer
 # ====================================================================
 
-SCIENTIFIC_GENERALIST_BRIEFING_STANDARD = """
-
+# The technical pass answers to this and nothing else. It is not an audience
+# rule and does not relax when the register softens; the editor is held to it
+# too, at one remove, because it may not introduce a claim of its own.
+STANDARD_OF_PROOF = """
 THE STANDARD OF PROOF
 Every sentence you write is a claim, and a claim belongs in the briefing only when the evidence would be unlikely to look as it does if the claim were false. Apply that test to each one before you write it.
 - Name the number the claim rests on. A sentence with no number behind it is narration, not evidence: cut it, or mark it plainly as your reading rather than a finding.
@@ -182,8 +212,12 @@ The test cuts both ways. A finding the evidence does license belongs in the brie
 A quantity you cannot clean is still worth reporting, provided you label it for what it is: name what it mixes together and say plainly that it is not the estimand. Withholding it serves rigour no better than reporting it unlabelled, and it leaves the reader with nothing where the evidence had something.
 
 A specialist reading the raw evidence should find no sentence here they would strike out. Writing plainly changes the words available to you, never that standard: when the honest finding is complicated, state it plainly and in full rather than neatly and in part.
+"""
 
 
+# The editor answers to this. Kept apart from the standard of proof on purpose:
+# one model asked to satisfy both at once is what smoothed findings away.
+AUDIENCE_STANDARD = """
 AUDIENCE AND WRITING STANDARD
 Write for scientific generalists: readers who understand evidence, uncertainty, and the scientific method, but may not have specialist training in statistics, mathematics, or data science. They are sophisticated readers, not beginners. Preserve the full analytical substance while removing unnecessary technical friction.
 
@@ -203,7 +237,7 @@ Translate without diluting:
 - Do not patronize the reader by explaining elementary scientific ideas. Explain only the concept needed to understand this result.
 - Explain each important limitation by how it could change the conclusion, not as a list of missing variables.
 - Make open questions actionable: name the evidence or analysis that would resolve each one, and what part of the answer it could change.
-- Keep step references at the ends of the relevant sentences or paragraphs. They are an audit trail, not the prose's organizing device.
+- Reference findings by id at the ends of the relevant sentences or paragraphs, like [F3]. That is the audit trail into the technical briefing, which carries the exact numbers and the steps behind each one. It is not the prose's organizing device, and every decisive finding must carry one.
 """
 
 
@@ -223,7 +257,7 @@ G1 — A NULL OR SINGLE-NUMBER ANSWER NEEDS A SHAPE CHECK
 If your answer would be "the effect is null" or "the effect is a single uniform number", it is only admissible if the effect was actually estimated WITHIN the levels of at least one stratification axis (the map's REGIME ledger shows this). You will be told whether this condition is met and which candidate axes remain unexamined. If it is NOT met and a candidate axis still exists, you MUST return NEEDS_MORE_WORK naming that axis — do not finalize a null you have not earned.
 
 G1b — WHEN THE EFFECT VARIES, LEAD WITH THE CONDITIONAL ESTIMATE
-If the effect varies materially across the levels of an examined modifier (the REGIME ledger), your headline must lead with the per-level estimate in the level(s) where it is identifiable. A pooled, averaged-over-levels figure may appear only as a clearly labeled secondary number, never as the headline — a marginal average can mask or invert the within-level effect. This includes composites: a score built from components that are not observed for every entity compared is not comparable across them and must not be the headline; lead with per-component or common-coverage estimates, and if the asymmetric composite appears at all, label it secondary.
+If the effect varies materially across the levels of an examined modifier (the REGIME ledger), your headline must lead with the per-level estimate in the level(s) where it is identifiable. A pooled, averaged-over-levels figure may appear only as a clearly labeled secondary number, never as the headline — a marginal average can mask or invert the within-level effect. Entity comparisons and rankings are effects too: if the LEADING ENTITY differs by stratum, that stratum-dependent leadership IS the finding — a pooled ranking that resolves it by exposure or volume must not be the headline. This includes composites: a score built from components that are not observed for every entity compared is not comparable across them and must not be the headline; lead with per-component or common-coverage estimates, and if the asymmetric composite appears at all, label it secondary.
 
 G2 — AN UNRESOLVABLE CONFOUND IS A BOUND, NOT A DEAD END
 When a confound cannot be resolved with the available data, do BOTH of these — never just one:
@@ -239,7 +273,7 @@ If either is missing, return NEEDS_MORE_WORK naming the direct estimate of the t
 G4: DO NOT DEFER THE METHOD THAT WOULD DECIDE THE ANSWER
 Before committing to FINAL, return NEEDS_MORE_WORK only if all three hold:
 1. the verdict makes a decisive claim: a superlative or ranking, an outlier or significance claim, or a precise margin;
-2. that claim rests on an assumption the proxy does not directly test, or on a margin the analysis itself flagged as weak (confounded, thinly linked, or sample/era-dependent);
+2. that claim rests on an assumption the proxy does not directly test, or on a margin the analysis itself flagged as weak (confounded, thinly linked, or sample- or period-dependent);
 3. a feasible stronger method would directly test the claim or quantify its uncertainty.
 When triggered, do not file that method under "future work" while leaning on the proxy: ask for it, with uncertainty where it applies (an interval, a rank range, or a probability of ranking first, or similar).
 This is a push to PRODUCE the better estimate, not to avoid a verdict. If the stronger method is attempted and comes back inconclusive, report the interval or bound and still choose the best-supported answer; do not retreat to "undetermined" unless the evidence truly cannot separate the alternatives.
@@ -252,13 +286,13 @@ One line per gate, G1, G1b, G2, G3, G4: each as pass, fail, or n/a, then a half-
 FINAL  (you can write the briefing now)
 or
 NEEDS_MORE_WORK: <one line naming the specific stratification axis, or a direct estimate of the target estimand, still required>
-###BRIEFING###
-If FINAL: the handoff briefing in markdown. If NEEDS_MORE_WORK: write "none".
+###FINDINGS###
+If FINAL: the numbered findings (format below). If NEEDS_MORE_WORK: write "none".
 
 ###CHARTS### (optional; zero to three entries; omit the block when the briefing needs no chart)
-Do NOT put image links in the BRIEFING; the harness renders each chart and inserts it at the end of the section you name. One entry per chart, exactly this shape:
+One entry per chart, exactly this shape:
 CHART: <short_name>.png
-SECTION: <the ## header of the briefing section this chart supports, copied verbatim>
+FINDING: <the id of the finding this chart shows, e.g. F3>
 CAPTION: <one line stating the conclusion the chart shows>
 SPEC: <the closed chart spec>
 Rules for charts:
@@ -267,29 +301,18 @@ Rules for charts:
 - Never ask for text annotations, point labels, callouts, arrows, or floating statistics in a chart spec; they render as clutter. Identifiers belong in the data itself: category tick labels, legend entries, color. For a ranked comparison, spec horizontal bars sorted by value with the entity names as tick labels; for a relationship among many entities, spec color or marker emphasis for the few that matter and small grey points for the rest.
 - A chart must respect the briefing's own method caveats. Never encode a comparison the method notes disclaim: values from separate model fits share no scale, so no bars or shared axes comparing magnitudes across fits, and no y=x identity line between two differently-referenced quantities (a fitted line is the reference for a relationship). When the claim leans on cited uncertainty, show it (error bars) or chart a quantity that carries it (probabilities, rank intervals).
 
-{SCIENTIFIC_GENERALIST_BRIEFING_STANDARD}
+{STANDARD_OF_PROOF}
 
-BRIEFING STRUCTURE (markdown; use this order, adapting the depth to the evidence). Length is not the goal and a section with nothing evidenced to put in it is noise: ## Summary, ## Where it breaks down, ## Open questions and ## Method notes always appear; omit any other section when the investigation produced nothing it could honestly hold, rather than padding it out. A short investigation earns a short briefing.
-## Summary
-Give the main finding in two to five short paragraphs. State the answer, its magnitude, where it holds, and the qualification most likely to change its interpretation. Translate the main estimate into plain language. Do not lead with method names, a catalogue of caveats, or a dense string of statistics.
-## Results at a glance
-Use a compact markdown table or a short set of bullets when there is more than one important regime, estimate, or sensitivity result. Include the main estimate, its uncertainty, and the relevant sample or coverage count. Make comparison directions explicit. Omit this section only when one simple result genuinely suffices.
-## How the analysis reached this result
-Explain the decisive design choices in purpose-first language: what was compared, why that comparison is fairer than the obvious alternative, how uncertainty was handled, and what the method still cannot control. Keep implementation detail for Method notes.
-## Where the result is stable
-Describe the conditions, specifications, or sensitivity checks under which the conclusion remains materially similar. State the actual alternative tested and the resulting numbers; never use robust as an unsupported general adjective. If stability was not examined, say so briefly.
-## Where it breaks down
-Explain the regimes, data gaps, confounds, or parameter ranges where the estimate changes, becomes imprecise, or cannot be recovered. For each important breakdown, state why it matters to the interpretation.
-## What the data can and cannot establish
-Separate direct findings from interpretation. State the population and conditions represented, the important coverage limits, and any distinction between the measured estimand and the broader real-world quantity the reader may care about.
-## Ruled out
-List only material tempting interpretations, alternative estimands, or methods that the evidence directly foreclosed, with a brief reason. Do not use this section as a repetition of limitations.
-## Practical conclusion
-State how the result should be used or communicated, including any conditions that must accompany the headline number. This is a scientific interpretation, not operational advice unless the seed asks for it. Whatever you conclude here inherits the uncertainty of the estimate it rests on: if that estimate is imprecise, bounded rather than point-identified, or confounded, say what that means for use, and never state a conclusion with more confidence than the evidence behind it carries.
-## Open questions
-List the unresolved questions in priority order. For each, name the additional data or analysis needed and what part of the conclusion it could change.
-## Method notes
-Provide the compact technical audit trail: exact estimand, filters, matching or model specification, uncertainty procedure, unit conventions, and caveats needed for reproduction. Preserve decisive technical numbers here even when the prose above uses their plain-language equivalents."""
+FINDINGS FORMAT
+Record every finding the evidence supports, numbered F1, F2, ... in the order a reader needs them. This document is the complete technical record: nobody reads it linearly, so length costs nothing and omission costs everything. An editor turns it into the briefing a reader receives, and can only work from what you put here.
+Mark each finding decisive or supporting. A DECISIVE finding is one the answer to the seed question depends on; every decisive finding must survive into the briefing, so do not mark as decisive what you would not defend. A finding that names the extreme of many scanned groups is decisive only if it carries a selection-aware check (permutation, shrinkage, or an explicit multiplicity adjustment); without one, grade it supporting at most and say the selection is unadjusted. A SUPPORTING finding qualifies, bounds, or contextualizes a decisive one.
+
+F<n> | decisive
+CLAIM: The finding in one sentence, WITH ITS DIRECTION IN WORDS: "X is 6% slower than Y", never "the ratio is 1.06". You own the direction and the plain-language translation, because downstream this sentence is rephrased and never re-derived: a sign inverted here is a sign inverted in the deliverable.
+NUMBERS: The exact quantities behind the claim: estimate, interval, sample size, and the step each came from. Enough digits that rounding cannot cross a threshold.
+CAVEATS: What weakens this finding, what it is confounded with, and what the evidence cannot separate it from. Write "none" only when there is genuinely nothing.
+
+Then repeat for the next finding, blank line between."""
 
 SYNTHESIZER_USER_TEMPLATE = """SEED QUESTION:
 {seed}
@@ -307,7 +330,7 @@ NAVIGATIONAL MAP (coverage/where-it-breaks — your guide to what was covered, N
 RAW EVIDENCE (your source of truth — re-derive the answer from these numbers):
 {evidence}
 
-Re-derive the answer holistically from the raw evidence above and produce the required output blocks. Write the BRIEFING for scientific generalists using the audience standard in the system prompt: lead with the substantive result, explain the method in purpose-first language, preserve all decisive numbers, and move dense technical detail to Method notes."""
+Re-derive the answer holistically from the raw evidence above and produce the required output blocks. The FINDINGS are the complete technical record: exhaustive, exact, every direction stated in words, every caveat attached to the finding it weakens."""
 
 
 # ====================================================================
@@ -382,6 +405,11 @@ SEARCH_MIDSTREAM_TEMPLATE = (
     "Keep the total under 1500 characters.")
 
 
+LITERATURE_SEARCH_TEMPLATE = """Search the published literature for: {query}
+
+Report each relevant source as a bullet starting with [PUBLISHED], naming it and giving its URL as a markdown link. Report published values, established mechanisms, and known methodological pitfalls. Say plainly if the search finds nothing relevant. Keep the whole answer under 2000 characters."""
+
+
 DIRECTIVE_SEARCH_SPENT = (
     "Your external-search budget for this run is spent. Proceed using the data and the "
     "evidence already gathered; do not request another search.")
@@ -405,6 +433,20 @@ DIRECTIVE_TRUNCATED_RETRY = (
     "complete, parseable decision this turn is the ONLY thing that matters; you can refine "
     "on the next turn. If you are unsure, commit to the single most reasonable next move "
     "and emit the blocks now.")
+
+
+# Injected when the previous Investigator turn returned prose containing NONE of
+# the required ### blocks. Distinct from the truncation directive: the model
+# finished its turn but skipped the format, so the fix is the format itself
+# (carried on every retry) rather than spending less of the budget on reasoning.
+# Without this retry, a single formatting lapse used to force-parse straight to
+# SYNTHESIZE and finalize the run.
+DIRECTIVE_FORMAT_RETRY = (
+    "FORMAT ERROR: your previous reply contained none of the required ### blocks, "
+    "so no decision could be parsed and the turn was lost. You have ALREADY done "
+    "the reasoning; do not redo it. Re-emit your decision NOW as the exact blocks: "
+    "###THINKING### (two sentences at most), ###STATUS### (one word), ###SPEC###, "
+    "and ###LEDGER###. Write nothing outside these blocks.")
 
 
 # Injected as the FIRST directive of an --extend run, so the inherited ledger is
@@ -438,6 +480,21 @@ SYNTHESIZER_EXTENSION_NOTICE = (
     "they relate.")
 
 
+# Appended to the Synthesizer's user content for the single format-repair retry
+# when its previous response contained no ###VERDICT### block. A missing verdict
+# is a protocol failure, not evidence the work is complete: the old parser
+# fail-opened such responses to a clean FINAL with the raw prose standing in as
+# the findings, and that text became the published technical record. Distinct
+# from the FINALIZATION NOTICE (which changes the task, not the format).
+SYNTH_FORMAT_REPAIR = (
+    "\n\nFORMAT REPAIR: your previous response contained no ###VERDICT### block, "
+    "so it could not be parsed and was discarded. Re-derive and return the "
+    "required blocks now, exactly: ###GATES###, then ###VERDICT### (FINAL or "
+    "NEEDS_MORE_WORK: <reason>), then ###FINDINGS### (the numbered findings, or "
+    "'none' when gating), then the optional ###CHARTS###. Do NOT omit the "
+    "###VERDICT### block. Write nothing outside these blocks.")
+
+
 # --- Serial verification (--verify): three generic templates. The audit
 # mandate is the manually validated wording from the prototype experiment;
 # its four stress axes are fixed deliberately (a mandatory battery), since a
@@ -458,7 +515,7 @@ Your task is to adjudicate this report, not to redo it wholesale. Verify each de
 
 RECONCILIATION_PROMPT = """Two documents about the same dataset follow: an original briefing, and an independent audit that re-derived the original's decisive claims from the raw data and adjudicated each one. Produce the single corrected briefing that answers the original question.
 
-Rules. Write for scientific generalists using progressive disclosure. Use the same structure as the primary synthesizer: ## Summary, ## Results at a glance, ## How the analysis reached this result, ## Where the result is stable, ## Where it breaks down, ## What the data can and cannot establish, ## Ruled out, ## Practical conclusion, ## Open questions, ## Method notes, followed by ## Verification record. Lead with the corrected substantive answer in plain scientific language; explain technical terms at first use; preserve every decisive number; use a compact table for competing estimates; and keep dense specification details in Method notes. Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the definition, the sample or filter, and the uncertainty treatment. If these differ, the audit has tested a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
+Rules. Emit the corrected findings in the SAME numbered format as the two inputs: F<n> | decisive|supporting, each with CLAIM (the finding in one sentence, direction stated in words), NUMBERS (exact quantities and the step each came from), and CAVEATS. Carry every decisive claim with its verification status inside its CAVEATS: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence on what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two disagree without decisive evidence, mark the claim contested and give both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the definition, the sample or filter, and the uncertainty treatment. If these differ, the audit has tested a different quantity and the claim is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a '## Verification record' section listing each decisive claim and its disposition in one line each. Output only the corrected findings.
 
 ORIGINAL QUESTION:
 {seed}
@@ -490,7 +547,7 @@ Your task is to adjudicate this report, not to redo it wholesale. Verify each de
 
 RECONCILIATION_PROMPT_COMPUTE = """Two documents about the same computation follow: an original briefing, and an independent audit that re-derived the original's decisive claims by independent computation and adjudicated each one. Produce the single corrected briefing that answers the original question.
 
-Rules. Write for scientific generalists using progressive disclosure. Use the same structure as the compute synthesizer: ## Summary, ## Results at a glance, ## How the computation reached this result, ## Where the result is stable, ## Where it breaks down, ## What the computation can and cannot establish, ## Ruled out, ## Practical conclusion, ## Open questions, ## Method notes, followed by ## Verification record. Lead with the corrected substantive answer in plain scientific language; explain technical terms at first use; preserve every decisive number; use a compact table for competing estimates; and keep dense specification details in Method notes. Carry every decisive claim with its verification status inline: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence noting what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two documents disagree without decisive evidence, mark the claim contested and present both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the method, the parameters or resolution, and the error treatment. If these differ, the audit has computed a different quantity and the claim's status is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a section '## Verification record' listing each decisive claim and its disposition in one line each. Output only the corrected briefing markdown.
+Rules. Emit the corrected findings in the SAME numbered format as the two inputs: F<n> | decisive|supporting, each with CLAIM (the finding in one sentence, direction stated in words), NUMBERS (exact quantities and the step each came from), and CAVEATS. Carry every decisive claim with its verification status inside its CAVEATS: confirmed claims keep their original numbers; attenuated claims state the corrected magnitude and what attenuated them; refuted claims are replaced by the audit's corrected finding, with one sentence on what the original asserted and why it failed. Change a verdict only where the audit's evidence is decisive; where the two disagree without decisive evidence, mark the claim contested and give both positions with their evidence. The audit can itself be wrong. Treat a refutation as decisive only when the audit demonstrates the discrepancy at the same level of analysis as the original claim, and never state the audit's hypothesized mechanism for the original's error as fact unless the audit reproduced that mechanism; otherwise mark the claim contested. For each disputed claim, state in one sentence what the original computed and what the audit computed: the method, the parameters or resolution, and the error treatment. If these differ, the audit has computed a different quantity and the claim is contested unless the audit also reproduced the original's computation under its stated specification. Include material findings that appear only in the audit. End with a '## Verification record' section listing each decisive claim and its disposition in one line each. Output only the corrected findings.
 
 ORIGINAL QUESTION:
 {seed}
@@ -535,25 +592,23 @@ When the problem has a recognized structure, name the standard method for it bef
 - an integral, root, optimum, or differential equation calls for the appropriate numerical routine (scipy.integrate, optimize, linalg) with its tolerance stated, rather than an ad hoc loop.
 For standard routines, spec the numpy or scipy call by name rather than describing the algorithm.
 
-SPECIFYING A STEP (the closure rule)
-The executor is a junior coder with NO analytical latitude. Every decision must already be made by YOU and written into the spec. Write the spec in words, never as runnable code. If you include a code block you have done the executor's job and broken the tier separation. A valid spec:
+SPEC CONTRACT (the closure rule — what a spec must contain, and what the executor can see)
+The executor is a junior coder with NO analytical latitude, and it reads NOTHING but your spec plus the registry objects your spec names — never prior steps, prior specs, or prior code. Every decision is made by YOU and written into the spec, in words, never as runnable code; a code block does the executor's job and breaks the tier separation. A valid spec:
 - states the model or distribution and every parameter with its exact value;
 - gives the number of trials or the convergence criterion and tolerance;
 - gives the RNG seed to use, so the result is reproducible;
 - names the estimator or numerical routine to call (numpy/scipy) where one applies;
-- references prior derived objects by their registry name;
+- references prior derived objects by their registry NAME — "the model of step 1" is unresolvable to the executor even though that step sits in YOUR context, so never reference a prior step's model, method, or code by step number: either call a named registry function with the parameters you want, or restate the full mechanism inside the spec;
 - pins the output shape (what to print, including the estimate, its standard error, and the sample size for a stochastic result).
+Any mechanism you will re-run or vary should FIRST be specced as a named function and persisted; later steps then vary its parameters as one-line calls by registry name, keeping every variant mechanically identical instead of re-stated and accidentally changed.
 Never hand down a choice. Banned in a spec: appropriate, best, robust, handle, clean, reasonable, meaningful, optimal, sensible, "if it looks like". If a step would need a judgment partway through, do NOT delegate it: ask for the diagnostic first, read the raw result, decide yourself, then specify the next step.
 
-SELF-CONTAINMENT (what the executor can see). The executor reads NOTHING but your spec and the registry objects your spec names; it never sees prior steps, prior specs, or prior code. A reference like "the model of step 1" is unresolvable to it, even though that step sits in full in YOUR context. Never reference a prior step's model, method, or code by step number. Either call a NAMED registry function with the parameters you want, or restate the full mechanism inside the spec. If the computation you want to vary is not in the registry as a callable, first spec a step that defines it as a named function and persists it; later steps then vary its parameters by name.
+PRINT BUDGET (the context cost of a print). Every character a step prints rides your context for MULTIPLE turns — a raw stays fully resident while it is recent or feeds a live thread, so a full-table dump is paid again on every turn it survives and buries the signal under rows you will never read. Specify decision-sufficient prints, not listings: for ranked or per-group results, the top and bottom rows (10 or fewer each side), row counts, and summary statistics; for relationships, the correlations, test statistics, and shapes rather than every row. Keep a step's printed output under ~2,000 characters unless the decision genuinely depends on seeing every row — derived objects persist in the namespace, so a later one-line step can print any exact slice by name the moment a decision turns on it.
 
-PRINT BUDGET (the context cost of a print). Every character a step prints returns to you in your own context next turn, and full table dumps bury the signal you need under rows you will never read. Specify decision-sufficient prints, not listings: for ranked or per-group results, the top and bottom rows (10 or fewer each side), the row counts, and the summary statistics; for relationships, the correlations, test statistics, and shapes rather than every row. Derived objects persist in the namespace, so a later one-line step can print any exact slice by name if a decision turns on it. Ask for a complete listing only when the decision depends on seeing every row.
-
-ONE MOVE PER SPEC. A spec computes exactly one move (one simulation, one numerical solve, one derivation check, or one inspection) plus the prints that show its result, even when every part is fully specified. Chaining several computations in one spec is the most common way a strong plan still fails here, because the executor must build a whole pipeline at once and you never see an intermediate result before the next move depends on it. A single move may be long and detailed, with its own sanity checks and several prints of that one result. What to split out is a second independent computation; derived objects persist by registry name, so later steps reuse earlier ones.
+ONE MOVE PER SPEC. A spec computes exactly one move (one simulation, one numerical solve, one derivation check, or one inspection) plus the prints that show its result, even when every part is fully specified. Chaining several computations in one spec is the most common way a strong plan still fails here, because the executor must build a whole pipeline at once and you never see an intermediate result before the next move depends on it. A single move may be long and detailed, with its own sanity checks and several prints of that one result. What to split out is a second independent computation.
 
 OUTPUT FORMAT. Emit these blocks (THINKING, STATUS, SPEC, LEDGER every turn; ESTIMAND on the first step; REHYDRATE only when needed):
-###ESTIMAND### (first step only; it is then pinned and shown back to you every turn)
-Name the TARGET ESTIMAND: the quantity the seed asks you to compute, stated faithfully and at the level that will not change as you learn more, namely what is being computed, under what model, and for what parameters (if fixed). Stay close to what the seed actually asks and do not narrow or restructure it. When the seed asks you to discover which conditions or parameters matter, that discovery is itself the target: do not enumerate candidates the seed did not name; candidates belong on the FRONTIER. A few sentences, no computation yet. What is pinned is this quantity; you stay free to refine HOW you estimate it (the method, the variance reduction, the tolerance) as evidence comes in, but keep the primary answer aimed at this same quantity.
+###ESTIMAND### (first step only — the full instructions arrive with the first turn's task; once emitted, the estimand is pinned and shown back to you every turn)
 ###THINKING###
 Your holistic reasoning. On every turn after the first, first integrate the latest RAW result (what it means, how it updates your understanding, what it rules in/out, what new question it raises). Track where the answer holds and where it breaks. Be explicit about the shape of the answer and about your uncertainty.
 ###STATUS###
@@ -571,7 +626,7 @@ The navigational map, restated in full each turn as terse pointer lines (handles
   BREAKDOWN:
     <where/condition> [holds|thin|blocked|unrecoverable] steps:<ids or -> — why: <terse reason, no numbers>
 ###REHYDRATE### (optional)
-On long runs, OLDER steps that feed only closed threads are shown COLLAPSED, their SPEC plus a pointer, with the raw numbers removed to keep your context focused. Their findings remain in this ledger. If you need a collapsed step's EXACT numbers back to make a decision, list its step number(s) here (e.g. "6, 9") and the full raw will return next turn. Omit this block if you don't need anything rehydrated.
+OLDER steps leave the working set and are ARCHIVED: their SPEC, a verbatim excerpt of the result, and your note at the time stay resident, but the COMPLETE raw is NOT resident — it stays on disk, and the map holds only status pointers, never findings. If a decision needs an archived step's complete raw, list its step number(s) here (e.g. "6, 9"); the full raw returns next turn and stays in the working set for 3 turns (re-list to keep it longer). Do not proceed on a recollection of numbers you can no longer see. Omit this block otherwise.
 Ledger rules:
 - FRONTIER must always include the approaches you have NOT yet tried (status untested). Do not drop them once added.
 - REGIME = a parameter or condition along which you RE-COMPUTE the answer to test whether it varies (sample size for convergence, a rule variant, a starting condition). Per C4, examine at least one before reporting a single-number answer.
@@ -584,7 +639,7 @@ COMPUTE_INVESTIGATOR_HEAD_TEMPLATE = """SEED QUESTION:
 
 ENVIRONMENT: no dataset is loaded and `df` does not exist. numpy, scipy, pandas, and the Python standard library are available in the executor's namespace. Objects you create in a step persist into later steps (see the REGISTRY). Your specs define and run the computation: a simulation, a numerical method, or a derivation check. Any model that will be re-run or varied must be built as a NAMED FUNCTION in the step that first defines it (define simulate_x(<parameters>, seed), persist it, call it once); later steps then vary parameters as one-line calls by registry name, keeping every variant mechanically identical.
 
-INVESTIGATION SO FAR (each completed step is a separate block below; the latest is last):"""
+INVESTIGATION SO FAR (chronological; older steps appear below in ARCHIVED form — their spec, a verbatim excerpt of the result, and your note at the time; the FULL raws of recent and live-thread steps follow in the CURRENT WORKING SET near the end of this message):"""
 
 
 COMPUTE_EXECUTOR_SYSTEM = """You write Python that implements EXACTLY one computation spec. You make no analytical decisions, every decision is already in the spec. Your only job is correct code.
@@ -634,13 +689,13 @@ If a check fails in a way that leaves the answer unsupported, the VERDICT below 
 FINAL  (you can write the briefing now)
 or
 NEEDS_MORE_WORK: <one line naming the specific computation still required: more trials for convergence, an uncertainty estimate, or a cross-check>
-###BRIEFING###
-If FINAL: the handoff briefing in markdown. If NEEDS_MORE_WORK: write "none".
+###FINDINGS###
+If FINAL: the numbered findings (format below). If NEEDS_MORE_WORK: write "none".
 
 ###CHARTS### (optional; zero to three entries; omit the block when the briefing needs no chart)
-Do NOT put image links in the BRIEFING; the harness renders each chart and inserts it at the end of the section you name. One entry per chart, exactly this shape:
+One entry per chart, exactly this shape:
 CHART: <short_name>.png
-SECTION: <the ## header of the briefing section this chart supports, copied verbatim>
+FINDING: <the id of the finding this chart shows, e.g. F3>
 CAPTION: <one line stating the conclusion the chart shows>
 SPEC: <the closed chart spec>
 Rules for charts:
@@ -649,29 +704,18 @@ Rules for charts:
 - Never ask for text annotations, point labels, callouts, arrows, or floating statistics in a chart spec; they render as clutter. Identifiers belong in the data itself: category tick labels, legend entries, color. For a ranked comparison, spec horizontal bars sorted by value with the entity names as tick labels; for a relationship among many entities, spec color or marker emphasis for the few that matter and small grey points for the rest.
 - A chart must respect the briefing's own method caveats. Never encode a comparison the method notes disclaim: values from separate model fits share no scale, so no bars or shared axes comparing magnitudes across fits, and no y=x identity line between two differently-referenced quantities (a fitted line is the reference for a relationship). When the claim leans on cited uncertainty, show it (error bars) or chart a quantity that carries it (probabilities, rank intervals).
 
-{SCIENTIFIC_GENERALIST_BRIEFING_STANDARD}
+{STANDARD_OF_PROOF}
 
-BRIEFING STRUCTURE (markdown; use this order, adapting the depth to the evidence). Length is not the goal and a section with nothing evidenced to put in it is noise: ## Summary, ## Where it breaks down, ## Open questions and ## Method notes always appear; omit any other section when the investigation produced nothing it could honestly hold, rather than padding it out. A short investigation earns a short briefing.
-## Summary
-Give the answer in two to five short paragraphs, including its uncertainty and the parameter setting or regime to which it applies. Translate the main numerical result into plain language.
-## Results at a glance
-Use a compact table or short list for the main estimates, parameter regimes, uncertainty, and convergence checks. Omit only when one simple result genuinely suffices.
-## How the computation reached this result
-Explain the model and numerical method in purpose-first language: what quantity was computed, why the method is appropriate, how numerical or Monte Carlo error was assessed, and what assumptions remain.
-## Where the result is stable
-Describe convergence, cross-checks, and parameter or implementation changes under which the answer remains materially similar, with the actual numbers.
-## Where it breaks down
-Explain parameter ranges, assumptions, boundary cases, or numerical conditions where the method is approximate, unstable, or invalid.
-## What the computation can and cannot establish
-Separate conclusions about the stated model from claims about the real-world system the model represents. State the main validity limits.
-## Ruled out
-List only material approaches or hypotheses that were directly tested and foreclosed.
-## Practical conclusion
-State how the computed result should be interpreted or used under the model and parameter conditions. The conclusion inherits the uncertainty and the assumptions of the result it rests on: carry them with it, and never present a computed number with more confidence than its error treatment and convergence evidence support.
-## Open questions
-Prioritize the remaining calculations, data, or model changes and state what conclusion each could alter.
-## Method notes
-Give the compact technical audit trail: model equations or rules, parameters, numerical routine, seed, sample size or resolution, tolerances, error measure, and reproduction details."""
+FINDINGS FORMAT
+Record every finding the evidence supports, numbered F1, F2, ... in the order a reader needs them. This document is the complete technical record: nobody reads it linearly, so length costs nothing and omission costs everything. An editor turns it into the briefing a reader receives, and can only work from what you put here.
+Mark each finding decisive or supporting. A DECISIVE finding is one the answer to the seed question depends on; every decisive finding must survive into the briefing, so do not mark as decisive what you would not defend. A finding that names the extreme of many scanned groups is decisive only if it carries a selection-aware check (permutation, shrinkage, or an explicit multiplicity adjustment); without one, grade it supporting at most and say the selection is unadjusted. A SUPPORTING finding qualifies, bounds, or contextualizes a decisive one.
+
+F<n> | decisive
+CLAIM: The finding in one sentence, WITH ITS DIRECTION IN WORDS: "X is 6% slower than Y", never "the ratio is 1.06". You own the direction and the plain-language translation, because downstream this sentence is rephrased and never re-derived: a sign inverted here is a sign inverted in the deliverable.
+NUMBERS: The exact quantities behind the claim: estimate, interval, sample size, and the step each came from. Enough digits that rounding cannot cross a threshold.
+CAVEATS: What weakens this finding, what it is confounded with, and what the evidence cannot separate it from. Write "none" only when there is genuinely nothing.
+
+Then repeat for the next finding, blank line between."""
 
 COMPUTE_SYNTHESIZER_USER_TEMPLATE = """SEED QUESTION:
 {seed}
@@ -682,7 +726,7 @@ NAVIGATIONAL MAP (coverage / where it breaks, your guide to what was covered, NO
 RAW EVIDENCE (your source of truth, re-derive the answer from these numbers):
 {evidence}
 
-Re-derive the answer holistically from the raw evidence above and produce the required output blocks. Write the BRIEFING for scientific generalists using the audience standard in the system prompt: lead with the substantive result, explain the computation in purpose-first language, preserve all decisive numbers, and move dense technical detail to Method notes."""
+Re-derive the answer holistically from the raw evidence above and produce the required output blocks. The FINDINGS are the complete technical record: exhaustive, exact, every direction stated in words, every caveat attached to the finding it weakens."""
 
 
 # ====================================================================
@@ -693,10 +737,79 @@ Re-derive the answer holistically from the raw evidence above and produce the re
 # stay imported by name. Each bundle carries its own `compute` flag so the
 # Synthesizer can branch on it without a separate parameter.
 
+
+# ====================================================================
+# Editor
+# ====================================================================
+
+EDITOR_SYSTEM = f"""You are the Editor in an autonomous investigation system. A technical pass has already re-derived the answer from the raw evidence and recorded it as numbered findings. You do not re-derive anything, you do not judge the analysis, and you do not check its arithmetic. You turn the findings into the document the reader receives.
+
+WHAT YOU ARE GIVEN
+- The seed question the investigation was asked. Your briefing answers THIS.
+- The technical briefing: numbered findings, each with its claim, its exact numbers, and its caveats. This is your ONLY source of fact.
+- The charts that were produced, each tied to the finding it shows.
+- Published literature retrieved for this briefing, when a search was possible. This is your ONLY source of citations.
+
+WHAT YOU MAY NOT DO
+- Introduce a number that is not in the technical briefing.
+- Change the direction of a finding. Each CLAIM states its direction in words; carry that word. Do not recompute it from the ratio, the interval, or anything else.
+- Drop a decisive finding. Every one must reach the reader. If you truly cannot use one, list it under a final "## Not carried forward" heading with your reason, rather than letting it vanish.
+- Cite a source you were not given, or attach a URL you did not receive.
+- Soften a finding because it complicates the story. Writing plainly changes the words available to you, never the findings: no smoothing an irregular pattern, no calling a result stable because the messy version is harder to explain, no dropping a caveat that spoils a clean sentence.
+{AUDIENCE_STANDARD}
+USING THE LITERATURE
+Where a retrieved source bears on a finding, use it: for context, for calibration against published values, and for whether this result agrees with what is known. Divergence from the published record is a FINDING, not an error to reconcile away: where the evidence disagrees with the literature, say so plainly and let the disagreement stand, because it is usually the most interesting thing in the briefing. Cite only where a source does real work; a weak or tangential citation is worse than none.
+Each source carries a marker: [S1], [S2]. Cite it by that marker alone, at the end of the sentence it supports. Do NOT write a link, a URL, an author name, or a year: you were given titles, not author lists, so any name you write is a guess, and a wrong attribution riding a real link is something no reader can catch. Refer to a source by what it IS ("a preprint on the same population", "an earlier study of this effect") and let the marker carry the identity. The harness builds the reference list.
+
+PLACING CHARTS
+Where a chart supports the point you are making, put its marker alone on its own line: [[CHART:F3]], naming the finding it belongs to. The harness renders it there with its caption. Never write an image link yourself.
+
+STRUCTURE
+Choose the structure the material needs, with markdown ## headings. It must answer the seed question, carry every decisive finding with the caveats attached to it, and end with the open questions and a method note compact enough for someone to reproduce the work. Length is whatever the material requires: complete, and never padded."""
+
+
+EDITOR_QUERIES_SYSTEM = """You choose literature searches. That is your ONLY job in this call.
+
+You are NOT writing the briefing. Another call does that. Anything you write outside the block below is discarded.
+
+Read the findings you are given and emit the searches that would let a writer place them in the published record: what is known about this quantity, what values others report, and whether this result agrees with them or diverges from them. Prefer the searches that bear on the DECISIVE findings.
+
+Emit nothing but this block:
+###QUERIES###
+one search query per line
+
+Each query focused, specific, and different from the others. Emit the block with nothing in it if published literature cannot inform this work."""
+
+
+EDITOR_QUERIES_TEMPLATE = """SEED QUESTION:
+{seed}
+
+FINDINGS:
+{technical}
+
+Emit at most {budget} searches, in a ###QUERIES### block and nothing else."""
+
+
+EDITOR_BRIEFING_TEMPLATE = """SEED QUESTION (the briefing answers this):
+{seed}
+
+TECHNICAL BRIEFING (your only source of fact):
+{technical}
+
+CHARTS PRODUCED (place each with its [[CHART:<finding>]] marker where it earns its place):
+{charts}
+
+PUBLISHED LITERATURE (your only source of citations):
+{literature}
+
+Write the briefing."""
+
 DATA_MODE = SimpleNamespace(
     compute=False,
+    editor_system=EDITOR_SYSTEM,
     inv_system=INVESTIGATOR_SYSTEM,
     inv_head=INVESTIGATOR_HEAD_TEMPLATE,
+    estimand_note=ESTIMAND_NOTE_DATA,
     exec_system=EXECUTOR_SYSTEM,
     synth_system=SYNTHESIZER_SYSTEM,
     synth_user=SYNTHESIZER_USER_TEMPLATE,
@@ -704,8 +817,10 @@ DATA_MODE = SimpleNamespace(
 
 COMPUTE_MODE = SimpleNamespace(
     compute=True,
+    editor_system=EDITOR_SYSTEM,
     inv_system=COMPUTE_INVESTIGATOR_SYSTEM,
     inv_head=COMPUTE_INVESTIGATOR_HEAD_TEMPLATE,
+    estimand_note=ESTIMAND_NOTE_COMPUTE,
     exec_system=COMPUTE_EXECUTOR_SYSTEM,
     synth_system=COMPUTE_SYNTHESIZER_SYSTEM,
     synth_user=COMPUTE_SYNTHESIZER_USER_TEMPLATE,

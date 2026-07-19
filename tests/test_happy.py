@@ -34,7 +34,8 @@ class Mock:
         if agent=="Executor":
             if "raised an error" not in m[-1]["content"]:s.e+=1
             return EXEC[s.e]
-        if agent=="Synthesizer":return "###VERDICT###\nFINAL\n###BRIEFING###\n## Summary\nintensity-dependent; holds at high effort.\n"
+        if agent=="Synthesizer":return "###VERDICT###\nFINAL\n###FINDINGS###\nF1 | decisive\nCLAIM: The effect is intensity-dependent; it holds at high effort.\nNUMBERS: ratio 1.0622 (95% CI 0.9994-1.1083), n=43 [step 1]\nCAVEATS: none\n"
+        if agent=="Editor":return "## Summary\n\nThe effect is intensity-dependent; it holds at high effort [F1].\n"
         return ""
 k=PersistentKernel(df=df)
 log,_,nav,briefing=run_investigation(seed="t",df=df,client=Mock(),

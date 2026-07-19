@@ -23,11 +23,14 @@ k.registry = {"columns": ["a", "b"],
               "namespace": [{"name": f"obj{i}", "type": "DataFrame", "desc": f"DataFrame {i}x2"}
                             for i in range(130)]}
 
-# #1 cap keeps NEWEST, hides oldest
+# #1 Investigator default view: NEWEST objects carry descriptions; every older
+# object is listed by NAME only (names are the reuse contract and never drop —
+# an improvement over the old 120-cap, which hid the oldest names entirely).
 out = k.describe_namespace(max_items=120)
-assert "- obj129:" in out and "- obj10:" in out
-assert "- obj0:" not in out and "- obj9:" not in out
-assert "+10 older derived objects hidden" in out
+assert "- obj129:" in out and "- obj105:" in out, "newest 25 keep descriptions"
+assert "- obj104:" not in out and "- obj10:" not in out, "older objects drop descriptions"
+assert "Earlier derived objects, by NAME only" in out
+assert "obj10" in out and "obj0" in out, "every name stays present"
 
 # #2/#3 names subset shows only named objects + count of the rest
 out_focus = k.describe_namespace(names={"obj5", "obj129"})

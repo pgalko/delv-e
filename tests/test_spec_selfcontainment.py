@@ -25,19 +25,30 @@ from investigation import _referenced_names, scan_spec_for_leakage
 
 # ── 1) The rule exists in both modes and is leakage-clean ──
 src = inspect.getsource(P)
-assert src.count("SELF-CONTAINMENT (what the executor can see)") == 2
-for phrase in ("never sees prior steps", "by step number",
-               "defines it as a named function"):
+# Audit 4.2 merged SPECIFYING A STEP + SELF-CONTAINMENT into one SPEC CONTRACT
+# section per mode; the pinned anchors below track the merged wording. The
+# semantics protected here are unchanged: the executor sees nothing but the
+# spec + named registry objects, step-number references are banned, and the
+# persist-a-function escape hatch exists in both modes.
+assert src.count("SPEC CONTRACT (the closure rule") == 2
+for phrase in ("never prior steps, prior specs, or prior code", "by step number",
+               "specced as a named function and persisted"):
     assert src.count(phrase) == 2, f"rule lost in one mode: {phrase!r}"
-i = src.index("SELF-CONTAINMENT (what the executor can see)")
+i = src.index("SPEC CONTRACT (the closure rule")
 clause = src[i:src.index("PRINT BUDGET", i)]
+# The merged section now CONTAINS the banned-word list itself; exclude that
+# line (it names the words on purpose) and require the rest to model
+# closed-spec language.
+clause = "\n".join(ln for ln in clause.splitlines() if "Banned in a spec:" not in ln)
 assert scan_spec_for_leakage(clause) == [], "the rule must model closed-spec language"
 print("self-containment rule: both modes, leakage-clean: OK")
 
-# ── 2) Compute mode: persist-as-function rule, exactly once (compute only) ──
+# ── 2) Persist-as-function rule: promoted to BOTH modes (audit 5.5) ──
+# The compute head template keeps its named-function mandate, and the merged
+# SPEC CONTRACT now carries the escape hatch in both modes: head + 2 systems.
 assert src.count("must be built as a NAMED FUNCTION in the step that first defines it") == 1
-assert src.count("keeping every variant mechanically identical") == 1
-print("compute persist-as-function rule: OK")
+assert src.count("keeping every variant mechanically identical") == 3
+print("persist-as-function rule (both modes + compute head): OK")
 
 # ── 3) _referenced_names: the resolver the tripwire keys on ──
 class _K:

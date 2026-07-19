@@ -1,0 +1,111 @@
+{
+  "dataset_family": "f1_1950_2024",
+  "frozen": "edit only before the first scored run; never after",
+  "seeds": [
+    {
+      "id": "goat_ranking",
+      "question": "Identify the greatest Formula 1 driver of all time through multi-dimensional statistical analysis across 1950-2024. Raw career totals are confounded by car quality and era length — use teammate pairings as natural experiments to isolate driver skill from machinery, and discover which independent performance dimensions best separate elite drivers from good drivers in good cars. Determine whether one driver emerges as a clear statistical outlier or whether greatness is multidimensional.",
+      "estimand_type": "ranking",
+      "checklist": [
+        "car quality controlled via within-team (teammate) comparison, not raw totals",
+        "era effects examined by stratification or era-conditional estimates",
+        "mechanical DNF contamination of finish-based measures addressed",
+        "small-sample drivers handled (contest-count floor or uncertainty-aware ranking)",
+        "ranking uncertainty quantified (not a bare point ranking)",
+        "coverage/connectivity of the pairing graph checked before trusting cross-era claims"
+      ],
+      "headline_hint": "named driver(s) with a probability-of-rank-1 or equivalent, plus the condition (era/pool) it holds under"
+    },
+    {
+      "id": "home_advantage",
+      "question": "Do Formula 1 drivers perform measurably better at their home grand prix? Estimate the size of any home advantage on finishing position and qualifying, and determine whether it is real skill expression or an artifact of team choices, circuit familiarity by era, or selection in which drivers get home races.",
+      "estimand_type": "effect",
+      "checklist": [
+        "within-driver comparison (home vs away for the same driver), not cross-driver",
+        "era heterogeneity of the effect examined",
+        "circuit familiarity vs nationality disentangled or acknowledged",
+        "selection into having a home race addressed (not all drivers have one)",
+        "effect size with uncertainty interval, not just a p-value or direction"
+      ],
+      "headline_hint": "signed effect size (positions or probability) with CI and the population it applies to"
+    },
+    {
+      "id": "quali_race_conversion",
+      "question": "How much does qualifying position determine race outcome in Formula 1, and how has that relationship changed across eras? Identify the eras or circuit types where grid position matters most and least, and quantify what a one-place grid improvement is worth in finishing position today versus in earlier decades.",
+      "estimand_type": "trend/interaction",
+      "checklist": [
+        "era trend estimated within levels, not a single pooled slope",
+        "circuit heterogeneity examined or explicitly bounded",
+        "DNFs handled in the grid-to-finish mapping",
+        "regression-to-the-mean / truncation in finishing positions considered",
+        "the marginal value of one grid place stated with uncertainty for a named era"
+      ],
+      "headline_hint": "per-era slope or conversion rate with a clear most/least era statement"
+    },
+    {
+      "id": "reliability_survival",
+      "question": "Quantify how car reliability has shaped Formula 1 outcomes: estimate the rate of mechanical retirements across eras, which constructors were most and least reliable relative to their era, and how many championship-relevant results plausibly flipped due to reliability rather than pace.",
+      "estimand_type": "survival/reliability",
+      "checklist": [
+        "mechanical vs driver-caused retirement separated (classification quality acknowledged)",
+        "era baseline removed when ranking constructors (relative-to-era, not raw rates)",
+        "exposure adjusted (entries/laps, not raw retirement counts)",
+        "the counterfactual 'flipped results' claim bounded honestly with assumptions stated",
+        "uncertainty on constructor reliability estimates"
+      ],
+      "headline_hint": "era reliability trend plus named most/least reliable constructors relative to era"
+    },
+    {
+      "id": "teammate_gap_age",
+      "question": "How does driver performance evolve with age and experience in Formula 1? Using teammate comparisons to control for machinery, estimate the typical age or experience curve, when drivers peak, and whether late-career declines are real performance effects or seat-quality selection.",
+      "estimand_type": "curve/effect",
+      "checklist": [
+        "machinery controlled via teammate contrasts",
+        "age vs experience (seasons/races) disentangled or acknowledged as confounded",
+        "survivor/selection bias addressed (who keeps a seat is not random)",
+        "peak located with uncertainty, not a bare point estimate",
+        "era interaction checked (curves may differ by era)"
+      ],
+      "headline_hint": "peak age/experience with interval and an explicit statement on selection effects"
+    },
+    {
+      "id": "constructor_dominance",
+      "question": "Measure constructor dominance cycles in Formula 1: how concentrated has competitive success been across eras, which regulation changes most reshuffled the competitive order, and is the sport becoming more or less competitive over time?",
+      "estimand_type": "trend/anomaly",
+      "checklist": [
+        "a concentration metric defined and computed per season/era (not anecdotes)",
+        "regulation-change years identified and tested as change points, not assumed",
+        "points-system changes across eras normalized or acknowledged",
+        "trend claim made with uncertainty and robustness to metric choice",
+        "at least one alternative explanation for reshuffles considered"
+      ],
+      "headline_hint": "direction of the competitiveness trend plus the top regulation change-points found"
+    },
+    {
+      "id": "wet_weather_skill",
+      "question": "Is wet-weather skill a distinct, persistent driver trait in Formula 1, or noise? Identify drivers whose wet performance most exceeds their dry baseline using within-driver comparisons, and determine whether wet outperformance persists across seasons and cars.",
+      "estimand_type": "trait/persistence",
+      "checklist": [
+        "within-driver wet-vs-dry contrast (own baseline), machinery held via teammate or car-season",
+        "sample-size floors for wet races per driver (wet races are rare)",
+        "persistence tested across seasons/cars, not a single-season list",
+        "condition labeling quality of 'wet' acknowledged",
+        "multiple-comparisons risk addressed when naming outlier drivers"
+      ],
+      "headline_hint": "named persistent wet outperformers with effect size, or a defensible null"
+    },
+    {
+      "id": "season_form_momentum",
+      "question": "Does momentum exist within a Formula 1 season? Test whether a driver's recent-race form predicts their next result beyond their season-long ability and car performance, and quantify how much 'hot streaks' are real versus artifacts of car upgrades and circuit sequencing.",
+      "estimand_type": "predictive/effect",
+      "checklist": [
+        "ability and car baseline controlled before attributing anything to recent form",
+        "car-upgrade trajectory within season considered as the confound",
+        "circuit sequencing/heterogeneity addressed",
+        "out-of-sample or held-out evaluation of the momentum term, not in-sample fit",
+        "effect size with uncertainty; a null result stated plainly if found"
+      ],
+      "headline_hint": "momentum coefficient/effect with CI, or an explicit well-supported null"
+    }
+  ]
+}
